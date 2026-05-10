@@ -12,18 +12,23 @@ smoke_test_() ->
         ]
     end}.
 
+-define(REPO, kura_sqlite_smoke_repo).
+
 setup() ->
+    application:set_env(kura, repos, #{?REPO => #{dialect => kura_dialect_sqlite}}),
     application:set_env(kura, dialect, kura_dialect_sqlite),
     Name = kura_sqlite_smoke_pool,
     {ok, _} = kura_pool_sqlite:start_pool(Name, #{database => <<":memory:">>, pool_size => 1}),
     Name.
 
 teardown(Name) ->
+    application:unset_env(kura, repos),
     application:unset_env(kura, dialect),
     kura_pool_sqlite:stop_pool(Name).
 
 ddl_emit_sqlite() ->
     SQL = kura_migrator:compile_operation(
+        ?REPO,
         {create_table, ~"items", [
             #kura_column{name = id, type = id, primary_key = true, nullable = false},
             #kura_column{name = name, type = string, nullable = false},
@@ -39,6 +44,7 @@ ddl_emit_sqlite() ->
 on_conflict_upsert() ->
     Name = kura_sqlite_smoke_pool,
     DDL = kura_migrator:compile_operation(
+        ?REPO,
         {create_table, ~"upserts", [
             #kura_column{name = key, type = string, primary_key = true, nullable = false},
             #kura_column{name = count, type = integer, default = 0}
