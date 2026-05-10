@@ -29,6 +29,10 @@ phase 2 skeleton and will be addressed by capability flags in phase 3.
 
 -behaviour(kura_dialect).
 
+-include_lib("kura/include/kura.hrl").
+
+-eqwalizer({nowarn_function, format_default/1}).
+
 -export([
     to_sql/1,
     to_sql_from/2,
@@ -40,6 +44,8 @@ phase 2 skeleton and will be addressed by capability flags in phase 3.
     delete_all/1,
     insert_all/3,
     insert_all/4,
+    column_type/1,
+    format_default/1,
     swap_placeholders/1
 ]).
 
@@ -47,12 +53,12 @@ phase 2 skeleton and will be addressed by capability flags in phase 3.
 %% kura_dialect callbacks
 %%----------------------------------------------------------------------
 
--spec to_sql(term()) -> {iodata(), [term()]}.
+-spec to_sql(#kura_query{}) -> {iodata(), [term()]}.
 to_sql(Query) ->
     {SQL, Params} = kura_dialect_pg:to_sql(Query),
     {swap_placeholders(SQL), Params}.
 
--spec to_sql_from(term(), pos_integer()) -> {iodata(), [term()], pos_integer()}.
+-spec to_sql_from(#kura_query{}, pos_integer()) -> {iodata(), [term()], pos_integer()}.
 to_sql_from(Query, StartCounter) ->
     {SQL, Params, NextCounter} = kura_dialect_pg:to_sql_from(Query, StartCounter),
     {swap_placeholders(SQL), Params, NextCounter}.
@@ -77,12 +83,12 @@ delete(SchemaOrTable, PKField, PKValue) ->
     {SQL, Params} = kura_dialect_pg:delete(SchemaOrTable, PKField, PKValue),
     {swap_placeholders(SQL), Params}.
 
--spec update_all(term(), map()) -> {iodata(), [term()]}.
+-spec update_all(#kura_query{}, map()) -> {iodata(), [term()]}.
 update_all(Query, SetMap) ->
     {SQL, Params} = kura_dialect_pg:update_all(Query, SetMap),
     {swap_placeholders(SQL), Params}.
 
--spec delete_all(term()) -> {iodata(), [term()]}.
+-spec delete_all(#kura_query{}) -> {iodata(), [term()]}.
 delete_all(Query) ->
     {SQL, Params} = kura_dialect_pg:delete_all(Query),
     {swap_placeholders(SQL), Params}.
@@ -96,6 +102,70 @@ insert_all(SchemaOrTable, Fields, Rows) ->
 insert_all(SchemaOrTable, Fields, Rows, Opts) ->
     {SQL, Params} = kura_dialect_pg:insert_all(SchemaOrTable, Fields, Rows, Opts),
     {swap_placeholders(SQL), Params}.
+
+%%----------------------------------------------------------------------
+%% DDL: column type + default value emit
+%%----------------------------------------------------------------------
+
+-spec column_type(kura_types:kura_type()) -> binary().
+column_type(id) ->
+    ~"INTEGER";
+column_type(integer) ->
+    ~"INTEGER";
+column_type(bigint) ->
+    ~"INTEGER";
+column_type(smallint) ->
+    ~"INTEGER";
+column_type(float) ->
+    ~"REAL";
+column_type(decimal) ->
+    ~"NUMERIC";
+column_type(string) ->
+    ~"TEXT";
+column_type(text) ->
+    ~"TEXT";
+column_type(binary) ->
+    ~"BLOB";
+column_type(boolean) ->
+    ~"INTEGER";
+column_type(date) ->
+    ~"TEXT";
+column_type(time) ->
+    ~"TEXT";
+column_type(utc_datetime) ->
+    ~"TEXT";
+column_type(naive_datetime) ->
+    ~"TEXT";
+column_type(uuid) ->
+    ~"TEXT";
+column_type(jsonb) ->
+    ~"TEXT";
+column_type({enum, _}) ->
+    ~"TEXT";
+column_type({array, _}) ->
+    ~"TEXT";
+column_type({embed, _, _}) ->
+    ~"TEXT";
+column_type({custom, Mod}) ->
+    case erlang:function_exported(Mod, sqlite_type, 0) of
+        true -> Mod:sqlite_type();
+        false -> Mod:pg_type()
+    end.
+
+-spec format_default(term()) -> binary().
+format_default(Val) when is_integer(Val) -> integer_to_binary(Val);
+format_default(Val) when is_float(Val) -> float_to_binary(Val);
+format_default(Val) when is_binary(Val) -> <<"'", Val/binary, "'">>;
+format_default(true) ->
+    ~"1";
+format_default(false) ->
+    ~"0";
+format_default(Val) when is_map(Val) ->
+    Json = iolist_to_binary(json:encode(Val)),
+    <<"'", Json/binary, "'">>;
+format_default(Val) when is_list(Val) ->
+    Json = iolist_to_binary(json:encode(Val)),
+    <<"'", Json/binary, "'">>.
 
 %%----------------------------------------------------------------------
 %% Helpers

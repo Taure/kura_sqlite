@@ -22,6 +22,39 @@ swap_double_digit_placeholder_test() ->
     ).
 
 %%----------------------------------------------------------------------
+%% column_type/1: SQLite type mapping
+%%----------------------------------------------------------------------
+
+column_type_basics_test_() ->
+    [
+        ?_assertEqual(~"INTEGER", kura_dialect_sqlite:column_type(id)),
+        ?_assertEqual(~"INTEGER", kura_dialect_sqlite:column_type(integer)),
+        ?_assertEqual(~"INTEGER", kura_dialect_sqlite:column_type(boolean)),
+        ?_assertEqual(~"REAL", kura_dialect_sqlite:column_type(float)),
+        ?_assertEqual(~"TEXT", kura_dialect_sqlite:column_type(string)),
+        ?_assertEqual(~"TEXT", kura_dialect_sqlite:column_type(text)),
+        ?_assertEqual(~"TEXT", kura_dialect_sqlite:column_type(uuid)),
+        ?_assertEqual(~"TEXT", kura_dialect_sqlite:column_type(jsonb)),
+        ?_assertEqual(~"TEXT", kura_dialect_sqlite:column_type(utc_datetime)),
+        ?_assertEqual(~"BLOB", kura_dialect_sqlite:column_type(binary)),
+        ?_assertEqual(~"TEXT", kura_dialect_sqlite:column_type({enum, [a, b]})),
+        ?_assertEqual(~"TEXT", kura_dialect_sqlite:column_type({array, integer}))
+    ].
+
+%%----------------------------------------------------------------------
+%% format_default/1: SQLite-flavoured default literals
+%%----------------------------------------------------------------------
+
+format_default_test_() ->
+    [
+        ?_assertEqual(~"42", kura_dialect_sqlite:format_default(42)),
+        ?_assertEqual(~"1", kura_dialect_sqlite:format_default(true)),
+        ?_assertEqual(~"0", kura_dialect_sqlite:format_default(false)),
+        ?_assertEqual(<<"'hello'">>, kura_dialect_sqlite:format_default(<<"hello">>)),
+        ?_assertEqual(<<"'{\"a\":1}'">>, kura_dialect_sqlite:format_default(#{a => 1}))
+    ].
+
+%%----------------------------------------------------------------------
 %% Behaviour declaration
 %%----------------------------------------------------------------------
 
