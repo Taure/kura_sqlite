@@ -32,6 +32,10 @@ calls inside the fun route to the same conn.
 
 -behaviour(kura_driver).
 
+-eqwalizer({nowarn_function, query/5}).
+-eqwalizer({nowarn_function, transaction/4}).
+-eqwalizer({nowarn_function, collect_rows/3}).
+
 -export([
     query/5,
     query_on/4,
