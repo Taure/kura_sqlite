@@ -1,50 +1,62 @@
 # kura_sqlite
 
-SQLite backend for [kura](https://github.com/Taure/kura).
-
-Provides `kura_pool_sqlite`, `kura_driver_sqlite`, `kura_dialect_sqlite`,
-and `kura_backend_sqlite` so kura applications can target SQLite via the
+SQLite backend for [kura](https://github.com/Taure/kura). Provides
+`kura_pool_sqlite`, `kura_driver_sqlite`, `kura_dialect_sqlite`, and
+`kura_backend_sqlite` on top of the
 [esqlite](https://hex.pm/packages/esqlite) NIF driver.
 
 ## Use
 
-Add `kura` and `kura_sqlite` to your `rebar.config`:
-
 ```erlang
 {deps, [
-    {kura, "~> 2.0"},
-    {kura_sqlite, "~> 0.1"}
+    {kura, "~> 2.4"},
+    {kura_sqlite, "~> 0.2"}
 ]}.
 ```
 
-Configure your repo to use the SQLite backend:
+Point kura at the backend in `sys.config`:
 
 ```erlang
-{my_app, [
-    {repo, [
-        {backend, kura_backend_sqlite},
-        {database, "priv/myapp.db"},
-        {pool_size, 4}
-    ]}
-]}.
+[{kura, [
+    {repo, my_repo},
+    {backend, kura_backend_sqlite},
+    {database, <<"priv/my_app.db">>},   %% or <<":memory:">>
+    {pool_size, 4}
+]}].
 ```
+
+`kura_app:start/2` resolves the aggregator and auto-populates `dialect`,
+`pool_module`, and `driver_module`. Per-key overrides still win.
 
 ## Status
 
-This is a phase-2 skeleton. The core SQL surface (SELECT / INSERT / UPDATE /
-DELETE / WHERE / ORDER / LIMIT / RETURNING / ON CONFLICT) works through
-the `kura_dialect_sqlite` placeholder rewrite. Type mapping, full migration
-DDL, and the sandbox path are tracked for phase 3.
+Working: schemas, queries, migrations, `INSERT … ON CONFLICT`,
+`RETURNING`, transactions, JSON storage as TEXT, boolean as `0`/`1`
+(transparently round-tripped via `kura_types:cast/2`).
 
-Capability set declared by `kura_pool_sqlite`:
+Not yet: `kura_sandbox` test fixtures, JSONB operators (`->`, `->>`,
+`@>`), arrays.
+
+`kura_pool_sqlite:capabilities/0`:
 
 ```
 [returning, json, partial_indexes, transactions, savepoints, prepared_statements]
 ```
 
-PG-only features (`advisory_locks`, `listen_notify`, `arrays`) are deliberately
-absent; consumers that require them will refuse to start on this backend
-via `kura_capabilities:require/2`.
+PG-only features (`advisory_locks`, `listen_notify`, `arrays`,
+`jsonb`) are deliberately absent; consumers that require them refuse
+to start on this backend via `kura_capabilities:require/2`.
+
+## Caveats
+
+- **Booleans** encode as INTEGER 0/1 on disk. `kura_types:cast/2`
+  transparently decodes them back to `true`/`false` on read, so user
+  code is unaffected.
+- **JSON** values store as TEXT. JSONB operators (`->`, `->>`, `@>`)
+  are not available; use Erlang map operations after decoding.
+- **Arrays** are unsupported.
+- **In-memory** (`<<":memory:">>`) is per-connection. Use `pool_size: 1`
+  if multiple checkouts must observe the same data, or use a file path.
 
 ## License
 
