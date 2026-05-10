@@ -2,7 +2,7 @@
 [{<<"esqlite">>,{pkg,<<"esqlite">>,<<"0.9.0">>},0},
  {<<"kura">>,
   {git,"https://github.com/Taure/kura.git",
-       {ref,"78f71e2e954e11c2f1cf49112dc8123c8dd8cf95"}},
+       {ref,"de3fd745fc588ff9384e513b7254ddf28dcf11da"}},
   0},
  {<<"telemetry">>,{pkg,<<"telemetry">>,<<"1.4.1">>},1}]}.
 [
