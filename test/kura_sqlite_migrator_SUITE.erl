@@ -17,7 +17,6 @@ that asobi-CT covers for Postgres but no app exercises for SQLite.
 
 -define(REPO, kura_sqlite_e2e_test_repo).
 -define(APP, kura_sqlite_e2e_test_app).
--define(POOL, kura_sqlite_e2e_pool).
 -define(VERSION, 20260510000000).
 
 all() ->
