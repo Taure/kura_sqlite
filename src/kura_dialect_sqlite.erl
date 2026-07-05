@@ -146,6 +146,8 @@ column_type({array, _}) ->
     ~"TEXT";
 column_type({embed, _, _}) ->
     ~"TEXT";
+column_type({encrypted, _}) ->
+    ~"BLOB";
 column_type({custom, Mod}) ->
     case erlang:function_exported(Mod, sqlite_type, 0) of
         true -> Mod:sqlite_type();
