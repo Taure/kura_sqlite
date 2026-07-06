@@ -55,6 +55,8 @@ to start on this backend via `kura_capabilities:require/2`.
 - **JSON** values store as TEXT. JSONB operators (`->`, `->>`, `@>`)
   are not available; use Erlang map operations after decoding.
 - **Arrays** are unsupported.
+- **Composite primary and foreign keys** work the same as on Postgres
+  (SQLite supports `PRIMARY KEY (a, b)` and row-value `IN`).
 - **In-memory** (`<<":memory:">>`) is per-connection. Use `pool_size: 1`
   if multiple checkouts must observe the same data, or use a file path.
 
