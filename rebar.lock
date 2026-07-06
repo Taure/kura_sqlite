@@ -1,15 +1,14 @@
 {"1.2.0",
 [{<<"esqlite">>,{pkg,<<"esqlite">>,<<"0.9.0">>},0},
- {<<"kura">>,
-  {git,"https://github.com/Taure/kura.git",
-       {ref,"ca7c86350e4369841182f842dea717b9232a7fc8"}},
-  0},
+ {<<"kura">>,{pkg,<<"kura">>,<<"2.17.1">>},0},
  {<<"telemetry">>,{pkg,<<"telemetry">>,<<"1.4.2">>},1}]}.
 [
 {pkg_hash,[
  {<<"esqlite">>, <<"23960E182234D0300F946066C6FA9F3E06951ABF2FD36E07F1FD18F40B8624E0">>},
+ {<<"kura">>, <<"6C32025B0BCE4F5674219C761AC614B67BA3A920B6A93E0E601231926BA02335">>},
  {<<"telemetry">>, <<"A0CB522801DFFB1C49FE6E30561BADFFC7B6D0E180DB1300DF759FAA22062855">>}]},
 {pkg_hash_ext,[
  {<<"esqlite">>, <<"CCF72258A4EE152EC7AD92AA9A03552EB6CA1B06B65C93AD5B6E55C302E05855">>},
+ {<<"kura">>, <<"BB872E7831CAB132EF7B50D9A0C9C7AD83DD6A24E4FCF2AAC7BED3A544B00609">>},
  {<<"telemetry">>, <<"928F6495066506077862C0D1646609EED891A4326BEE3126BA54B60AF61FEBB1">>}]}
 ].
