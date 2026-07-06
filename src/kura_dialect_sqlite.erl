@@ -39,7 +39,7 @@ phase 2 skeleton and will be addressed by capability flags in phase 3.
     insert/3,
     insert/4,
     update/4,
-    delete/3,
+    delete/2,
     update_all/2,
     delete_all/1,
     insert_all/3,
@@ -73,14 +73,14 @@ insert(SchemaOrTable, Fields, Data, Opts) ->
     {SQL, Params} = kura_dialect_pg:insert(SchemaOrTable, Fields, Data, Opts),
     {swap_placeholders(SQL), Params}.
 
--spec update(atom() | module(), [atom()], map(), {atom(), term()}) -> {iodata(), [term()]}.
-update(SchemaOrTable, Fields, Changes, PK) ->
-    {SQL, Params} = kura_dialect_pg:update(SchemaOrTable, Fields, Changes, PK),
+-spec update(atom() | module(), [atom()], map(), [{atom(), term()}]) -> {iodata(), [term()]}.
+update(SchemaOrTable, Fields, Changes, KeyClauses) ->
+    {SQL, Params} = kura_dialect_pg:update(SchemaOrTable, Fields, Changes, KeyClauses),
     {swap_placeholders(SQL), Params}.
 
--spec delete(atom() | module(), atom(), term()) -> {iodata(), [term()]}.
-delete(SchemaOrTable, PKField, PKValue) ->
-    {SQL, Params} = kura_dialect_pg:delete(SchemaOrTable, PKField, PKValue),
+-spec delete(atom() | module(), [{atom(), term()}]) -> {iodata(), [term()]}.
+delete(SchemaOrTable, KeyClauses) ->
+    {SQL, Params} = kura_dialect_pg:delete(SchemaOrTable, KeyClauses),
     {swap_placeholders(SQL), Params}.
 
 -spec update_all(#kura_query{}, map()) -> {iodata(), [term()]}.

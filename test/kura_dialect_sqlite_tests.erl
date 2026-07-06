@@ -62,3 +62,43 @@ declares_kura_dialect_behaviour_test() ->
     Attrs = kura_dialect_sqlite:module_info(attributes),
     Behaviours = lists:append([V || {behaviour, V} <- Attrs] ++ [V || {behavior, V} <- Attrs]),
     ?assert(lists:member(kura_dialect, Behaviours)).
+
+%%----------------------------------------------------------------------
+%% composite primary/foreign keys (delegated to kura_dialect_pg, then
+%% placeholders swapped to SQLite style)
+%%----------------------------------------------------------------------
+
+composite_update_test() ->
+    {SQL, Params} = kura_dialect_sqlite:update(
+        kura_sqlite_composite_schema,
+        [role],
+        #{role => <<"admin">>},
+        [{org_id, <<"o">>}, {user_id, <<"u">>}]
+    ),
+    ?assertNotEqual(
+        nomatch,
+        binary:match(iolist_to_binary(SQL), <<"WHERE \"org_id\" = ?2 AND \"user_id\" = ?3">>)
+    ),
+    ?assertEqual([<<"admin">>, <<"o">>, <<"u">>], Params).
+
+composite_delete_test() ->
+    {SQL, Params} = kura_dialect_sqlite:delete(
+        kura_sqlite_composite_schema, [{org_id, <<"o">>}, {user_id, <<"u">>}]
+    ),
+    ?assertNotEqual(
+        nomatch,
+        binary:match(iolist_to_binary(SQL), <<"WHERE \"org_id\" = ?1 AND \"user_id\" = ?2">>)
+    ),
+    ?assertEqual([<<"o">>, <<"u">>], Params).
+
+composite_in_to_sql_test() ->
+    Q = kura_query:where(
+        kura_query:from(kura_sqlite_composite_schema),
+        {[org_id, user_id], in, [{<<"o1">>, <<"u1">>}, {<<"o2">>, <<"u2">>}]}
+    ),
+    {SQL, Params} = kura_dialect_sqlite:to_sql(Q),
+    ?assertNotEqual(
+        nomatch,
+        binary:match(iolist_to_binary(SQL), <<"(\"org_id\", \"user_id\") IN ((?1, ?2), (?3, ?4))">>)
+    ),
+    ?assertEqual([<<"o1">>, <<"u1">>, <<"o2">>, <<"u2">>], Params).
