@@ -13,6 +13,43 @@ end_to_end_test_() ->
         ]
     end}.
 
+%% Regression test for the SQLITE_BUSY case_clause crash: esqlite3:step/1
+%% returns the bare atom '$busy' (not an {error, _} tuple) once a
+%% connection's own busy_timeout is exhausted racing another writer -
+%% see collect_rows/3's own comment. Needs two real connections to the
+%% *same file* db (in-memory dbs are private per-connection, so they
+%% can never contend) with busy_timeout pragma'd down so the test does
+%% not have to wait out the NIF's 2s default.
+busy_returns_error_tuple_instead_of_crashing_test_() ->
+    {timeout, 10, fun() ->
+        Path = tmp_db_path(),
+        Name = kura_driver_sqlite_busy_test_pool,
+        {ok, _} = kura_pool_sqlite:start_pool(Name, #{database => Path, pool_size => 2}),
+        try
+            {ok, ConnA, TokenA} = kura_pool_sqlite:checkout(Name, #{}),
+            {ok, ConnB, TokenB} = kura_pool_sqlite:checkout(Name, #{}),
+            ok = esqlite3:exec(ConnA, ~"PRAGMA busy_timeout = 50"),
+            ok = esqlite3:exec(ConnB, ~"PRAGMA busy_timeout = 50"),
+            ok = esqlite3:exec(ConnA, ~"CREATE TABLE t (id INTEGER)"),
+            %% BEGIN IMMEDIATE takes the write lock right away, unlike a
+            %% plain BEGIN (which stays a read lock until the first write) -
+            %% needed so ConnB is guaranteed to hit SQLITE_BUSY below.
+            ok = esqlite3:exec(ConnA, ~"BEGIN IMMEDIATE"),
+            Result = kura_driver_sqlite:query_on(ConnB, ~"INSERT INTO t VALUES (1)", [], #{}),
+            ?assertEqual({error, busy}, Result),
+            ok = esqlite3:exec(ConnA, ~"ROLLBACK"),
+            kura_pool_sqlite:checkin(Name, TokenA),
+            kura_pool_sqlite:checkin(Name, TokenB)
+        after
+            kura_pool_sqlite:stop_pool(Name),
+            file:delete(Path)
+        end
+    end}.
+
+tmp_db_path() ->
+    Rand = integer_to_list(erlang:unique_integer([positive])),
+    iolist_to_binary(["/tmp/kura_sqlite_busy_test_", Rand, ".db"]).
+
 setup() ->
     Name = kura_driver_sqlite_test_pool,
     %% pool_size=1 because in-memory SQLite databases are per-connection.
