@@ -36,6 +36,14 @@ calls inside the fun route to the same conn.
 -eqwalizer({nowarn_function, transaction/4}).
 -eqwalizer({nowarn_function, collect_rows/3}).
 
+%% esqlite3:step/1's own -spec claims StepResult :: row() | '$done' | error(),
+%% omitting '$busy' - but the NIF genuinely returns the bare atom '$busy'
+%% (confirmed empirically: esqlite_step in esqlite3_nif.c returns it
+%% directly, not wrapped via make_sqlite3_error_tuple like every other
+%% non-ok rc). Dialyzer, trusting the incomplete upstream spec, sees the
+%% '$busy' clause below as unreachable; it is not.
+-dialyzer({nowarn_function, collect_rows/3}).
+
 -export([
     query/5,
     query_on/4,
@@ -147,6 +155,15 @@ collect_rows(Stmt, ColNames, Acc) ->
     case esqlite3:step(Stmt) of
         '$done' ->
             lists:reverse(Acc);
+        %% esqlite's NIF sets a 2s busy_timeout on every connection and
+        %% retries internally within SQLite itself; '$busy' only surfaces
+        %% here once that retry has already been exhausted (unlike every
+        %% other error path, which esqlite already wraps as {error, _} -
+        %% see esqlite_step in esqlite3_nif.c). Without this clause a
+        %% write racing another writer past the busy_timeout crashes the
+        %% caller with a case_clause instead of getting a reportable error.
+        '$busy' ->
+            {error, busy};
         {error, _} = Err ->
             Err;
         Row when is_list(Row) ->
