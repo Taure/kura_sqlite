@@ -55,7 +55,7 @@ checkout_waits_for_a_checkin_test() ->
         %% The only connection is held for 30ms by the process above;
         %% a default-timeout checkout must wait it out and succeed
         %% rather than fail-fast on {error, no_conns}.
-        ?assertEqual({ok, Conn, Conn}, kura_pool_sqlite:checkout(Name, #{timeout => 2000}))
+        ?assertMatch({ok, Conn, _}, kura_pool_sqlite:checkout(Name, #{timeout => 2000}))
     after
         kura_pool_sqlite:stop_pool(Name)
     end.
@@ -125,6 +125,49 @@ race_worker(Name, Holders, Rounds, Parent) ->
 
 free_count(Name) ->
     length(ets:select(Name, ets:fun2ms(fun({Conn, free}) -> Conn end))).
+
+reclaims_a_lease_whose_holder_died_test() ->
+    Name = pool_for_dead_holder,
+    {ok, _} = kura_pool_sqlite:start_pool(Name, #{database => <<":memory:">>, pool_size => 1}),
+    try
+        Parent = self(),
+        %% The only connection is leased, mid-transaction, by a process
+        %% that then dies without checking in.
+        {Holder, Ref} = spawn_monitor(fun() ->
+            {ok, Conn, _Token} = kura_pool_sqlite:checkout(Name, #{}),
+            ok = esqlite3:exec(Conn, ~"CREATE TABLE t (id INTEGER)"),
+            ok = esqlite3:exec(Conn, ~"BEGIN"),
+            ok = esqlite3:exec(Conn, ~"INSERT INTO t VALUES (1)"),
+            Parent ! leased,
+            receive never -> ok end
+        end),
+        receive leased -> ok end,
+        ?assertEqual({error, no_conns}, kura_pool_sqlite:checkout(Name, #{timeout => 0})),
+        exit(Holder, kill),
+        receive {'DOWN', Ref, process, Holder, _} -> ok end,
+        %% Taken over, its transaction rolled back.
+        {ok, Conn, Token} = kura_pool_sqlite:checkout(Name, #{timeout => 0}),
+        ?assertEqual([[0]], esqlite3:q(Conn, ~"SELECT count(*) FROM t")),
+        ok = kura_pool_sqlite:checkin(Name, Token),
+        ?assertEqual(1, free_count(Name))
+    after
+        kura_pool_sqlite:stop_pool(Name)
+    end.
+
+a_live_holder_keeps_its_lease_test() ->
+    Name = pool_for_live_holder,
+    {ok, _} = kura_pool_sqlite:start_pool(Name, #{database => <<":memory:">>, pool_size => 1}),
+    try
+        {ok, _Conn, Token} = kura_pool_sqlite:checkout(Name, #{}),
+        %% Handed to another process that's alive: still not reclaimable,
+        %% even after the original holder (this test) would have gone.
+        Other = spawn(fun() -> receive stop -> ok end end),
+        ok = kura_pool_sqlite:give_away(Token, Other, undefined),
+        ?assertEqual({error, no_conns}, kura_pool_sqlite:checkout(Name, #{timeout => 0})),
+        Other ! stop
+    after
+        kura_pool_sqlite:stop_pool(Name)
+    end.
 
 stop_pool_idempotent_test() ->
     Name = pool_for_stop,

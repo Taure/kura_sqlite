@@ -38,6 +38,19 @@ backend, whose default wait is nonzero for the identical reason.
 `#{timeout => 0}` restores the old fail-immediately behavior for a
 caller that specifically wants it.
 
+## Leases whose holder died
+
+A connection is leased as `{busy, Pid}`, and only `checkin/2` frees it.
+A holder that dies first — a request handler killed when its client
+went away mid-query, say — never checks in, and that connection is lost
+for the life of the pool; once every one is lost, every checkout fails
+with `{error, no_conns}` for good. So when no connection is free,
+`checkout/2` takes over one whose holder is no longer alive (the same
+atomic `select_replace/2` as an ordinary lease), rolling back whatever
+transaction it may have died inside before handing it out. `give_away/3`
+records the new holder, so a lease handed on isn't mistaken for one
+whose holder died.
+
 ## Example
 
 ```erlang
@@ -154,11 +167,36 @@ try_checkout(Name) ->
                 fun({C, free}) when C =:= Conn -> {C, {busy, self()}} end
             ),
             case ets:select_replace(Name, MatchSpec) of
-                1 -> {ok, Conn, Conn};
+                1 -> {ok, Conn, {Name, Conn}};
                 0 -> try_checkout(Name)
             end;
         '$end_of_table' ->
-            {error, no_conns}
+            reclaim_dead_lease(Name)
+    end.
+
+%% No connection is free: take over one whose holder has died (see the
+%% moduledoc's "Leases whose holder died"). The takeover is the same
+%% atomic match-and-replace on `{Conn, {busy, DeadPid}}`, so two callers
+%% can't both reclaim it.
+reclaim_dead_lease(Name) ->
+    Leases = ets:select(Name, ets:fun2ms(fun({Conn, {busy, Pid}}) -> {Conn, Pid} end)),
+    case [L || {_, Pid} = L <- Leases, not is_process_alive(Pid)] of
+        [] ->
+            {error, no_conns};
+        [{Conn, Dead} | _] ->
+            MatchSpec = ets:fun2ms(
+                fun({C, {busy, P}}) when C =:= Conn, P =:= Dead -> {C, {busy, self()}} end
+            ),
+            case ets:select_replace(Name, MatchSpec) of
+                1 ->
+                    %% It may have died mid-transaction.
+                    try esqlite3:exec(Conn, <<"ROLLBACK">>) of _ -> ok
+                    catch _:_ -> ok
+                    end,
+                    {ok, Conn, {Name, Conn}};
+                0 ->
+                    try_checkout(Name)
+            end
     end.
 
 -spec checkin(kura_pool:name(), kura_pool:token()) -> ok.
@@ -172,16 +210,21 @@ checkin(Name, Token) ->
             %% (idempotent, matches kura_pool_pgo / kura_pool_ets) and
             %% a double checkin is harmless - both in one atomic call,
             %% no read-then-write gap for a concurrent checkout to land in.
-            _ = ets:update_element(Name, Token, {2, free}),
+            _ = ets:update_element(Name, conn(Token), {2, free}),
             ok
     end.
 
 -spec give_away(kura_pool:token(), pid(), term()) -> ok | {error, term()}.
+give_away({Name, Conn}, NewOwner, _GiftData) when is_pid(NewOwner) ->
+    %% The new holder is recorded, so the lease isn't taken for one whose
+    %% holder died once the old one exits (see reclaim_dead_lease/1).
+    case ets:whereis(Name) of
+        undefined -> ok;
+        _Tid ->
+            _ = ets:update_element(Name, Conn, {2, {busy, NewOwner}}),
+            ok
+    end;
 give_away(_Token, NewOwner, _GiftData) when is_pid(NewOwner) ->
-    %% No transferable per-conn structure to hand off; the protocol
-    %% guarantee callers care about (checkin not crashing on a
-    %% transferred token) holds because checkin keys off the conn
-    %% handle rather than the owner pid.
     ok;
 give_away(_Token, _NotPid, _GiftData) ->
     {error, badarg}.
@@ -209,6 +252,11 @@ capabilities() ->
 %%----------------------------------------------------------------------
 %% Internal
 %%----------------------------------------------------------------------
+
+%% A token is `{Pool, Conn}`; a bare connection (an older token) is
+%% accepted too.
+conn({_Name, Conn}) -> Conn;
+conn(Conn) -> Conn.
 
 -spec open_n(binary() | string(), non_neg_integer(), [esqlite3:esqlite3()]) ->
     {ok, [esqlite3:esqlite3()]} | {error, term()}.
