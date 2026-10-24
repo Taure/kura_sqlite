@@ -17,9 +17,29 @@ prefix.
 ## Transactions
 
 `transaction/4` wraps the fun in `BEGIN`/`COMMIT` (or `ROLLBACK` on
-throw) using `esqlite3:exec/2`. The leased connection is stashed in
-the process dict under `kura_sqlite_tx_conn` so nested `query/5`
-calls inside the fun route to the same conn.
+a raise) using `esqlite3:exec/2`. The leased connection is kept in the
+process dictionary, per pool, so `query/5` calls inside the fun route
+to the same connection.
+
+A `transaction/4` on the same pool inside the fun runs on that
+connection under a `SAVEPOINT`: its work is released into the outer
+transaction when the fun returns, rolled back to the savepoint when it
+raises, and only kept if the outermost transaction commits. A
+transaction on another pool, or in another process, is independent.
+
+Failures raise rather than return, so they cannot be mistaken for the
+fun's own result:
+
+- `{kura_driver_sqlite, {begin_failed, Reason}}` when `BEGIN` fails.
+- `{kura_driver_sqlite, {savepoint_failed, Reason}}` when a nested
+  `SAVEPOINT` fails. The nested fun does not run.
+- `{kura_driver_sqlite, {commit_failed, Reason}}` when `COMMIT` fails,
+  for example on a deferred foreign key. The transaction is rolled
+  back and nothing it wrote is kept.
+- `transaction_rolled_back` when SQLite has already rolled the whole
+  transaction back underneath a nested one.
+
+A checkout that fails is still returned as `{error, Reason}`.
 
 ## Caveats (phase 2 skeleton)
 
@@ -48,7 +68,7 @@ calls inside the fun route to the same conn.
 
 -spec query(module(), atom(), iodata(), [term()], map()) -> dynamic().
 query(PoolMod, Pool, SQL, Params, _Opts) ->
-    case erlang:get(kura_sqlite_tx_conn) of
+    case erlang:get({kura_sqlite_tx_conn, Pool}) of
         undefined ->
             kura_pool:with_conn(PoolMod, Pool, fun(Conn) ->
                 run(Conn, SQL, Params)
@@ -63,47 +83,69 @@ query_on(Conn, SQL, Params, _Opts) ->
 
 -spec transaction(module(), atom(), fun(() -> term()), map()) -> term().
 transaction(PoolMod, Pool, Fun, _Opts) ->
-    case kura_pool:with_conn(PoolMod, Pool, fun(Conn) -> begin_run_finish(Conn, Fun) end) of
-        {sqlite_tx_threw, Class, Reason, Stack} ->
-            erlang:raise(Class, Reason, Stack);
-        Result ->
-            Result
+    case erlang:get({kura_sqlite_tx_conn, Pool}) of
+        undefined ->
+            kura_pool:with_conn(PoolMod, Pool, fun(Conn) -> outermost(Pool, Conn, Fun) end);
+        Conn ->
+            nested(Conn, Fun)
     end.
 
 %%----------------------------------------------------------------------
 %% Internal
 %%----------------------------------------------------------------------
 
--spec begin_run_finish(esqlite3:esqlite3(), fun(() -> term())) -> term().
-begin_run_finish(Conn, Fun) ->
-    Prior = erlang:put(kura_sqlite_tx_conn, Conn),
+-spec outermost(atom(), esqlite3:esqlite3(), fun(() -> term())) -> term().
+outermost(Pool, Conn, Fun) ->
     case esqlite3:exec(Conn, ~"BEGIN") of
         ok ->
+            _ = erlang:put({kura_sqlite_tx_conn, Pool}, Conn),
             try Fun() of
-                Result ->
-                    case esqlite3:exec(Conn, ~"COMMIT") of
-                        ok -> Result;
-                        {error, _} = E -> E
-                    end
+                Result -> committed(Conn, Result)
             catch
                 Class:Reason:Stack ->
                     _ = esqlite3:exec(Conn, ~"ROLLBACK"),
-                    {sqlite_tx_threw, Class, Reason, Stack}
+                    erlang:raise(Class, Reason, Stack)
             after
-                restore(Prior)
+                erlang:erase({kura_sqlite_tx_conn, Pool})
             end;
-        {error, _} = Err ->
-            restore(Prior),
-            Err
+        {error, Reason} ->
+            error({kura_driver_sqlite, {begin_failed, Reason}})
     end.
 
--spec restore(term()) -> ok.
-restore(undefined) ->
-    erlang:erase(kura_sqlite_tx_conn),
-    ok;
-restore(Prior) ->
-    erlang:put(kura_sqlite_tx_conn, Prior),
-    ok.
+%% A COMMIT refused by a deferred constraint leaves the transaction open.
+-spec committed(esqlite3:esqlite3(), term()) -> term().
+committed(Conn, Result) ->
+    case esqlite3:exec(Conn, ~"COMMIT") of
+        ok ->
+            Result;
+        {error, Reason} ->
+            _ = esqlite3:exec(Conn, ~"ROLLBACK"),
+            error({kura_driver_sqlite, {commit_failed, Reason}})
+    end.
+
+-spec nested(esqlite3:esqlite3(), fun(() -> term())) -> term().
+nested(Conn, Fun) ->
+    Savepoint = [~"kura_savepoint_", integer_to_binary(erlang:unique_integer([positive]))],
+    case esqlite3:exec(Conn, [~"SAVEPOINT ", Savepoint]) of
+        ok ->
+            try Fun() of
+                Result -> released(Conn, Savepoint, Result)
+            catch
+                Class:Reason:Stack ->
+                    _ = esqlite3:exec(Conn, [~"ROLLBACK TO SAVEPOINT ", Savepoint]),
+                    _ = esqlite3:exec(Conn, [~"RELEASE SAVEPOINT ", Savepoint]),
+                    erlang:raise(Class, Reason, Stack)
+            end;
+        {error, Reason} ->
+            error({kura_driver_sqlite, {savepoint_failed, Reason}})
+    end.
+
+-spec released(esqlite3:esqlite3(), iodata(), term()) -> term().
+released(Conn, Savepoint, Result) ->
+    case esqlite3:exec(Conn, [~"RELEASE SAVEPOINT ", Savepoint]) of
+        ok -> Result;
+        {error, _} -> error(transaction_rolled_back)
+    end.
 
 -spec run(esqlite3:esqlite3(), iodata(), [term()]) -> dynamic().
 run(Conn, SQL, Params) ->
