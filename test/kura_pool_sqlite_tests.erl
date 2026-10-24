@@ -521,8 +521,8 @@ ddl_on_main_keeps_the_connection_test() ->
     {ok, _} = kura_pool_sqlite:start_pool(Name, #{database => ~":memory:", pool_size => 1}),
     try
         #{} = sql(Name, ~"CREATE TABLE t (id INTEGER)"),
-        #{} = sql(Name, ~"PRAGMA busy_timeout = 100"),
-        ?assertMatch(#{rows := [#{timeout := 100}]}, sql(Name, ~"PRAGMA busy_timeout")),
+        #{} = sql(Name, ~"PRAGMA cache_size = 100"),
+        ?assertMatch(#{rows := [#{cache_size := 100}]}, sql(Name, ~"PRAGMA cache_size")),
         ?assertMatch(#{rows := []}, sql(Name, ~"SELECT id FROM t"))
     after
         kura_pool_sqlite:stop_pool(Name)
@@ -586,7 +586,9 @@ write_after_a_busy_statement_is_committed_test() ->
     {ok, Other} = esqlite3:open(binary_to_list(Path)),
     try
         #{} = sql(Name, ~"CREATE TABLE t (id INTEGER)"),
-        #{} = sql(Name, ~"PRAGMA busy_timeout = 50"),
+        ok = kura_pool:with_conn(kura_pool_sqlite, Name, fun(Conn) ->
+            esqlite3:exec(Conn, ~"PRAGMA busy_timeout = 50")
+        end),
         ok = esqlite3:exec(Other, ~"BEGIN IMMEDIATE"),
         Self = self(),
         Busy = spawn(fun() ->
@@ -613,6 +615,67 @@ write_after_a_busy_statement_is_committed_test() ->
         _ = esqlite3:close(Other),
         kura_pool_sqlite:stop_pool(Name),
         file:delete(Path)
+    end.
+
+exclusive_locking_mode_is_not_inherited_test() ->
+    with_file_pool(pool_for_locking_mode, fun(Name) ->
+        #{} = sql(Name, ~"PRAGMA locking_mode = EXCLUSIVE"),
+        #{} = sql(Name, ~"INSERT INTO t VALUES (1)"),
+        {ok, Other} = esqlite3:open(binary_to_list(db_path(Name))),
+        try
+            ok = esqlite3:exec(Other, ~"PRAGMA busy_timeout = 0"),
+            ?assertEqual(ok, esqlite3:exec(Other, ~"INSERT INTO t VALUES (2)"))
+        after
+            _ = esqlite3:close(Other)
+        end
+    end).
+
+connection_settings_are_not_inherited_test() ->
+    with_file_pool(pool_for_settings, fun(Name) ->
+        _ = [
+            begin
+                Default = sql(Name, [~"PRAGMA ", Setting]),
+                #{} = sql(Name, [~"PRAGMA ", Setting, ~" = ", Value]),
+                ?assertEqual({Setting, Default}, {Setting, sql(Name, [~"PRAGMA ", Setting])})
+            end
+         || {Setting, Value} <- changed_settings()
+        ],
+        ok
+    end).
+
+journal_mode_off_is_not_inherited_test() ->
+    with_file_pool(pool_for_journal_off, fun(Name) ->
+        #{} = sql(Name, ~"PRAGMA journal_mode = OFF"),
+        ?assertMatch(#{rows := [#{journal_mode := ~"delete"}]}, sql(Name, ~"PRAGMA journal_mode"))
+    end).
+
+switch_to_wal_keeps_the_connection_test() ->
+    with_file_pool(pool_for_wal, fun(Name) ->
+        #{} = sql(Name, ~"PRAGMA journal_mode = WAL"),
+        {Conn, Token} = checkout_within(Name, 1000),
+        ok = kura_pool_sqlite:checkin(Name, Token),
+        #{} = sql(Name, ~"CREATE TABLE u (id INTEGER)"),
+        ?assertMatch({Conn, _}, checkout_within(Name, 1000))
+    end).
+
+settings_after_a_switch_to_wal_become_the_baseline_test() ->
+    Dir = filename:join(os:getenv("TMPDIR", "/tmp"), "pool_for_wal_baseline"),
+    _ = file:del_dir_r(Dir),
+    ok = file:make_dir(Dir),
+    Name = pool_for_wal_baseline,
+    {ok, _} = kura_pool_sqlite:start_pool(Name, #{
+        database => filename:join(Dir, "db"), pool_size => 1
+    }),
+    try
+        #{} = sql(Name, ~"PRAGMA journal_mode = WAL"),
+        {Conn, Token} = checkout_within(Name, 1000),
+        ok = kura_pool_sqlite:checkin(Name, Token),
+        ok = file:del_dir_r(Dir),
+        #{} = sql(Name, ~"PRAGMA user_version"),
+        ?assertMatch({Conn, _}, checkout_within(Name, 1000))
+    after
+        kura_pool_sqlite:stop_pool(Name),
+        file:del_dir_r(Dir)
     end.
 
 dropped_connection_stays_usable_by_a_process_still_holding_it_test() ->
@@ -698,6 +761,14 @@ wait_for_checkout_loop(Name, Deadline) ->
                     wait_for_checkout_loop(Name, Deadline)
             end
     end.
+
+changed_settings() ->
+    [
+        {~"synchronous", ~"OFF"},
+        {~"recursive_triggers", ~"ON"},
+        {~"max_page_count", ~"100000"},
+        {~"busy_timeout", ~"1"}
+    ].
 
 with_file_pool(Name, Test) ->
     Path = db_path(Name),

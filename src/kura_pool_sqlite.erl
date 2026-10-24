@@ -28,22 +28,35 @@ the connection and opens a fresh one in its place. On `:memory:` a fresh
 connection is an empty database.
 
 A dropped connection is not closed by the pool: it is closed when the last
-process holding it lets it go. A connection dropped because its rollback
-failed keeps that transaction, and its write lock, until then.
+process holding it lets it go. The pool first puts it back in NORMAL
+locking mode, so a lease that set EXCLUSIVE does not keep the database
+locked meanwhile. A connection dropped because its rollback failed keeps
+that transaction, and its write lock, until then.
 
 A lease that ran anything other than `SELECT`, `INSERT`, `UPDATE` or
 `DELETE`, in any letter case and with or without a leading `WITH`, through
 `kura_driver_sqlite` gets a closer look on return. If it
 left TEMP tables, views or triggers, an attached database, or a
-`query_only`, `writable_schema`, `foreign_keys`, `trusted_schema` or
-`ignore_check_constraints` setting different from what a new connection
-has, the connection is dropped and a fresh one opened. A reopened
-connection starts from the defaults, so settings a consumer made on the
-old one, checked or not (`busy_timeout`, for example), are not kept. On
-`:memory:` the reopened connection is an empty database, so such a lease
-loses the data that connection held.
-Statements run on the connection directly through `esqlite3` are not
-seen.
+`query_only`, `writable_schema`, `foreign_keys`, `trusted_schema`,
+`ignore_check_constraints`, `locking_mode`, `synchronous`,
+`recursive_triggers`, `max_page_count`, `busy_timeout` or `journal_mode`
+setting different from what a new connection has, the connection is
+dropped and a fresh one opened. WAL is kept in the database file, so a
+lease that switches the journal mode into or out of WAL changes what a new
+connection has, and that is not counted against it. A reopened connection
+starts from the defaults, so settings a consumer made on the old one,
+checked or not (`cache_size`, for example), are not kept. On `:memory:`
+the reopened connection is an empty database, so such a lease loses the
+data that connection held. Statements run on the connection directly
+through `esqlite3` are not seen.
+
+Foreign keys are off on every new connection, SQLite's default. A consumer
+that turns them on through the driver has them for that lease only, and
+one that turns them on directly through `esqlite3` loses them when the
+connection is reopened for any of the reasons above.
+
+`last_insert_rowid()` and `changes()` belong to the connection and are not
+reset, so a lease can read the values the previous lease left.
 
 One window remains: a borrower killed after it has called into esqlite but
 before the call has taken the connection's lock. That call can still run
@@ -97,16 +110,26 @@ connections nobody holds.
     ~"writable_schema",
     ~"foreign_keys",
     ~"trusted_schema",
-    ~"ignore_check_constraints"
+    ~"ignore_check_constraints",
+    ~"locking_mode",
+    ~"synchronous",
+    ~"recursive_triggers",
+    ~"max_page_count",
+    ~"busy_timeout",
+    ~"journal_mode"
 ]).
 
 -type lease() :: #{lease := reference(), monitor := reference(), dirty := boolean()}.
+
+-type outcome() :: kept | {kept, [term()]} | dropped.
+
+-type baseline() :: #{settings := [term()], db_path := binary() | string()}.
 
 -type state() :: #{
     name := atom(),
     supervisor := pid(),
     db_path := binary() | string(),
-    settings := [term()],
+    baseline := baseline(),
     available := [esqlite3:esqlite3()],
     out := #{esqlite3:esqlite3() => lease()},
     resetting := #{pid() => {reference(), esqlite3:esqlite3(), gen_server:from() | none}}
@@ -216,7 +239,7 @@ init({Name, DbPath, Size, Supervisor}) ->
                 name => Name,
                 supervisor => Supervisor,
                 db_path => DbPath,
-                settings => opened_settings(Conns),
+                baseline => baseline(Conns, DbPath),
                 available => Conns,
                 out => #{},
                 resetting => #{}
@@ -276,11 +299,19 @@ handle_cast(_Request, State) ->
 
 -spec handle_info(term(), state()) -> {noreply, state()}.
 handle_info({reset, Helper, Outcome}, State = #{resetting := Resetting}) when
-    is_map_key(Helper, Resetting), Outcome =:= kept orelse Outcome =:= dropped
+    is_map_key(Helper, Resetting)
 ->
     #{Helper := {Monitor, Conn, From}} = Resetting,
     true = erlang:demonitor(Monitor, [flush]),
-    {noreply, restored(Conn, From, Outcome, State#{resetting := maps:remove(Helper, Resetting)})};
+    Rest = State#{resetting := maps:remove(Helper, Resetting)},
+    case Outcome of
+        {kept, Settings} when is_list(Settings) ->
+            {noreply, restored(Conn, From, kept, learned(Settings, Rest))};
+        kept ->
+            {noreply, restored(Conn, From, kept, Rest)};
+        _ ->
+            {noreply, restored(Conn, From, dropped, Rest)}
+    end;
 %% A reset that raised, for example on a connection the borrower closed
 %% itself, leaves the connection in an unknown state.
 handle_info({'DOWN', _Monitor, process, Helper, _Reason}, State = #{resetting := Resetting}) when
@@ -339,17 +370,21 @@ returned(
     Conn,
     #{monitor := Monitor, dirty := Dirty},
     From,
-    State = #{out := Out, resetting := Resetting, settings := Settings}
+    State = #{out := Out, resetting := Resetting, baseline := Baseline}
 ) ->
     true = erlang:demonitor(Monitor, [flush]),
     Pool = self(),
     {Helper, HelperMonitor} = spawn_monitor(fun() ->
-        Pool ! {reset, self(), reset(Conn, Dirty, Settings)}
+        Pool ! {reset, self(), reset(Conn, Dirty, Baseline)}
     end),
     State#{
         out := maps:remove(Conn, Out),
         resetting := Resetting#{Helper => {HelperMonitor, Conn, From}}
     }.
+
+-spec learned([term()], state()) -> state().
+learned(Settings, State = #{baseline := Baseline}) ->
+    State#{baseline := Baseline#{settings := Settings}}.
 
 -spec restored(esqlite3:esqlite3(), gen_server:from() | none, kept | dropped, state()) -> state().
 restored(Conn, From, kept, State = #{available := Available}) ->
@@ -380,13 +415,22 @@ replied(From) -> gen_server:reply(From, ok).
 %% waiting on a lock, has returned before the transaction state is read.
 %% Until then `get_autocommit/1` can report a transaction that is still
 %% open as finished.
--spec reset(esqlite3:esqlite3(), boolean(), [term()]) -> kept | dropped.
-reset(Conn, Dirty, Settings) ->
+-spec reset(esqlite3:esqlite3(), boolean(), baseline()) -> outcome().
+reset(Conn, Dirty, Baseline) ->
     _ = esqlite3:exec(Conn, ~""),
-    case rolled_back(Conn) andalso (not Dirty orelse pristine(Conn, Settings)) of
+    case rolled_back(Conn) of
+        true when Dirty -> inspected(Conn, Baseline);
         true -> kept;
-        false -> dropped
+        false -> unlocked(Conn)
     end.
+
+%% A dropped connection lives on until no process holds it. In EXCLUSIVE
+%% locking mode it would keep the database locked all that time; back in
+%% NORMAL mode it gives the lock up on its next access.
+-spec unlocked(esqlite3:esqlite3()) -> dropped.
+unlocked(Conn) ->
+    _ = esqlite3:exec(Conn, ~"PRAGMA locking_mode = NORMAL; SELECT count(*) FROM sqlite_schema"),
+    dropped.
 
 -spec rolled_back(esqlite3:esqlite3()) -> boolean().
 rolled_back(Conn) ->
@@ -398,27 +442,49 @@ rolled_back(Conn) ->
             esqlite3:get_autocommit(Conn)
     end.
 
-%% TEMP tables, views and triggers, attached databases and changed settings
-%% outlive the lease that made them.
--spec pristine(esqlite3:esqlite3(), [term()]) -> boolean().
-pristine(Conn, Settings) ->
-    true =:= apart(fun() -> unchanged(Conn, Settings) end).
+-spec inspected(esqlite3:esqlite3(), baseline()) -> outcome().
+inspected(Conn, Baseline) ->
+    case apart(fun() -> unchanged(Conn, Baseline) end) of
+        true -> kept;
+        {new, Settings} when is_list(Settings) -> {kept, Settings};
+        _ -> unlocked(Conn)
+    end.
 
--spec unchanged(esqlite3:esqlite3(), [term()]) -> boolean().
-unchanged(Conn, Settings) ->
+-spec unchanged(esqlite3:esqlite3(), baseline()) -> boolean() | {new, [term()]}.
+unchanged(Conn, #{settings := Opened, db_path := DbPath}) ->
     Temp = esqlite3:q(Conn, ~"SELECT count(*) FROM temp.sqlite_schema"),
     Attached = esqlite3:q(
         Conn, ~"SELECT count(*) FROM pragma_database_list WHERE name NOT IN ('main', 'temp')"
     ),
-    {Temp, Attached, settings(Conn)} =:= {[[0]], [[0]], Settings}.
+    case {Temp, Attached} =:= {[[0]], [[0]]} andalso settings(Conn) of
+        false -> false;
+        Opened -> true;
+        Settings -> Settings =:= settings_of_new(DbPath) andalso {new, Settings}
+    end.
 
--spec opened_settings([esqlite3:esqlite3()]) -> [term()].
-opened_settings([Conn | _]) ->
+%% WAL is kept in the database file, and a connection opened on a WAL
+%% database starts from other defaults (`synchronous`), so a lease that
+%% switched the journal mode changed what a new connection has. Settings
+%% that differ from the baseline are held against a connection opened now,
+%% and become the baseline if they match it.
+-spec settings_of_new(binary() | string()) -> [term()] | {error, term()}.
+settings_of_new(DbPath) ->
+    case esqlite3:open(to_filename(DbPath)) of
+        {ok, New} ->
+            Settings = settings(New),
+            closed = closed(New),
+            Settings;
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+-spec baseline([esqlite3:esqlite3()], binary() | string()) -> baseline().
+baseline([Conn | _], DbPath) ->
     case apart(fun() -> settings(Conn) end) of
-        Settings when is_list(Settings) -> Settings
+        Settings when is_list(Settings) -> #{settings => Settings, db_path => DbPath}
     end;
-opened_settings([]) ->
-    [].
+baseline([], DbPath) ->
+    #{settings => [], db_path => DbPath}.
 
 -spec settings(esqlite3:esqlite3()) -> [term()].
 settings(Conn) ->
