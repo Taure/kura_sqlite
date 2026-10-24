@@ -29,8 +29,8 @@ on a lock leaves that `COMMIT` running, and it can fail and leave the
 transaction open after the borrower is gone. A transaction still open
 after that is rolled back. If the rollback fails, or the reset raises, for
 example because the borrower closed the connection itself, the pool drops
-the connection and opens a fresh one in its place. On `:memory:` a fresh
-connection is an empty database.
+the connection and opens a fresh one in its place, or, if that fails, on
+a later checkout. On `:memory:` a fresh connection is an empty database.
 
 A dropped connection is not closed by the pool: it is closed when the last
 process holding it lets it go. The pool first puts it back in NORMAL
@@ -136,6 +136,8 @@ connections nobody holds.
     name := atom(),
     supervisor := pid(),
     db_path := binary() | string(),
+    size := non_neg_integer(),
+    short := boolean(),
     baseline := baseline(),
     available := [esqlite3:esqlite3()],
     out := #{esqlite3:esqlite3() => lease()},
@@ -246,6 +248,8 @@ init({Name, DbPath, Size, Supervisor}) ->
                 name => Name,
                 supervisor => Supervisor,
                 db_path => DbPath,
+                size => Size,
+                short => false,
                 baseline => baseline(Conns, DbPath),
                 available => Conns,
                 out => #{},
@@ -257,20 +261,21 @@ init({Name, DbPath, Size, Supervisor}) ->
 
 -spec handle_call(request(), gen_server:from(), state()) ->
     {reply, term(), state()} | {noreply, state()}.
-handle_call(
-    {checkout, Borrower, Lease},
-    _From,
-    State = #{name := Name, available := [Conn | Rest], out := Out}
-) ->
-    Monitor = erlang:monitor(process, Borrower),
-    {reply, {ok, Conn, {Name, Conn, Lease}}, State#{
-        available := Rest,
-        out := Out#{
-            Conn => #{lease => Lease, monitor => Monitor, dirty => false, given_away => false}
-        }
-    }};
-handle_call({checkout, _Borrower, _Lease}, _From, State) ->
-    {reply, {error, no_conns}, State};
+handle_call({checkout, Borrower, Lease}, _From, State0) ->
+    case replenished(State0) of
+        State = #{name := Name, available := [Conn | Rest], out := Out} ->
+            Monitor = erlang:monitor(process, Borrower),
+            {reply, {ok, Conn, {Name, Conn, Lease}}, State#{
+                available := Rest,
+                out := Out#{
+                    Conn => #{
+                        lease => Lease, monitor => Monitor, dirty => false, given_away => false
+                    }
+                }
+            }};
+        State ->
+            {reply, {error, no_conns}, State}
+    end;
 handle_call({checkin, Conn, Lease}, From, State = #{out := Out}) ->
     case Out of
         #{Conn := Held = #{lease := Lease}} ->
@@ -402,14 +407,29 @@ restored(Conn, From, kept, State = #{available := Available}) ->
 %% esqlite's close is not safe against a statement another process is still
 %% running on the connection, and gives up without closing when its rollback
 %% fails, so a dropped connection is left to its destructor.
-restored(_Conn, From, dropped, State = #{name := Name, db_path := DbPath, available := Available}) ->
+restored(_Conn, From, dropped, State) ->
     ok = replied(From),
+    opened(State).
+
+%% A connection that could not be replaced is opened on a later checkout.
+-spec replenished(state()) -> state().
+replenished(
+    State = #{size := Size, available := [], out := Out, resetting := Resetting}
+) when map_size(Out) + map_size(Resetting) < Size ->
+    opened(State);
+replenished(State) ->
+    State.
+
+-spec opened(state()) -> state().
+opened(State = #{name := Name, db_path := DbPath, available := Available, short := Short}) ->
     case esqlite3:open(to_filename(DbPath)) of
         {ok, Fresh} ->
-            State#{available := [Fresh | Available]};
+            State#{available := [Fresh | Available], short := false};
+        {error, _} when Short ->
+            State;
         {error, Reason} ->
             ?LOG_WARNING(#{event => connection_not_replaced, pool => Name, reason => Reason}),
-            State
+            State#{short := true}
     end.
 
 -spec replied(gen_server:from() | none) -> ok.

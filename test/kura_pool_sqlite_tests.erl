@@ -716,6 +716,31 @@ dropped_connection_stays_usable_by_a_process_still_holding_it_test() ->
         ?assertEqual([[0]], esqlite3:q(Conn, ~"SELECT count(*) FROM scratch"))
     end).
 
+connection_that_could_not_be_replaced_is_opened_on_checkout_test() ->
+    Dir = filename:join(os:getenv("TMPDIR", "/tmp"), "pool_for_late_reopen"),
+    _ = file:del_dir_r(Dir),
+    ok = file:make_dir(Dir),
+    Name = pool_for_late_reopen,
+    {ok, _} = kura_pool_sqlite:start_pool(Name, #{
+        database => filename:join(Dir, "db"), pool_size => 1
+    }),
+    ok = logger:add_handler(Name, ?MODULE, #{config => #{test => self()}}),
+    try
+        ok = file:del_dir_r(Dir),
+        ok = planted(Name, [~"CREATE TEMP TABLE scratch (id INTEGER)"]),
+        ?assertEqual({error, no_conns}, kura_pool_sqlite:checkout(Name, #{})),
+        ?assertEqual({error, no_conns}, kura_pool_sqlite:checkout(Name, #{})),
+        ?assertEqual([connection_not_replaced], logged()),
+        ok = file:make_dir(Dir),
+        {ok, _Conn, Token} = kura_pool_sqlite:checkout(Name, #{}),
+        ?assertEqual({error, no_conns}, kura_pool_sqlite:checkout(Name, #{})),
+        ok = kura_pool_sqlite:checkin(Name, Token)
+    after
+        _ = logger:remove_handler(Name),
+        kura_pool_sqlite:stop_pool(Name),
+        file:del_dir_r(Dir)
+    end.
+
 reclaimed_given_away_connection_is_not_lent_again_test() ->
     Name = pool_for_reclaimed_gift,
     {ok, _} = kura_pool_sqlite:start_pool(Name, #{database => ~":memory:", pool_size => 1}),
@@ -868,6 +893,12 @@ checkout_within_loop(Name, Deadline) ->
 
 db_path(Name) ->
     iolist_to_binary(filename:join(os:getenv("TMPDIR", "/tmp"), atom_to_list(Name) ++ ".db")).
+
+logged() ->
+    receive
+        {logged, Event} -> [Event | logged()]
+    after 0 -> []
+    end.
 
 log(#{msg := {report, #{event := Event}}}, #{config := #{test := Test}}) ->
     Test ! {logged, Event},
