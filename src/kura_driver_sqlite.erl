@@ -256,16 +256,21 @@ run(Conn, SQL, Params) ->
             Err
     end.
 
+%% A statement that stops short of `'$done'`, on an error or `'$busy'`,
+%% holds its connection's implicit transaction open until it is reset, and
+%% anything the next borrower writes in autocommit would stay uncommitted.
 -spec run_prepared(esqlite3:esqlite3_stmt(), [term()], atom()) -> dynamic().
 run_prepared(Stmt, Params, Cmd) ->
     case bind_params(Stmt, Params) of
         ok ->
             ColNames = esqlite3:column_names(Stmt),
-            case collect_rows(Stmt, ColNames, []) of
+            try collect_rows(Stmt, ColNames, []) of
                 {error, _} = Err ->
                     Err;
                 Rows when is_list(Rows) ->
                     #{rows => Rows, num_rows => length(Rows), command => Cmd}
+            after
+                _ = esqlite3:reset(Stmt)
             end;
         {error, _} = Err ->
             Err

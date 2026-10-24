@@ -94,9 +94,6 @@ killed_borrower_releases_the_write_lock_test() ->
         #{} = sql(Name, ~"CREATE TABLE t (id INTEGER)"),
         Borrower = hold_in_transaction(Name, ~"INSERT INTO t VALUES (1)"),
         ?assertError({case_clause, '$busy'}, sql(Name, ~"INSERT INTO t VALUES (2)")),
-        %% The busy statement keeps its connection's implicit transaction
-        %% open until it is finalized.
-        true = erlang:garbage_collect(),
         ok = kill(Borrower),
         {_, First} = checkout_within(Name, 1000),
         {_, Second} = checkout_within(Name, 1000),
@@ -579,6 +576,43 @@ stop_pool_leaves_a_lease_in_use_working_test() ->
         )
     after
         kura_pool_sqlite:stop_pool(Name)
+    end.
+
+write_after_a_busy_statement_is_committed_test() ->
+    Name = pool_for_busy_statement,
+    Path = db_path(Name),
+    _ = file:delete(Path),
+    {ok, _} = kura_pool_sqlite:start_pool(Name, #{database => Path, pool_size => 1}),
+    {ok, Other} = esqlite3:open(binary_to_list(Path)),
+    try
+        #{} = sql(Name, ~"CREATE TABLE t (id INTEGER)"),
+        #{} = sql(Name, ~"PRAGMA busy_timeout = 50"),
+        ok = esqlite3:exec(Other, ~"BEGIN IMMEDIATE"),
+        Self = self(),
+        Busy = spawn(fun() ->
+            Self !
+                {busy,
+                    try sql(Name, ~"INSERT INTO t VALUES (1)") of
+                        Result -> Result
+                    catch
+                        error:Reason -> Reason
+                    end},
+            receive
+                never -> ok
+            end
+        end),
+        receive
+            {busy, Busied} -> ?assertEqual({case_clause, '$busy'}, Busied)
+        after 2000 -> error(never_busy)
+        end,
+        ok = esqlite3:exec(Other, ~"ROLLBACK"),
+        ?assertMatch(#{command := insert}, sql(Name, ~"INSERT INTO t VALUES (2)")),
+        ?assertEqual([[2]], esqlite3:q(Other, ~"SELECT id FROM t")),
+        ok = kill(Busy)
+    after
+        _ = esqlite3:close(Other),
+        kura_pool_sqlite:stop_pool(Name),
+        file:delete(Path)
     end.
 
 sql(Name, SQL) ->
