@@ -1,6 +1,8 @@
 -module(kura_pool_sqlite_tests).
 -include_lib("eunit/include/eunit.hrl").
 
+-export([log/2]).
+
 start_pool_opens_in_memory_db_test() ->
     Name = pool_for_in_memory,
     {ok, _} = kura_pool_sqlite:start_pool(Name, #{database => <<":memory:">>, pool_size => 2}),
@@ -406,6 +408,24 @@ checkin_of_a_closed_connection_replaces_it_test() ->
     after
         kura_pool_sqlite:stop_pool(Name),
         file:delete(Path)
+    end.
+
+reset_that_raises_is_logged_test() ->
+    Name = pool_for_raising_reset,
+    {ok, _} = kura_pool_sqlite:start_pool(Name, #{database => ~":memory:", pool_size => 1}),
+    ok = logger:add_handler(Name, ?MODULE, #{config => #{test => self()}}),
+    try
+        {ok, Conn, Token} = kura_pool_sqlite:checkout(Name, #{}),
+        ok = esqlite3:close(Conn),
+        ok = kura_pool_sqlite:checkin(Name, Token),
+        receive
+            {logged, connection_reset_failed} -> ok
+        after 1000 -> error(not_logged)
+        end,
+        ?assertMatch({_, _}, checkout_within(Name, 1000))
+    after
+        _ = logger:remove_handler(Name),
+        kura_pool_sqlite:stop_pool(Name)
     end.
 
 checkin_after_give_away_returns_the_connection_test() ->
@@ -848,3 +868,9 @@ checkout_within_loop(Name, Deadline) ->
 
 db_path(Name) ->
     iolist_to_binary(filename:join(os:getenv("TMPDIR", "/tmp"), atom_to_list(Name) ++ ".db")).
+
+log(#{msg := {report, #{event := Event}}}, #{config := #{test := Test}}) ->
+    Test ! {logged, Event},
+    ok;
+log(_Event, _Config) ->
+    ok.

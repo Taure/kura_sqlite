@@ -321,8 +321,8 @@ handle_info({reset, Helper, Outcome}, State = #{resetting := Resetting}) when
         _ ->
             {noreply, restored(Conn, From, dropped, Rest)}
     end;
-%% A reset that raised, for example on a connection the borrower closed
-%% itself, leaves the connection in an unknown state.
+%% A reset helper killed before it reported back leaves the connection in an
+%% unknown state.
 handle_info({'DOWN', _Monitor, process, Helper, _Reason}, State = #{resetting := Resetting}) when
     is_map_key(Helper, Resetting)
 ->
@@ -377,14 +377,14 @@ call(Name, Request, Timeout) ->
 -spec returned(esqlite3:esqlite3(), lease(), gen_server:from() | none, state()) -> state().
 returned(
     Conn,
-    #{monitor := Monitor, dirty := Dirty, given_away := GivenAway},
+    Held = #{monitor := Monitor},
     From,
-    State = #{out := Out, resetting := Resetting, baseline := Baseline}
+    State = #{name := Name, out := Out, resetting := Resetting, baseline := Baseline}
 ) ->
     true = erlang:demonitor(Monitor, [flush]),
     Pool = self(),
     {Helper, HelperMonitor} = spawn_monitor(fun() ->
-        Pool ! {reset, self(), reclaimed(Conn, GivenAway, reset(Conn, Dirty, Baseline))}
+        Pool ! {reset, self(), outcome(Name, Conn, Held, Baseline)}
     end),
     State#{
         out := maps:remove(Conn, Out),
@@ -431,6 +431,18 @@ reset(Conn, Dirty, Baseline) ->
         true when Dirty -> inspected(Conn, Baseline);
         true -> kept;
         false -> unlocked(Conn)
+    end.
+
+-spec outcome(atom(), esqlite3:esqlite3(), lease(), baseline()) -> outcome().
+outcome(Name, Conn, #{dirty := Dirty, given_away := GivenAway}, Baseline) ->
+    try
+        reclaimed(Conn, GivenAway, reset(Conn, Dirty, Baseline))
+    catch
+        Class:Reason ->
+            ?LOG_WARNING(#{
+                event => connection_reset_failed, pool => Name, class => Class, reason => Reason
+            }),
+            dropped
     end.
 
 %% A lease handed on with `give_away/3` and reclaimed from its new owner may
