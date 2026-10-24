@@ -30,6 +30,20 @@ database open when its own rollback fails, so a write lock may stay held
 until the handle is garbage collected. On `:memory:` a fresh connection is
 an empty database.
 
+A lease that ran anything other than `SELECT`, `INSERT`, `UPDATE` or
+`DELETE`, in any letter case and with or without a leading `WITH`, through
+`kura_driver_sqlite` gets a closer look on return. If it
+left TEMP tables, views or triggers, an attached database, or a
+`query_only`, `writable_schema`, `foreign_keys`, `trusted_schema` or
+`ignore_check_constraints` setting different from what a new connection
+has, the connection is closed and a fresh one opened. A reopened
+connection starts from the defaults, so settings a consumer made on the
+old one, checked or not (`busy_timeout`, for example), are not kept. On
+`:memory:` the reopened connection is an empty database, so such a lease
+loses the data that connection held.
+Statements run on the connection directly through `esqlite3` are not
+seen.
+
 One window remains: a borrower killed after it has called into esqlite but
 before the call has taken the connection's lock. That call can still run
 after the reset. Closing it needs a process that owns each connection and
@@ -42,8 +56,9 @@ times out gives its lease back, so a connection the pool hands out after
 the caller stopped waiting is not lost to it.
 
 A restarted pool opens new connections. Connections leased before the
-restart are no longer the pool's: their checkins are ignored, and if
-the pool stopped normally they were closed with it.
+restart are no longer the pool's: their checkins are ignored, and they
+are closed when garbage collected. A stopping pool closes only the
+connections nobody holds.
 
 `pool_size` from `start_pool/2` opts pre-opens N connections.
 
@@ -70,18 +85,27 @@ the pool stopped normally they were closed with it.
     capabilities/0
 ]).
 
--export([start_link/4]).
+-export([start_link/4, dirty/2]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, format_status/1]).
 
 -include_lib("kernel/include/logger.hrl").
 
--type lease() :: #{lease := reference(), monitor := reference()}.
+-define(SETTINGS, [
+    ~"query_only",
+    ~"writable_schema",
+    ~"foreign_keys",
+    ~"trusted_schema",
+    ~"ignore_check_constraints"
+]).
+
+-type lease() :: #{lease := reference(), monitor := reference(), dirty := boolean()}.
 
 -type state() :: #{
     name := atom(),
     supervisor := pid(),
     db_path := binary() | string(),
+    settings := [term()],
     available := [esqlite3:esqlite3()],
     out := #{esqlite3:esqlite3() => lease()},
     resetting := #{pid() => {reference(), esqlite3:esqlite3(), gen_server:from() | none}}
@@ -91,6 +115,7 @@ the pool stopped normally they were closed with it.
     {checkout, pid(), reference()}
     | {checkin, esqlite3:esqlite3(), reference()}
     | {give_away, esqlite3:esqlite3(), reference(), pid()}
+    | {dirty, esqlite3:esqlite3()}
     | supervisor.
 
 %%----------------------------------------------------------------------
@@ -170,6 +195,12 @@ capabilities() ->
 %%----------------------------------------------------------------------
 
 -doc false.
+-spec dirty(kura_pool:name(), esqlite3:esqlite3()) -> ok.
+dirty(Name, Conn) ->
+    _ = call(Name, {dirty, Conn}),
+    ok.
+
+-doc false.
 -spec start_link(atom(), binary() | string(), non_neg_integer(), pid()) -> gen_server:start_ret().
 start_link(Name, DbPath, Size, Supervisor) ->
     gen_server:start_link({local, Name}, ?MODULE, {Name, DbPath, Size, Supervisor}, []).
@@ -184,6 +215,7 @@ init({Name, DbPath, Size, Supervisor}) ->
                 name => Name,
                 supervisor => Supervisor,
                 db_path => DbPath,
+                settings => opened_settings(Conns),
                 available => Conns,
                 out => #{},
                 resetting => #{}
@@ -201,14 +233,15 @@ handle_call(
 ) ->
     Monitor = erlang:monitor(process, Borrower),
     {reply, {ok, Conn, {Name, Conn, Lease}}, State#{
-        available := Rest, out := Out#{Conn => #{lease => Lease, monitor => Monitor}}
+        available := Rest,
+        out := Out#{Conn => #{lease => Lease, monitor => Monitor, dirty => false}}
     }};
 handle_call({checkout, _Borrower, _Lease}, _From, State) ->
     {reply, {error, no_conns}, State};
 handle_call({checkin, Conn, Lease}, From, State = #{out := Out}) ->
     case Out of
-        #{Conn := #{lease := Lease, monitor := Monitor}} ->
-            {noreply, returned(Conn, Monitor, From, State)};
+        #{Conn := Held = #{lease := Lease}} ->
+            {noreply, returned(Conn, Held, From, State)};
         #{} ->
             {reply, ok, State}
     end;
@@ -221,6 +254,11 @@ handle_call({give_away, Conn, Lease, NewOwner}, _From, State = #{out := Out}) ->
         #{} ->
             {reply, {error, not_checked_out}, State}
     end;
+handle_call({dirty, Conn}, _From, State = #{out := Out}) ->
+    case Out of
+        #{Conn := Held} -> {reply, ok, State#{out := Out#{Conn := Held#{dirty := true}}}};
+        #{} -> {reply, ok, State}
+    end;
 handle_call(supervisor, _From, State = #{supervisor := Supervisor}) ->
     {reply, Supervisor, State};
 handle_call(_Request, _From, State) ->
@@ -228,8 +266,8 @@ handle_call(_Request, _From, State) ->
 
 -spec handle_cast(term(), state()) -> {noreply, state()}.
 handle_cast({abandon, Lease}, State = #{out := Out}) ->
-    case [{Conn, Monitor} || Conn := #{lease := L, monitor := Monitor} <- Out, L =:= Lease] of
-        [{Conn, Monitor}] -> {noreply, returned(Conn, Monitor, none, State)};
+    case [{Conn, Held} || Conn := Held = #{lease := L} <- Out, L =:= Lease] of
+        [{Conn, Held}] -> {noreply, returned(Conn, Held, none, State)};
         [] -> {noreply, State}
     end;
 handle_cast(_Request, State) ->
@@ -242,6 +280,8 @@ handle_info({reset, Helper, Outcome}, State = #{resetting := Resetting}) when
     #{Helper := {Monitor, Conn, From}} = Resetting,
     true = erlang:demonitor(Monitor, [flush]),
     {noreply, restored(Conn, From, Outcome, State#{resetting := maps:remove(Helper, Resetting)})};
+%% A reset that raised, for example on a connection the borrower closed
+%% itself, leaves the connection in an unknown state.
 handle_info({'DOWN', _Monitor, process, Helper, _Reason}, State = #{resetting := Resetting}) when
     is_map_key(Helper, Resetting)
 ->
@@ -249,17 +289,15 @@ handle_info({'DOWN', _Monitor, process, Helper, _Reason}, State = #{resetting :=
     _ = spawn(fun() -> closed(Conn) end),
     {noreply, restored(Conn, From, closed, State#{resetting := maps:remove(Helper, Resetting)})};
 handle_info({'DOWN', Ref, process, _Pid, _Reason}, State = #{out := Out}) when is_reference(Ref) ->
-    case [Conn || Conn := #{monitor := Monitor} <- Out, Monitor =:= Ref] of
-        [Conn] -> {noreply, returned(Conn, Ref, none, State)};
+    case [{Conn, Held} || Conn := Held = #{monitor := Monitor} <- Out, Monitor =:= Ref] of
+        [{Conn, Held}] -> {noreply, returned(Conn, Held, none, State)};
         [] -> {noreply, State}
     end;
 handle_info(_Info, State) ->
     {noreply, State}.
 
 -spec terminate(term(), state()) -> ok.
-terminate(_Reason, #{available := Available, out := Out, resetting := Resetting}) ->
-    _ = [spawn(fun() -> closed(Conn) end) || Conn <- maps:keys(Out)],
-    _ = [spawn(fun() -> closed(Conn) end) || _ := {_, Conn, _} <- Resetting],
+terminate(_Reason, #{available := Available}) ->
     close_each(Available).
 
 %% A crash report would otherwise list every lease, and a lease is what a
@@ -296,11 +334,18 @@ call(Name, Request, Timeout) ->
             {exit, shutdown}
     end.
 
--spec returned(esqlite3:esqlite3(), reference(), gen_server:from() | none, state()) -> state().
-returned(Conn, Monitor, From, State = #{out := Out, resetting := Resetting}) ->
+-spec returned(esqlite3:esqlite3(), lease(), gen_server:from() | none, state()) -> state().
+returned(
+    Conn,
+    #{monitor := Monitor, dirty := Dirty},
+    From,
+    State = #{out := Out, resetting := Resetting, settings := Settings}
+) ->
     true = erlang:demonitor(Monitor, [flush]),
     Pool = self(),
-    {Helper, HelperMonitor} = spawn_monitor(fun() -> Pool ! {reset, self(), reset(Conn)} end),
+    {Helper, HelperMonitor} = spawn_monitor(fun() ->
+        Pool ! {reset, self(), reset(Conn, Dirty, Settings)}
+    end),
     State#{
         out := maps:remove(Conn, Out),
         resetting := Resetting#{Helper => {HelperMonitor, Conn, From}}
@@ -332,16 +377,12 @@ replied(From) -> gen_server:reply(From, ok).
 %% waiting on a lock, has returned before the transaction state is read.
 %% Until then `get_autocommit/1` can report a transaction that is still
 %% open as finished.
--spec reset(esqlite3:esqlite3()) -> kept | closed.
-reset(Conn) ->
-    try
-        _ = esqlite3:exec(Conn, ~""),
-        rolled_back(Conn)
-    of
+-spec reset(esqlite3:esqlite3(), boolean(), [term()]) -> kept | closed.
+reset(Conn, Dirty, Settings) ->
+    _ = esqlite3:exec(Conn, ~""),
+    case rolled_back(Conn) andalso (not Dirty orelse pristine(Conn, Settings)) of
         true -> kept;
         false -> closed(Conn)
-    catch
-        _:_ -> closed(Conn)
     end.
 
 -spec rolled_back(esqlite3:esqlite3()) -> boolean().
@@ -353,6 +394,41 @@ rolled_back(Conn) ->
             _ = esqlite3:exec(Conn, ~"ROLLBACK"),
             esqlite3:get_autocommit(Conn)
     end.
+
+%% TEMP tables, views and triggers, attached databases and changed settings
+%% outlive the lease that made them.
+-spec pristine(esqlite3:esqlite3(), [term()]) -> boolean().
+pristine(Conn, Settings) ->
+    true =:= apart(fun() -> unchanged(Conn, Settings) end).
+
+-spec unchanged(esqlite3:esqlite3(), [term()]) -> boolean().
+unchanged(Conn, Settings) ->
+    Temp = esqlite3:q(Conn, ~"SELECT count(*) FROM temp.sqlite_schema"),
+    Attached = esqlite3:q(
+        Conn, ~"SELECT count(*) FROM pragma_database_list WHERE name NOT IN ('main', 'temp')"
+    ),
+    {Temp, Attached, settings(Conn)} =:= {[[0]], [[0]], Settings}.
+
+-spec opened_settings([esqlite3:esqlite3()]) -> [term()].
+opened_settings([Conn | _]) ->
+    case apart(fun() -> settings(Conn) end) of
+        Settings when is_list(Settings) -> Settings
+    end;
+opened_settings([]) ->
+    [].
+
+-spec settings(esqlite3:esqlite3()) -> [term()].
+settings(Conn) ->
+    [esqlite3:q(Conn, [~"PRAGMA ", Setting]) || Setting <- ?SETTINGS].
+
+%% A statement is finalized when it is garbage collected, under its
+%% connection's lock, so a process that collects one while a borrower runs
+%% a long statement on that connection stalls its scheduler. Run in a
+%% process of its own, the statements are finalized when it exits, and
+%% erpc returns only after that.
+-spec apart(fun(() -> term())) -> term().
+apart(Fun) ->
+    erpc:call(node(), Fun, #{timeout => infinity, always_spawn => true}).
 
 -spec closed(esqlite3:esqlite3()) -> closed.
 closed(Conn) ->

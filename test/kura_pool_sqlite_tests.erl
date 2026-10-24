@@ -399,7 +399,13 @@ checkin_of_a_closed_connection_replaces_it_test() ->
         end,
         ?assertMatch(
             #{rows := [#{id := 1}, #{id := 2}]}, sql(Name, ~"SELECT id FROM t ORDER BY id")
-        )
+        ),
+        {First, FirstToken} = checkout_within(Name, 1000),
+        {Second, SecondToken} = checkout_within(Name, 1000),
+        ?assertEqual([[1]], esqlite3:q(First, ~"SELECT 1")),
+        ?assertEqual([[1]], esqlite3:q(Second, ~"SELECT 1")),
+        ok = kura_pool_sqlite:checkin(Name, FirstToken),
+        ok = kura_pool_sqlite:checkin(Name, SecondToken)
     after
         kura_pool_sqlite:stop_pool(Name),
         file:delete(Path)
@@ -430,6 +436,147 @@ status_does_not_list_leases_test() ->
         {ok, _Conn, {Name, _, Lease}} = kura_pool_sqlite:checkout(Name, #{}),
         Status = lists:flatten(io_lib:format("~p", [sys:get_status(Name)])),
         ?assertEqual(nomatch, string:find(Status, ref_to_list(Lease)))
+    after
+        kura_pool_sqlite:stop_pool(Name)
+    end.
+
+temp_table_does_not_shadow_for_the_next_borrower_test() ->
+    with_file_pool(pool_for_temp_table, fun(Name) ->
+        ok = planted(Name, [
+            ~"CREATE TEMP TABLE t (id INTEGER)", ~"INSERT INTO temp.t VALUES (2)"
+        ]),
+        #{} = sql(Name, ~"INSERT INTO t VALUES (1)"),
+        ?assertMatch(#{rows := [#{id := 1}]}, sql(Name, ~"SELECT id FROM t"))
+    end).
+
+temp_trigger_does_not_see_the_next_borrowers_writes_test() ->
+    with_file_pool(pool_for_temp_trigger, fun(Name) ->
+        #{} = sql(Name, ~"CREATE TABLE copied (id INTEGER)"),
+        ok = planted(Name, [
+            ~"CREATE TEMP TRIGGER copy AFTER INSERT ON main.t BEGIN INSERT INTO copied VALUES (NEW.id); END"
+        ]),
+        #{} = sql(Name, ~"INSERT INTO t VALUES (1)"),
+        ?assertMatch(#{rows := []}, sql(Name, ~"SELECT id FROM copied"))
+    end).
+
+query_only_is_not_inherited_test() ->
+    with_file_pool(pool_for_query_only, fun(Name) ->
+        #{} = sql(Name, ~"PRAGMA query_only = 1"),
+        ?assertMatch(#{command := insert}, sql(Name, ~"INSERT INTO t VALUES (1)"))
+    end).
+
+writable_schema_is_not_inherited_test() ->
+    with_file_pool(pool_for_writable_schema, fun(Name) ->
+        #{} = sql(Name, ~"PRAGMA writable_schema = ON"),
+        ?assertMatch(#{rows := [#{writable_schema := 0}]}, sql(Name, ~"PRAGMA writable_schema"))
+    end).
+
+safety_settings_are_not_inherited_test_() ->
+    [
+        {Setting, fun() ->
+            with_file_pool(pool_for_safety_settings, fun(Name) ->
+                Key = binary_to_atom(Setting),
+                #{rows := [#{Key := Default}]} = sql(Name, [~"PRAGMA ", Setting]),
+                Changed = 1 - Default,
+                ?assertEqual(
+                    [[Changed]],
+                    kura_pool:with_conn(kura_pool_sqlite, Name, fun(Conn) ->
+                        ok = esqlite3:exec(Conn, [
+                            ~"PRAGMA ", Setting, ~" = ", integer_to_binary(Changed)
+                        ]),
+                        ok = kura_pool_sqlite:dirty(Name, Conn),
+                        esqlite3:q(Conn, [~"PRAGMA ", Setting])
+                    end)
+                ),
+                ?assertMatch(#{rows := [#{Key := Default}]}, sql(Name, [~"PRAGMA ", Setting]))
+            end)
+        end}
+     || Setting <- [~"foreign_keys", ~"trusted_schema", ~"ignore_check_constraints"]
+    ].
+
+attached_database_is_not_inherited_test() ->
+    with_file_pool(pool_for_attach, fun(Name) ->
+        Attached = db_path(pool_for_attach_other),
+        try
+            #{} = sql(Name, [~"ATTACH '", Attached, ~"' AS other"]),
+            ?assertMatch(
+                #{rows := [#{name := ~"main"}]}, sql(Name, ~"PRAGMA database_list")
+            )
+        after
+            file:delete(Attached)
+        end
+    end).
+
+dml_in_any_case_or_under_with_keeps_the_connection_test() ->
+    with_file_pool(pool_for_clean_dml, fun(Name) ->
+        {Conn, Token} = checkout_within(Name, 1000),
+        ok = esqlite3:exec(Conn, ~"CREATE TEMP TABLE marker (id INTEGER)"),
+        ok = kura_pool_sqlite:checkin(Name, Token),
+        ?assertMatch(#{command := select}, sql(Name, ~"select id from t")),
+        ?assertMatch(#{command := insert}, sql(Name, ~"Insert INTO t VALUES (1)")),
+        #{} = sql(Name, ~"WITH x AS (SELECT 1) SELECT * FROM x"),
+        #{} = sql(Name, ~"with x(id) as (select 2) insert into t select id from x"),
+        ?assertMatch({Conn, _}, checkout_within(Name, 1000))
+    end).
+
+ddl_on_main_keeps_the_connection_test() ->
+    Name = pool_for_kept_ddl,
+    {ok, _} = kura_pool_sqlite:start_pool(Name, #{database => ~":memory:", pool_size => 1}),
+    try
+        #{} = sql(Name, ~"CREATE TABLE t (id INTEGER)"),
+        #{} = sql(Name, ~"PRAGMA busy_timeout = 100"),
+        ?assertMatch(#{rows := [#{timeout := 100}]}, sql(Name, ~"PRAGMA busy_timeout")),
+        ?assertMatch(#{rows := []}, sql(Name, ~"SELECT id FROM t"))
+    after
+        kura_pool_sqlite:stop_pool(Name)
+    end.
+
+stop_pool_does_not_wait_for_a_running_statement_test() ->
+    Name = pool_for_stop_while_running,
+    {ok, _} = kura_pool_sqlite:start_pool(Name, #{database => ~":memory:", pool_size => 1}),
+    Self = self(),
+    Borrower = spawn(fun() ->
+        {ok, Conn, _Token} = kura_pool_sqlite:checkout(Name, #{}),
+        Self ! {running, self()},
+        esqlite3:q(
+            Conn,
+            ~"SELECT (WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 30000000) SELECT count(*) FROM c)"
+        )
+    end),
+    try
+        receive
+            {running, Borrower} -> ok
+        after 1000 -> error(never_ran)
+        end,
+        ok = wait_in_nif(Borrower, {esqlite3_nif, step, 1}),
+        {Elapsed, ok} = timer:tc(kura_pool_sqlite, stop_pool, [Name]),
+        ?assert(Elapsed < 1000000)
+    after
+        ok = kill(Borrower),
+        kura_pool_sqlite:stop_pool(Name)
+    end.
+
+stop_pool_leaves_a_lease_in_use_working_test() ->
+    Name = pool_for_stop_mid_lease,
+    {ok, _} = kura_pool_sqlite:start_pool(Name, #{database => ~":memory:", pool_size => 1}),
+    try
+        #{} = sql(Name, ~"CREATE TABLE t (id INTEGER)"),
+        ?assertMatch(
+            #{command := insert},
+            kura_driver_sqlite:transaction(
+                kura_pool_sqlite,
+                Name,
+                fun() ->
+                    #{} = sql(Name, ~"INSERT INTO t VALUES (1)"),
+                    Pool = whereis(Name),
+                    true = is_pid(Pool),
+                    ok = kura_pool_sqlite:stop_pool(Name),
+                    ok = wait_for_exit(Pool),
+                    sql(Name, ~"INSERT INTO t VALUES (2)")
+                end,
+                #{}
+            )
+        )
     after
         kura_pool_sqlite:stop_pool(Name)
     end.
@@ -499,6 +646,29 @@ wait_for_checkout_loop(Name, Deadline) ->
                     wait_for_checkout_loop(Name, Deadline)
             end
     end.
+
+with_file_pool(Name, Test) ->
+    Path = db_path(Name),
+    _ = file:delete(Path),
+    {ok, _} = kura_pool_sqlite:start_pool(Name, #{database => Path, pool_size => 1}),
+    try
+        #{} = sql(Name, ~"CREATE TABLE t (id INTEGER)"),
+        Test(Name)
+    after
+        kura_pool_sqlite:stop_pool(Name),
+        file:delete(Path)
+    end.
+
+planted(Name, Statements) ->
+    kura_driver_sqlite:transaction(
+        kura_pool_sqlite,
+        Name,
+        fun() ->
+            _ = [#{} = sql(Name, Statement) || Statement <- Statements],
+            ok
+        end,
+        #{}
+    ).
 
 wait_in_nif(Pid, Nif) ->
     wait_in_nif(Pid, Nif, 200).

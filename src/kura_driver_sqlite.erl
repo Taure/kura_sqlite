@@ -96,14 +96,17 @@ the workload. esqlite sets 2 seconds by default.
 
 -spec query(module(), atom(), iodata(), [term()], map()) -> dynamic().
 query(PoolMod, Pool, SQL, Params, _Opts) ->
+    SQLBin = iolist_to_binary(SQL),
     case erlang:get({kura_sqlite_tx_conn, Pool}) of
         undefined ->
             kura_pool:with_conn(PoolMod, Pool, fun(Conn) ->
-                run(Conn, SQL, Params)
+                ok = touched(PoolMod, Pool, Conn, SQLBin),
+                run(Conn, SQLBin, Params)
             end);
         Conn ->
             ok = still_open(Conn),
-            ended(Conn, run(Conn, SQL, Params))
+            ok = touched(PoolMod, Pool, Conn, SQLBin),
+            ended(Conn, run(Conn, SQLBin, Params))
     end.
 
 -spec query_on(esqlite3:esqlite3(), iodata(), [term()], map()) -> dynamic().
@@ -232,6 +235,17 @@ still_open(Conn) ->
         true -> error(transaction_rolled_back)
     end.
 
+%% A statement other than DML can leave state on the connection that the
+%% next borrower would inherit, so the pool checks it on return.
+-spec touched(module(), atom(), esqlite3:esqlite3(), binary()) -> ok.
+touched(kura_pool_sqlite, Pool, Conn, SQL) ->
+    case command_of(SQL) =/= other orelse keyword(SQL) =:= ~"WITH" of
+        true -> ok;
+        false -> kura_pool_sqlite:dirty(Pool, Conn)
+    end;
+touched(_PoolMod, _Pool, _Conn, _SQL) ->
+    ok.
+
 -spec run(esqlite3:esqlite3(), iodata(), [term()]) -> dynamic().
 run(Conn, SQL, Params) ->
     SQLBin = iolist_to_binary(SQL),
@@ -297,25 +311,27 @@ row_to_map([Cell | RestRow], [Name | RestNames], Acc) ->
 name_to_atom(N) -> binary_to_atom(N, utf8).
 
 -spec command_of(binary()) -> select | insert | update | delete | other.
-command_of(<<First, Rest/binary>>) when
+command_of(SQL) ->
+    case keyword(SQL) of
+        ~"SELECT" -> select;
+        ~"INSERT" -> insert;
+        ~"UPDATE" -> update;
+        ~"DELETE" -> delete;
+        _ -> other
+    end.
+
+-spec keyword(binary()) -> binary().
+keyword(<<First, Rest/binary>>) when
     First =:= $\s; First =:= $\t; First =:= $\n; First =:= $\r
 ->
-    command_of(Rest);
-command_of(<<"SELECT", _/binary>>) ->
-    select;
-command_of(<<"select", _/binary>>) ->
-    select;
-command_of(<<"INSERT", _/binary>>) ->
-    insert;
-command_of(<<"insert", _/binary>>) ->
-    insert;
-command_of(<<"UPDATE", _/binary>>) ->
-    update;
-command_of(<<"update", _/binary>>) ->
-    update;
-command_of(<<"DELETE", _/binary>>) ->
-    delete;
-command_of(<<"delete", _/binary>>) ->
-    delete;
-command_of(_) ->
-    other.
+    keyword(Rest);
+keyword(SQL) ->
+    upper_word(SQL).
+
+-spec upper_word(binary()) -> binary().
+upper_word(<<Letter, Rest/binary>>) when Letter >= $a, Letter =< $z ->
+    <<(Letter - $a + $A), (upper_word(Rest))/binary>>;
+upper_word(<<Letter, Rest/binary>>) when Letter >= $A, Letter =< $Z ->
+    <<Letter, (upper_word(Rest))/binary>>;
+upper_word(_) ->
+    ~"".
