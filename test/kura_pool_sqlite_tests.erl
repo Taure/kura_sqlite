@@ -615,6 +615,24 @@ write_after_a_busy_statement_is_committed_test() ->
         file:delete(Path)
     end.
 
+dropped_connection_stays_usable_by_a_process_still_holding_it_test() ->
+    with_file_pool(pool_for_dropped_in_use, fun(Name) ->
+        {ok, Conn, Token} = kura_pool_sqlite:checkout(Name, #{}),
+        Holder = spawn(fun() ->
+            receive
+                never -> ok
+            end
+        end),
+        ok = kura_pool_sqlite:give_away(Token, Holder, gift),
+        ok = esqlite3:exec(Conn, ~"CREATE TEMP TABLE scratch (id INTEGER)"),
+        ok = kura_pool_sqlite:dirty(Name, Conn),
+        ok = kill(Holder),
+        {Fresh, FreshToken} = checkout_within(Name, 1000),
+        ?assertNotEqual(Conn, Fresh),
+        ok = kura_pool_sqlite:checkin(Name, FreshToken),
+        ?assertEqual([[0]], esqlite3:q(Conn, ~"SELECT count(*) FROM scratch"))
+    end).
+
 sql(Name, SQL) ->
     kura_driver_sqlite:query(kura_pool_sqlite, Name, SQL, [], #{}).
 

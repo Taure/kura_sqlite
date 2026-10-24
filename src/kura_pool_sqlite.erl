@@ -23,12 +23,13 @@ connection to finish: a borrower killed during a `COMMIT` that is waiting
 on a lock leaves that `COMMIT` running, and it can fail and leave the
 transaction open after the borrower is gone. A transaction still open
 after that is rolled back. If the rollback fails, or the reset raises, for
-example because the borrower closed the connection itself, the connection
-is closed and a fresh one opened in its place. Closing cannot be relied on
-to release what the old connection held: esqlite's close leaves the
-database open when its own rollback fails, so a write lock may stay held
-until the handle is garbage collected. On `:memory:` a fresh connection is
-an empty database.
+example because the borrower closed the connection itself, the pool drops
+the connection and opens a fresh one in its place. On `:memory:` a fresh
+connection is an empty database.
+
+A dropped connection is not closed by the pool: it is closed when the last
+process holding it lets it go. A connection dropped because its rollback
+failed keeps that transaction, and its write lock, until then.
 
 A lease that ran anything other than `SELECT`, `INSERT`, `UPDATE` or
 `DELETE`, in any letter case and with or without a leading `WITH`, through
@@ -36,7 +37,7 @@ A lease that ran anything other than `SELECT`, `INSERT`, `UPDATE` or
 left TEMP tables, views or triggers, an attached database, or a
 `query_only`, `writable_schema`, `foreign_keys`, `trusted_schema` or
 `ignore_check_constraints` setting different from what a new connection
-has, the connection is closed and a fresh one opened. A reopened
+has, the connection is dropped and a fresh one opened. A reopened
 connection starts from the defaults, so settings a consumer made on the
 old one, checked or not (`busy_timeout`, for example), are not kept. On
 `:memory:` the reopened connection is an empty database, so such a lease
@@ -275,7 +276,7 @@ handle_cast(_Request, State) ->
 
 -spec handle_info(term(), state()) -> {noreply, state()}.
 handle_info({reset, Helper, Outcome}, State = #{resetting := Resetting}) when
-    is_map_key(Helper, Resetting), Outcome =:= kept orelse Outcome =:= closed
+    is_map_key(Helper, Resetting), Outcome =:= kept orelse Outcome =:= dropped
 ->
     #{Helper := {Monitor, Conn, From}} = Resetting,
     true = erlang:demonitor(Monitor, [flush]),
@@ -286,8 +287,7 @@ handle_info({'DOWN', _Monitor, process, Helper, _Reason}, State = #{resetting :=
     is_map_key(Helper, Resetting)
 ->
     #{Helper := {_, Conn, From}} = Resetting,
-    _ = spawn(fun() -> closed(Conn) end),
-    {noreply, restored(Conn, From, closed, State#{resetting := maps:remove(Helper, Resetting)})};
+    {noreply, restored(Conn, From, dropped, State#{resetting := maps:remove(Helper, Resetting)})};
 handle_info({'DOWN', Ref, process, _Pid, _Reason}, State = #{out := Out}) when is_reference(Ref) ->
     case [{Conn, Held} || Conn := Held = #{monitor := Monitor} <- Out, Monitor =:= Ref] of
         [{Conn, Held}] -> {noreply, returned(Conn, Held, none, State)};
@@ -351,11 +351,14 @@ returned(
         resetting := Resetting#{Helper => {HelperMonitor, Conn, From}}
     }.
 
--spec restored(esqlite3:esqlite3(), gen_server:from() | none, kept | closed, state()) -> state().
+-spec restored(esqlite3:esqlite3(), gen_server:from() | none, kept | dropped, state()) -> state().
 restored(Conn, From, kept, State = #{available := Available}) ->
     ok = replied(From),
     State#{available := [Conn | Available]};
-restored(_Conn, From, closed, State = #{name := Name, db_path := DbPath, available := Available}) ->
+%% esqlite's close is not safe against a statement another process is still
+%% running on the connection, and gives up without closing when its rollback
+%% fails, so a dropped connection is left to its destructor.
+restored(_Conn, From, dropped, State = #{name := Name, db_path := DbPath, available := Available}) ->
     ok = replied(From),
     case esqlite3:open(to_filename(DbPath)) of
         {ok, Fresh} ->
@@ -377,12 +380,12 @@ replied(From) -> gen_server:reply(From, ok).
 %% waiting on a lock, has returned before the transaction state is read.
 %% Until then `get_autocommit/1` can report a transaction that is still
 %% open as finished.
--spec reset(esqlite3:esqlite3(), boolean(), [term()]) -> kept | closed.
+-spec reset(esqlite3:esqlite3(), boolean(), [term()]) -> kept | dropped.
 reset(Conn, Dirty, Settings) ->
     _ = esqlite3:exec(Conn, ~""),
     case rolled_back(Conn) andalso (not Dirty orelse pristine(Conn, Settings)) of
         true -> kept;
-        false -> closed(Conn)
+        false -> dropped
     end.
 
 -spec rolled_back(esqlite3:esqlite3()) -> boolean().
