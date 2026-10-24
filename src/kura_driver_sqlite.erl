@@ -33,11 +33,23 @@ fun's own result:
 - `{kura_driver_sqlite, {begin_failed, Reason}}` when `BEGIN` fails.
 - `{kura_driver_sqlite, {savepoint_failed, Reason}}` when a nested
   `SAVEPOINT` fails. The nested fun does not run.
-- `{kura_driver_sqlite, {commit_failed, Reason}}` when `COMMIT` fails,
-  for example on a deferred foreign key. The transaction is rolled
-  back and nothing it wrote is kept.
+- `{kura_driver_sqlite, {commit_failed, Reason}}` when `COMMIT` is
+  refused, for example by a deferred foreign key or `SQLITE_BUSY`. The
+  transaction is rolled back and nothing it wrote is kept.
+- `{kura_driver_sqlite, {commit_unknown, Code}}` when `COMMIT` fails
+  with an I/O error (the `SQLITE_IOERR` family). In WAL mode that can
+  come after the commit record reached the log, so the transaction may
+  or may not have been kept. Do not assume either.
 - `{kura_driver_sqlite, {release_failed, Reason}}` when a nested
   `RELEASE` fails while the transaction is still open.
+- `{kura_driver_sqlite, {rollback_to_failed, Reason}}` when a nested
+  transaction raised and its `ROLLBACK TO` failed, for example because
+  the fun released the savepoint itself. The whole transaction is
+  rolled back rather than keep work the nested call was meant to undo.
+- `{kura_driver_sqlite, transaction_ended_by_statement}` when a
+  statement run inside the transaction, such as a raw `COMMIT`, `END`
+  or `ROLLBACK`, ended it. Whatever that statement committed stays
+  committed; nothing after it runs.
 - `{kura_driver_sqlite, {no_connection, Reason}}` when no connection
   can be checked out.
 - `transaction_rolled_back` when SQLite has rolled the whole
@@ -49,8 +61,13 @@ fun's own result:
   savepoint's work, on SQLite it always means the outermost
   transaction is gone.
 
-There is no unknown commit outcome: SQLite runs in this process and
-`COMMIT` returns once the database has kept the transaction or not.
+Apart from an I/O error, `COMMIT` has no unknown outcome: SQLite runs
+in this process and returns once the database has kept the transaction
+or not, so there is no timeout or lost connection to leave it in doubt.
+
+On a file database, set WAL mode (`PRAGMA journal_mode = WAL`) so
+readers do not block the writer, and a `PRAGMA busy_timeout` that suits
+the workload. esqlite sets 2 seconds by default.
 
 ## Caveats (phase 2 skeleton)
 
@@ -86,7 +103,7 @@ query(PoolMod, Pool, SQL, Params, _Opts) ->
             end);
         Conn ->
             ok = still_open(Conn),
-            run(Conn, SQL, Params)
+            ended(Conn, run(Conn, SQL, Params))
     end.
 
 -spec query_on(esqlite3:esqlite3(), iodata(), [term()], map()) -> dynamic().
@@ -142,12 +159,21 @@ committed(Conn, Result) ->
             Result;
         {error, Reason} ->
             _ = esqlite3:exec(Conn, ~"ROLLBACK"),
-            error({kura_driver_sqlite, {commit_failed, Reason}})
+            error({kura_driver_sqlite, commit_error(Reason)})
     end.
+
+%% The SQLITE_IOERR family can come after the commit record was written.
+-spec commit_error(term()) -> {commit_failed | commit_unknown, term()}.
+commit_error(Code) when is_integer(Code), Code band 16#ff =:= 10 ->
+    {commit_unknown, Code};
+commit_error(Reason) ->
+    {commit_failed, Reason}.
 
 -spec nested(esqlite3:esqlite3(), fun(() -> term())) -> term().
 nested(Conn, Fun) ->
-    Savepoint = [~"kura_savepoint_", integer_to_binary(erlang:unique_integer([positive]))],
+    Savepoint = [
+        ~"kura_savepoint_", integer_to_binary(erlang:unique_integer([positive, monotonic]))
+    ],
     ok = still_open(Conn),
     case esqlite3:exec(Conn, [~"SAVEPOINT ", Savepoint]) of
         ok ->
@@ -155,8 +181,7 @@ nested(Conn, Fun) ->
                 Result -> released(Conn, Savepoint, Result)
             catch
                 Class:Reason:Stack ->
-                    _ = esqlite3:exec(Conn, [~"ROLLBACK TO SAVEPOINT ", Savepoint]),
-                    _ = esqlite3:exec(Conn, [~"RELEASE SAVEPOINT ", Savepoint]),
+                    ok = rolled_back_to(Conn, Savepoint),
                     erlang:raise(Class, Reason, Stack)
             end;
         {error, Reason} ->
@@ -169,6 +194,33 @@ released(Conn, Savepoint, Result) ->
     case esqlite3:exec(Conn, [~"RELEASE SAVEPOINT ", Savepoint]) of
         ok -> Result;
         {error, Reason} -> error({kura_driver_sqlite, {release_failed, Reason}})
+    end.
+
+-spec rolled_back_to(esqlite3:esqlite3(), iodata()) -> ok.
+rolled_back_to(Conn, Savepoint) ->
+    case esqlite3:exec(Conn, [~"ROLLBACK TO SAVEPOINT ", Savepoint]) of
+        ok ->
+            _ = esqlite3:exec(Conn, [~"RELEASE SAVEPOINT ", Savepoint]),
+            ok;
+        {error, Reason} ->
+            case esqlite3:get_autocommit(Conn) of
+                true ->
+                    ok;
+                false ->
+                    _ = esqlite3:exec(Conn, ~"ROLLBACK"),
+                    error({kura_driver_sqlite, {rollback_to_failed, Reason}})
+            end
+    end.
+
+%% A statement that succeeds and leaves the connection in autocommit was the
+%% caller's own COMMIT, END or ROLLBACK.
+-spec ended(esqlite3:esqlite3(), dynamic()) -> dynamic().
+ended(_Conn, {error, _} = Error) ->
+    Error;
+ended(Conn, Result) ->
+    case esqlite3:get_autocommit(Conn) of
+        false -> Result;
+        true -> error({kura_driver_sqlite, transaction_ended_by_statement})
     end.
 
 %% A connection back in autocommit inside a transaction means SQLite rolled

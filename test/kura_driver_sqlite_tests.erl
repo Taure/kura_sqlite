@@ -173,6 +173,16 @@ nested_tests() ->
             {"the commit raises after SQLite rolls the transaction back", fun() ->
                 commit_after_sqlite_rollback_raises(Pool)
             end}
+        end,
+        fun(Pool) ->
+            {"a statement that ends the transaction raises", fun() ->
+                statement_ending_the_transaction_raises(Pool)
+            end}
+        end,
+        fun(Pool) ->
+            {"a nested raise whose savepoint is gone rolls back the whole transaction", fun() ->
+                failed_rollback_to_abandons_the_transaction(Pool)
+            end}
         end
     ].
 
@@ -303,6 +313,45 @@ outer_after_nested_sqlite_rollback_raises({Pool, _}) ->
         end)
     ),
     ?assertEqual([], ids(Pool)).
+
+statement_ending_the_transaction_raises({Pool, _}) ->
+    ?assertError(
+        {kura_driver_sqlite, transaction_ended_by_statement},
+        transaction(Pool, fun() ->
+            ok = insert(Pool, 1),
+            #{} = sql(Pool, ~"COMMIT"),
+            insert(Pool, 2)
+        end)
+    ),
+    ?assertEqual([1], ids(Pool)).
+
+failed_rollback_to_abandons_the_transaction({Pool, _}) ->
+    Before = erlang:unique_integer([positive, monotonic]),
+    ?assertError(
+        transaction_rolled_back,
+        transaction(Pool, fun() ->
+            ok = insert(Pool, 1),
+            ?assertError(
+                {kura_driver_sqlite, {rollback_to_failed, _}},
+                transaction(Pool, fun() ->
+                    ok = insert(Pool, 2),
+                    ok = release_own_savepoint(Pool, Before + 1, Before + 1000),
+                    throw(inner)
+                end)
+            ),
+            insert(Pool, 3)
+        end)
+    ),
+    ?assertEqual([], ids(Pool)).
+
+%% The nested call's savepoint is named from the next monotonic integer.
+release_own_savepoint(_Pool, From, To) when From > To ->
+    error(savepoint_not_found);
+release_own_savepoint(Pool, From, To) ->
+    case sql(Pool, [~"RELEASE kura_savepoint_", integer_to_binary(From)]) of
+        #{} -> ok;
+        {error, _} -> release_own_savepoint(Pool, From + 1, To)
+    end.
 
 commit_after_sqlite_rollback_raises({Pool, _}) ->
     ok = rollback_on_conflict_table(Pool),
