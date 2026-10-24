@@ -152,6 +152,27 @@ nested_tests() ->
             {"a rejected commit raises and leaves no transaction open", fun() ->
                 rejected_commit_raises(Pool)
             end}
+        end,
+        fun(Pool) ->
+            {"a statement after SQLite rolls the transaction back raises", fun() ->
+                statement_after_sqlite_rollback_raises(Pool)
+            end}
+        end,
+        fun(Pool) ->
+            {"the outer transaction raises after SQLite rolls back inside a nested one", fun() ->
+                outer_after_nested_sqlite_rollback_raises(Pool)
+            end}
+        end,
+
+        fun(Pool) ->
+            {"a nested transaction after SQLite rolls the transaction back raises", fun() ->
+                nested_after_sqlite_rollback_raises(Pool)
+            end}
+        end,
+        fun(Pool) ->
+            {"the commit raises after SQLite rolls the transaction back", fun() ->
+                commit_after_sqlite_rollback_raises(Pool)
+            end}
         end
     ].
 
@@ -259,6 +280,64 @@ foreign_keys_on(Pool, Held) ->
             lists:foreach(fun(Token) -> ok = kura_pool_sqlite:checkin(Pool, Token) end, Held)
     end.
 
+statement_after_sqlite_rollback_raises({Pool, _}) ->
+    ok = rollback_on_conflict_table(Pool),
+    ?assertError(
+        transaction_rolled_back,
+        transaction(Pool, fun() ->
+            ok = insert(Pool, 1),
+            ok = conflict(Pool),
+            insert(Pool, 2)
+        end)
+    ),
+    ?assertEqual([], ids(Pool)).
+
+outer_after_nested_sqlite_rollback_raises({Pool, _}) ->
+    ok = rollback_on_conflict_table(Pool),
+    ?assertError(
+        transaction_rolled_back,
+        transaction(Pool, fun() ->
+            ok = insert(Pool, 1),
+            ?assertError(transaction_rolled_back, transaction(Pool, fun() -> conflict(Pool) end)),
+            insert(Pool, 2)
+        end)
+    ),
+    ?assertEqual([], ids(Pool)).
+
+commit_after_sqlite_rollback_raises({Pool, _}) ->
+    ok = rollback_on_conflict_table(Pool),
+    ?assertError(
+        transaction_rolled_back,
+        transaction(Pool, fun() ->
+            ok = insert(Pool, 1),
+            conflict(Pool)
+        end)
+    ),
+    ?assertEqual([], ids(Pool)).
+
+nested_after_sqlite_rollback_raises({Pool, _}) ->
+    ok = rollback_on_conflict_table(Pool),
+    ?assertError(
+        transaction_rolled_back,
+        transaction(Pool, fun() ->
+            ok = insert(Pool, 1),
+            ok = conflict(Pool),
+            transaction(Pool, fun() -> insert(Pool, 2) end)
+        end)
+    ),
+    ?assertEqual([], ids(Pool)).
+
+rollback_on_conflict_table(Pool) ->
+    #{} = sql(
+        Pool, ~"CREATE TABLE rollback_on_conflict (id INTEGER PRIMARY KEY ON CONFLICT ROLLBACK)"
+    ),
+    ok.
+
+conflict(Pool) ->
+    #{} = sql(Pool, ~"INSERT INTO rollback_on_conflict VALUES (1)"),
+    {error, _} = sql(Pool, ~"INSERT INTO rollback_on_conflict VALUES (1)"),
+    ok.
+
 transaction(Pool, Fun) ->
     kura_driver_sqlite:transaction(kura_pool_sqlite, Pool, Fun, #{}).
 
@@ -274,6 +353,28 @@ insert(Pool, Id) ->
 ids(Pool) ->
     #{rows := Rows} = sql(Pool, ~"SELECT id FROM nested ORDER BY id"),
     [Id || #{id := Id} <- Rows].
+
+no_connection_raises_test() ->
+    {Pool, Path} = nested_setup(memory, 1),
+    {ok, _Conn, Token} = kura_pool_sqlite:checkout(Pool, #{}),
+    try
+        ?assertError(
+            {kura_driver_sqlite, {no_connection, no_conns}},
+            transaction(Pool, fun() -> {error, from_the_function} end)
+        )
+    after
+        ok = kura_pool_sqlite:checkin(Pool, Token),
+        nested_teardown({Pool, Path})
+    end.
+
+checkin_after_a_raise_test() ->
+    {Pool, Path} = nested_setup(memory, 1),
+    try
+        ?assertThrow(boom, transaction(Pool, fun() -> throw(boom) end)),
+        ?assertEqual(ok, transaction(Pool, fun() -> ok end))
+    after
+        nested_teardown({Pool, Path})
+    end.
 
 other_pool_inside_a_transaction_test() ->
     {Outer, OuterPath} = nested_setup(memory, 1),

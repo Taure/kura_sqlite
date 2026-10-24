@@ -8,9 +8,9 @@ in use.
 
 ## Result shape
 
-Returns `#{rows := Rows, num_rows := N, command := C}` to match
-`kura_driver_pgo`'s shape. `Rows` are maps keyed by atom column names,
-making them interchangeable with pgo result rows. `command` is one of
+Returns `#{rows := Rows, num_rows := N, command := C}`, the shape the
+other kura drivers return. `Rows` are maps keyed by atom column names.
+`command` is one of
 `select | insert | update | delete | other` derived from the SQL
 prefix.
 
@@ -36,10 +36,21 @@ fun's own result:
 - `{kura_driver_sqlite, {commit_failed, Reason}}` when `COMMIT` fails,
   for example on a deferred foreign key. The transaction is rolled
   back and nothing it wrote is kept.
-- `transaction_rolled_back` when SQLite has already rolled the whole
-  transaction back underneath a nested one.
+- `{kura_driver_sqlite, {release_failed, Reason}}` when a nested
+  `RELEASE` fails while the transaction is still open.
+- `{kura_driver_sqlite, {no_connection, Reason}}` when no connection
+  can be checked out.
+- `transaction_rolled_back` when SQLite has rolled the whole
+  transaction back on its own, which it does on `ON CONFLICT ROLLBACK`,
+  `INSERT OR ROLLBACK`, a full disk, an I/O error or running out of
+  memory. Every statement after that, nested or not, raises it rather
+  than run outside the transaction, and so does the commit. Unlike
+  Postgres, where a nested `transaction_rolled_back` loses only the
+  savepoint's work, on SQLite it always means the outermost
+  transaction is gone.
 
-A checkout that fails is still returned as `{error, Reason}`.
+There is no unknown commit outcome: SQLite runs in this process and
+`COMMIT` returns once the database has kept the transaction or not.
 
 ## Caveats (phase 2 skeleton)
 
@@ -74,6 +85,7 @@ query(PoolMod, Pool, SQL, Params, _Opts) ->
                 run(Conn, SQL, Params)
             end);
         Conn ->
+            ok = still_open(Conn),
             run(Conn, SQL, Params)
     end.
 
@@ -85,7 +97,16 @@ query_on(Conn, SQL, Params, _Opts) ->
 transaction(PoolMod, Pool, Fun, _Opts) ->
     case erlang:get({kura_sqlite_tx_conn, Pool}) of
         undefined ->
-            kura_pool:with_conn(PoolMod, Pool, fun(Conn) -> outermost(Pool, Conn, Fun) end);
+            case PoolMod:checkout(Pool, #{}) of
+                {ok, Conn, Token} ->
+                    try
+                        outermost(Pool, Conn, Fun)
+                    after
+                        PoolMod:checkin(Pool, Token)
+                    end;
+                {error, Reason} ->
+                    error({kura_driver_sqlite, {no_connection, Reason}})
+            end;
         Conn ->
             nested(Conn, Fun)
     end.
@@ -115,6 +136,7 @@ outermost(Pool, Conn, Fun) ->
 %% A COMMIT refused by a deferred constraint leaves the transaction open.
 -spec committed(esqlite3:esqlite3(), term()) -> term().
 committed(Conn, Result) ->
+    ok = still_open(Conn),
     case esqlite3:exec(Conn, ~"COMMIT") of
         ok ->
             Result;
@@ -126,6 +148,7 @@ committed(Conn, Result) ->
 -spec nested(esqlite3:esqlite3(), fun(() -> term())) -> term().
 nested(Conn, Fun) ->
     Savepoint = [~"kura_savepoint_", integer_to_binary(erlang:unique_integer([positive]))],
+    ok = still_open(Conn),
     case esqlite3:exec(Conn, [~"SAVEPOINT ", Savepoint]) of
         ok ->
             try Fun() of
@@ -142,9 +165,19 @@ nested(Conn, Fun) ->
 
 -spec released(esqlite3:esqlite3(), iodata(), term()) -> term().
 released(Conn, Savepoint, Result) ->
+    ok = still_open(Conn),
     case esqlite3:exec(Conn, [~"RELEASE SAVEPOINT ", Savepoint]) of
         ok -> Result;
-        {error, _} -> error(transaction_rolled_back)
+        {error, Reason} -> error({kura_driver_sqlite, {release_failed, Reason}})
+    end.
+
+%% A connection back in autocommit inside a transaction means SQLite rolled
+%% the transaction back itself, and anything run now would commit on its own.
+-spec still_open(esqlite3:esqlite3()) -> ok.
+still_open(Conn) ->
+    case esqlite3:get_autocommit(Conn) of
+        false -> ok;
+        true -> error(transaction_rolled_back)
     end.
 
 -spec run(esqlite3:esqlite3(), iodata(), [term()]) -> dynamic().
