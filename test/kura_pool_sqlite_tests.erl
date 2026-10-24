@@ -696,6 +696,27 @@ dropped_connection_stays_usable_by_a_process_still_holding_it_test() ->
         ?assertEqual([[0]], esqlite3:q(Conn, ~"SELECT count(*) FROM scratch"))
     end).
 
+reclaimed_given_away_connection_is_not_lent_again_test() ->
+    Name = pool_for_reclaimed_gift,
+    {ok, _} = kura_pool_sqlite:start_pool(Name, #{database => ~":memory:", pool_size => 1}),
+    try
+        {ok, Conn, Token} = kura_pool_sqlite:checkout(Name, #{}),
+        Holder = spawn(fun() ->
+            receive
+                never -> ok
+            end
+        end),
+        ok = kura_pool_sqlite:give_away(Token, Holder, gift),
+        ok = kill(Holder),
+        {Fresh, FreshToken} = checkout_within(Name, 1000),
+        ?assertNotEqual(Conn, Fresh),
+        ok = kura_pool_sqlite:checkin(Name, FreshToken),
+        ok = kura_pool_sqlite:stop_pool(Name),
+        ?assertEqual([[1]], esqlite3:q(Conn, ~"SELECT 1"))
+    after
+        kura_pool_sqlite:stop_pool(Name)
+    end.
+
 sql(Name, SQL) ->
     kura_driver_sqlite:query(kura_pool_sqlite, Name, SQL, [], #{}).
 

@@ -15,6 +15,11 @@ mid-transaction, gets its connection reclaimed.
 A checkout's token names that one lease, so a checkin or `give_away/3`
 with a token from an earlier lease of the same connection does nothing.
 
+A lease handed on with `give_away/3` can still be checked in by its token.
+If the pool reclaims it instead, because the new owner died, the process
+that handed it on may still be using it, so the connection is dropped
+rather than lent again.
+
 A connection coming back, by `checkin/2` or by its borrower dying, is
 reset before anyone else can check it out. The reset runs in a process of
 its own, so a slow one does not hold up the pool, and `checkin/2` returns
@@ -119,7 +124,9 @@ connections nobody holds.
     ~"journal_mode"
 ]).
 
--type lease() :: #{lease := reference(), monitor := reference(), dirty := boolean()}.
+-type lease() :: #{
+    lease := reference(), monitor := reference(), dirty := boolean(), given_away := boolean()
+}.
 
 -type outcome() :: kept | {kept, [term()]} | dropped.
 
@@ -258,14 +265,16 @@ handle_call(
     Monitor = erlang:monitor(process, Borrower),
     {reply, {ok, Conn, {Name, Conn, Lease}}, State#{
         available := Rest,
-        out := Out#{Conn => #{lease => Lease, monitor => Monitor, dirty => false}}
+        out := Out#{
+            Conn => #{lease => Lease, monitor => Monitor, dirty => false, given_away => false}
+        }
     }};
 handle_call({checkout, _Borrower, _Lease}, _From, State) ->
     {reply, {error, no_conns}, State};
 handle_call({checkin, Conn, Lease}, From, State = #{out := Out}) ->
     case Out of
         #{Conn := Held = #{lease := Lease}} ->
-            {noreply, returned(Conn, Held, From, State)};
+            {noreply, returned(Conn, Held#{given_away := false}, From, State)};
         #{} ->
             {reply, ok, State}
     end;
@@ -273,7 +282,7 @@ handle_call({give_away, Conn, Lease, NewOwner}, _From, State = #{out := Out}) ->
     case Out of
         #{Conn := Held = #{lease := Lease, monitor := Monitor}} ->
             true = erlang:demonitor(Monitor, [flush]),
-            Moved = Held#{monitor := erlang:monitor(process, NewOwner)},
+            Moved = Held#{monitor := erlang:monitor(process, NewOwner), given_away := true},
             {reply, ok, State#{out := Out#{Conn := Moved}}};
         #{} ->
             {reply, {error, not_checked_out}, State}
@@ -368,14 +377,14 @@ call(Name, Request, Timeout) ->
 -spec returned(esqlite3:esqlite3(), lease(), gen_server:from() | none, state()) -> state().
 returned(
     Conn,
-    #{monitor := Monitor, dirty := Dirty},
+    #{monitor := Monitor, dirty := Dirty, given_away := GivenAway},
     From,
     State = #{out := Out, resetting := Resetting, baseline := Baseline}
 ) ->
     true = erlang:demonitor(Monitor, [flush]),
     Pool = self(),
     {Helper, HelperMonitor} = spawn_monitor(fun() ->
-        Pool ! {reset, self(), reset(Conn, Dirty, Baseline)}
+        Pool ! {reset, self(), reclaimed(Conn, GivenAway, reset(Conn, Dirty, Baseline))}
     end),
     State#{
         out := maps:remove(Conn, Out),
@@ -423,6 +432,14 @@ reset(Conn, Dirty, Baseline) ->
         true -> kept;
         false -> unlocked(Conn)
     end.
+
+%% A lease handed on with `give_away/3` and reclaimed from its new owner may
+%% still be in use by the process that handed it on.
+-spec reclaimed(esqlite3:esqlite3(), boolean(), outcome()) -> outcome().
+reclaimed(Conn, true, Outcome) when Outcome =/= dropped ->
+    unlocked(Conn);
+reclaimed(_Conn, _GivenAway, Outcome) ->
+    Outcome.
 
 %% A dropped connection lives on until no process holds it. In EXCLUSIVE
 %% locking mode it would keep the database locked all that time; back in
