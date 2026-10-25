@@ -115,3 +115,330 @@ transaction_rolls_back_on_throw() ->
     after
         kura_pool_sqlite:checkin(Name, Tk2)
     end.
+
+nested_test_() ->
+    [
+        {Label,
+            {foreach, fun() -> nested_setup(Db, Size) end, fun nested_teardown/1, nested_tests()}}
+     || {Label, Db, Size} <- [
+            {"file database", file, 2},
+            {"in-memory database", memory, 1}
+        ]
+    ].
+
+nested_tests() ->
+    [
+        fun(Pool) ->
+            {"a raise in a nested transaction undoes only its own work", fun() ->
+                nested_raise_undoes_only_inner(Pool)
+            end}
+        end,
+        fun(Pool) ->
+            {"rolling back the outer transaction undoes the nested one", fun() ->
+                outer_rollback_undoes_nested(Pool)
+            end}
+        end,
+        fun(Pool) ->
+            {"the outer transaction carries on after a nested one", fun() ->
+                outer_continues_after_nested(Pool)
+            end}
+        end,
+        fun(Pool) ->
+            {"a raise two levels down undoes only the innermost work", fun() ->
+                doubly_nested_raise(Pool)
+            end}
+        end,
+        fun(Pool) ->
+            {"a rejected commit raises and leaves no transaction open", fun() ->
+                rejected_commit_raises(Pool)
+            end}
+        end,
+        fun(Pool) ->
+            {"a statement after SQLite rolls the transaction back raises", fun() ->
+                statement_after_sqlite_rollback_raises(Pool)
+            end}
+        end,
+        fun(Pool) ->
+            {"the outer transaction raises after SQLite rolls back inside a nested one", fun() ->
+                outer_after_nested_sqlite_rollback_raises(Pool)
+            end}
+        end,
+
+        fun(Pool) ->
+            {"a nested transaction after SQLite rolls the transaction back raises", fun() ->
+                nested_after_sqlite_rollback_raises(Pool)
+            end}
+        end,
+        fun(Pool) ->
+            {"the commit raises after SQLite rolls the transaction back", fun() ->
+                commit_after_sqlite_rollback_raises(Pool)
+            end}
+        end,
+        fun(Pool) ->
+            {"a statement that ends the transaction raises", fun() ->
+                statement_ending_the_transaction_raises(Pool)
+            end}
+        end,
+        fun(Pool) ->
+            {"a nested raise whose savepoint is gone rolls back the whole transaction", fun() ->
+                failed_rollback_to_abandons_the_transaction(Pool)
+            end}
+        end
+    ].
+
+nested_setup(Db, Size) ->
+    Pool = list_to_atom(
+        "kura_driver_sqlite_nested_" ++ integer_to_list(erlang:unique_integer([positive]))
+    ),
+    Path =
+        case Db of
+            memory -> ~":memory:";
+            file -> nested_path(Pool)
+        end,
+    {ok, _} = kura_pool_sqlite:start_pool(Pool, #{database => Path, pool_size => Size}),
+    #{} = sql(Pool, ~"CREATE TABLE nested (id INTEGER)"),
+    {Pool, Path}.
+
+nested_teardown({Pool, Path}) ->
+    kura_pool_sqlite:stop_pool(Pool),
+    _ = file:delete(Path),
+    ok.
+
+nested_path(Pool) ->
+    Dir = os:getenv("TMPDIR", "/tmp"),
+    iolist_to_binary(filename:join(Dir, atom_to_list(Pool) ++ ".db")).
+
+nested_raise_undoes_only_inner({Pool, _}) ->
+    ok = transaction(Pool, fun() ->
+        ok = insert(Pool, 1),
+        ?assertThrow(
+            inner,
+            transaction(Pool, fun() ->
+                ok = insert(Pool, 2),
+                throw(inner)
+            end)
+        ),
+        insert(Pool, 3)
+    end),
+    ?assertEqual([1, 3], ids(Pool)).
+
+outer_rollback_undoes_nested({Pool, _}) ->
+    ?assertThrow(
+        outer,
+        transaction(Pool, fun() ->
+            ok = insert(Pool, 1),
+            ok = transaction(Pool, fun() -> insert(Pool, 2) end),
+            throw(outer)
+        end)
+    ),
+    ?assertEqual([], ids(Pool)).
+
+outer_continues_after_nested({Pool, _}) ->
+    ?assertThrow(
+        outer,
+        transaction(Pool, fun() ->
+            ok = transaction(Pool, fun() -> insert(Pool, 1) end),
+            ok = insert(Pool, 2),
+            ?assertEqual([1, 2], ids(Pool)),
+            throw(outer)
+        end)
+    ),
+    ?assertEqual([], ids(Pool)).
+
+doubly_nested_raise({Pool, _}) ->
+    ok = transaction(Pool, fun() ->
+        ok = insert(Pool, 1),
+        ok = transaction(Pool, fun() ->
+            ok = insert(Pool, 2),
+            ?assertThrow(
+                inner,
+                transaction(Pool, fun() ->
+                    ok = insert(Pool, 3),
+                    throw(inner)
+                end)
+            ),
+            insert(Pool, 4)
+        end)
+    end),
+    ?assertEqual([1, 2, 4], ids(Pool)).
+
+rejected_commit_raises({Pool, _}) ->
+    #{} = sql(Pool, ~"CREATE TABLE parent (id INTEGER PRIMARY KEY)"),
+    #{} = sql(
+        Pool,
+        ~"CREATE TABLE child (parent_id INTEGER REFERENCES parent (id) DEFERRABLE INITIALLY DEFERRED)"
+    ),
+    ok = foreign_keys_on(Pool, []),
+    ?assertError(
+        {kura_driver_sqlite, {commit_failed, _}},
+        transaction(Pool, fun() ->
+            ok = insert(Pool, 1),
+            sql(Pool, ~"INSERT INTO child VALUES (99)")
+        end)
+    ),
+    ?assertEqual([], ids(Pool)),
+    ok = transaction(Pool, fun() -> insert(Pool, 2) end),
+    ?assertEqual([2], ids(Pool)).
+
+%% The pragma is per connection and ignored inside a transaction.
+foreign_keys_on(Pool, Held) ->
+    case kura_pool_sqlite:checkout(Pool, #{}) of
+        {ok, Conn, Token} ->
+            ok = esqlite3:exec(Conn, ~"PRAGMA foreign_keys = ON"),
+            foreign_keys_on(Pool, [Token | Held]);
+        {error, no_conns} ->
+            lists:foreach(fun(Token) -> ok = kura_pool_sqlite:checkin(Pool, Token) end, Held)
+    end.
+
+statement_after_sqlite_rollback_raises({Pool, _}) ->
+    ok = rollback_on_conflict_table(Pool),
+    ?assertError(
+        transaction_rolled_back,
+        transaction(Pool, fun() ->
+            ok = insert(Pool, 1),
+            ok = conflict(Pool),
+            insert(Pool, 2)
+        end)
+    ),
+    ?assertEqual([], ids(Pool)).
+
+outer_after_nested_sqlite_rollback_raises({Pool, _}) ->
+    ok = rollback_on_conflict_table(Pool),
+    ?assertError(
+        transaction_rolled_back,
+        transaction(Pool, fun() ->
+            ok = insert(Pool, 1),
+            ?assertError(transaction_rolled_back, transaction(Pool, fun() -> conflict(Pool) end)),
+            insert(Pool, 2)
+        end)
+    ),
+    ?assertEqual([], ids(Pool)).
+
+statement_ending_the_transaction_raises({Pool, _}) ->
+    ?assertError(
+        {kura_driver_sqlite, transaction_ended_by_statement},
+        transaction(Pool, fun() ->
+            ok = insert(Pool, 1),
+            #{} = sql(Pool, ~"COMMIT"),
+            insert(Pool, 2)
+        end)
+    ),
+    ?assertEqual([1], ids(Pool)).
+
+failed_rollback_to_abandons_the_transaction({Pool, _}) ->
+    Before = erlang:unique_integer([positive, monotonic]),
+    ?assertError(
+        transaction_rolled_back,
+        transaction(Pool, fun() ->
+            ok = insert(Pool, 1),
+            ?assertError(
+                {kura_driver_sqlite, {rollback_to_failed, _}},
+                transaction(Pool, fun() ->
+                    ok = insert(Pool, 2),
+                    ok = release_own_savepoint(Pool, Before + 1, Before + 1000),
+                    throw(inner)
+                end)
+            ),
+            insert(Pool, 3)
+        end)
+    ),
+    ?assertEqual([], ids(Pool)).
+
+%% The nested call's savepoint is named from the next monotonic integer.
+release_own_savepoint(_Pool, From, To) when From > To ->
+    error(savepoint_not_found);
+release_own_savepoint(Pool, From, To) ->
+    case sql(Pool, [~"RELEASE kura_savepoint_", integer_to_binary(From)]) of
+        #{} -> ok;
+        {error, _} -> release_own_savepoint(Pool, From + 1, To)
+    end.
+
+commit_after_sqlite_rollback_raises({Pool, _}) ->
+    ok = rollback_on_conflict_table(Pool),
+    ?assertError(
+        transaction_rolled_back,
+        transaction(Pool, fun() ->
+            ok = insert(Pool, 1),
+            conflict(Pool)
+        end)
+    ),
+    ?assertEqual([], ids(Pool)).
+
+nested_after_sqlite_rollback_raises({Pool, _}) ->
+    ok = rollback_on_conflict_table(Pool),
+    ?assertError(
+        transaction_rolled_back,
+        transaction(Pool, fun() ->
+            ok = insert(Pool, 1),
+            ok = conflict(Pool),
+            transaction(Pool, fun() -> insert(Pool, 2) end)
+        end)
+    ),
+    ?assertEqual([], ids(Pool)).
+
+rollback_on_conflict_table(Pool) ->
+    #{} = sql(
+        Pool, ~"CREATE TABLE rollback_on_conflict (id INTEGER PRIMARY KEY ON CONFLICT ROLLBACK)"
+    ),
+    ok.
+
+conflict(Pool) ->
+    #{} = sql(Pool, ~"INSERT INTO rollback_on_conflict VALUES (1)"),
+    {error, _} = sql(Pool, ~"INSERT INTO rollback_on_conflict VALUES (1)"),
+    ok.
+
+transaction(Pool, Fun) ->
+    kura_driver_sqlite:transaction(kura_pool_sqlite, Pool, Fun, #{}).
+
+sql(Pool, SQL) ->
+    kura_driver_sqlite:query(kura_pool_sqlite, Pool, SQL, [], #{}).
+
+insert(Pool, Id) ->
+    #{command := insert} = kura_driver_sqlite:query(
+        kura_pool_sqlite, Pool, ~"INSERT INTO nested VALUES (?1)", [Id], #{}
+    ),
+    ok.
+
+ids(Pool) ->
+    #{rows := Rows} = sql(Pool, ~"SELECT id FROM nested ORDER BY id"),
+    [Id || #{id := Id} <- Rows].
+
+no_connection_raises_test() ->
+    {Pool, Path} = nested_setup(memory, 1),
+    {ok, _Conn, Token} = kura_pool_sqlite:checkout(Pool, #{}),
+    try
+        ?assertError(
+            {kura_driver_sqlite, {no_connection, no_conns}},
+            transaction(Pool, fun() -> {error, from_the_function} end)
+        )
+    after
+        ok = kura_pool_sqlite:checkin(Pool, Token),
+        nested_teardown({Pool, Path})
+    end.
+
+checkin_after_a_raise_test() ->
+    {Pool, Path} = nested_setup(memory, 1),
+    try
+        ?assertThrow(boom, transaction(Pool, fun() -> throw(boom) end)),
+        ?assertEqual(ok, transaction(Pool, fun() -> ok end))
+    after
+        nested_teardown({Pool, Path})
+    end.
+
+other_pool_inside_a_transaction_test() ->
+    {Outer, OuterPath} = nested_setup(memory, 1),
+    {Other, OtherPath} = nested_setup(memory, 1),
+    try
+        ?assertThrow(
+            outer,
+            transaction(Outer, fun() ->
+                ok = insert(Other, 1),
+                ok = transaction(Other, fun() -> insert(Other, 2) end),
+                throw(outer)
+            end)
+        ),
+        ?assertEqual([1, 2], ids(Other))
+    after
+        nested_teardown({Outer, OuterPath}),
+        nested_teardown({Other, OtherPath})
+    end.
