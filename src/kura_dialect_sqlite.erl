@@ -31,8 +31,6 @@ phase 2 skeleton and will be addressed by capability flags in phase 3.
 
 -include_lib("kura/include/kura.hrl").
 
--eqwalizer({nowarn_function, format_default/1}).
-
 -export([
     to_sql/1,
     to_sql_from/2,
@@ -154,7 +152,8 @@ column_type({custom, Mod}) ->
         false -> Mod:pg_type()
     end.
 
--spec format_default(term()) -> binary().
+%% A default is whatever the schema declares.
+-spec format_default(dynamic()) -> binary().
 format_default(Val) when is_integer(Val) -> integer_to_binary(Val);
 format_default(Val) when is_float(Val) -> float_to_binary(Val);
 format_default(Val) when is_binary(Val) -> <<"'", Val/binary, "'">>;

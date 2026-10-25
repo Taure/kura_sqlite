@@ -8,7 +8,7 @@ on:
       - 'LICENSE'
       - '.gitignore'
   pull_request:
-    branches: [main]
+    branches: [main, next]
     paths-ignore:
       - '**.md'
       - 'LICENSE'
@@ -44,4 +44,4 @@ jobs:
       mutate-diff: true
       mutate-min-score: 75
       enable-elp-lint: true
-      enable-elp-eqwalize: false
+      enable-elp-eqwalize: true
