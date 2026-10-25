@@ -80,10 +80,6 @@ the workload. esqlite sets 2 seconds by default.
 
 -behaviour(kura_driver).
 
--eqwalizer({nowarn_function, query/5}).
--eqwalizer({nowarn_function, transaction/4}).
--eqwalizer({nowarn_function, collect_rows/3}).
-
 -export([
     query/5,
     query_on/4,
@@ -97,7 +93,7 @@ the workload. esqlite sets 2 seconds by default.
 -spec query(module(), atom(), iodata(), [term()], map()) -> dynamic().
 query(PoolMod, Pool, SQL, Params, _Opts) ->
     SQLBin = iolist_to_binary(SQL),
-    case erlang:get({kura_sqlite_tx_conn, Pool}) of
+    case tx_conn(Pool) of
         undefined ->
             kura_pool:with_conn(PoolMod, Pool, fun(Conn) ->
                 ok = touched(PoolMod, Pool, Conn, SQLBin),
@@ -115,7 +111,7 @@ query_on(Conn, SQL, Params, _Opts) ->
 
 -spec transaction(module(), atom(), fun(() -> term()), map()) -> term().
 transaction(PoolMod, Pool, Fun, _Opts) ->
-    case erlang:get({kura_sqlite_tx_conn, Pool}) of
+    case tx_conn(Pool) of
         undefined ->
             case PoolMod:checkout(Pool, #{}) of
                 {ok, Conn, Token} ->
@@ -264,7 +260,7 @@ run_prepared(Stmt, Params, Cmd) ->
     case bind_params(Stmt, Params) of
         ok ->
             ColNames = esqlite3:column_names(Stmt),
-            try collect_rows(Stmt, ColNames, []) of
+            try collect_rows(Stmt, ColNames) of
                 {error, _} = Err ->
                     Err;
                 Rows when is_list(Rows) ->
@@ -288,23 +284,32 @@ bind_params(Stmt, Params) ->
         {error, _} = E -> E
     end.
 
--spec collect_rows(esqlite3:esqlite3_stmt(), [binary()], [map()]) -> [map()] | {error, term()}.
-collect_rows(Stmt, ColNames, Acc) ->
+%% The process dictionary is untyped; what is stored is the connection put
+%% there by the outermost transaction.
+-spec tx_conn(atom()) -> dynamic().
+tx_conn(Pool) ->
+    erlang:get({kura_sqlite_tx_conn, Pool}).
+
+-spec collect_rows(esqlite3:esqlite3_stmt(), [binary()]) ->
+    [#{atom() => term()}] | {error, term()}.
+collect_rows(Stmt, ColNames) ->
     case esqlite3:step(Stmt) of
         '$done' ->
-            lists:reverse(Acc);
+            [];
         {error, _} = Err ->
             Err;
         Row when is_list(Row) ->
-            Map = row_to_map(Row, ColNames),
-            collect_rows(Stmt, ColNames, [Map | Acc])
+            case collect_rows(Stmt, ColNames) of
+                {error, _} = Err -> Err;
+                Rows -> [row_to_map(Row, ColNames) | Rows]
+            end
     end.
 
--spec row_to_map([term()], [binary()]) -> map().
+-spec row_to_map([term()], [binary()]) -> #{atom() => term()}.
 row_to_map(Row, ColNames) ->
     row_to_map(Row, ColNames, #{}).
 
--spec row_to_map([term()], [binary()], map()) -> map().
+-spec row_to_map([term()], [binary()], #{atom() => term()}) -> #{atom() => term()}.
 row_to_map([], _ColNames, Acc) ->
     Acc;
 row_to_map(_Row, [], Acc) ->
