@@ -431,6 +431,24 @@ other_pool_inside_a_transaction_test() ->
         nested_teardown({Other, OtherPath})
     end.
 
+statement_that_waits_out_the_busy_timeout_returns_busy_test() ->
+    {Pool, Path} = nested_setup(file, 1),
+    {ok, Other} = esqlite3:open(binary_to_list(Path)),
+    {ok, Conn, Token} = kura_pool_sqlite:checkout(Pool, #{}),
+    try
+        ok = esqlite3:exec(Other, ~"BEGIN IMMEDIATE"),
+        #{} = kura_driver_sqlite:query_on(Conn, ~"PRAGMA busy_timeout = 10", [], #{}),
+        ?assertEqual(
+            {error, busy},
+            kura_driver_sqlite:query_on(Conn, ~"INSERT INTO nested VALUES (1)", [], #{})
+        )
+    after
+        _ = esqlite3:exec(Other, ~"ROLLBACK"),
+        _ = esqlite3:close(Other),
+        ok = kura_pool_sqlite:checkin(Pool, Token),
+        nested_teardown({Pool, Path})
+    end.
+
 drop_of_a_referenced_table_is_refused_test() ->
     with_parent(fun(Pool) ->
         ?assertEqual(
