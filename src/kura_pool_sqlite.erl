@@ -111,6 +111,12 @@ A pool too busy to answer within the timeout and another 500 ms returns
 lease back, so a connection the pool hands out after the caller stopped
 waiting is not lost to it.
 
+A database file whose directory does not exist is refused with
+`{error, 14}` (`SQLITE_CANTOPEN`) without asking esqlite to open it:
+esqlite frees the handle twice when an open fails, which can corrupt the
+memory of the whole node. Other failed opens, such as a file the node may
+not read, still go through esqlite.
+
 A restarted pool opens new connections. Connections leased before the
 restart are no longer the pool's: their checkins are ignored, and they
 are closed when garbage collected. A stopping pool closes only the
@@ -148,6 +154,7 @@ connections nobody holds.
 -include_lib("kernel/include/logger.hrl").
 
 -define(DEFAULT_WAIT, 5000).
+-define(SQLITE_CANTOPEN, 14).
 -define(REPLY_MARGIN, 500).
 
 -define(SETTINGS, [
@@ -785,13 +792,29 @@ open_n(DbPath, N, Acc) when N > 0 ->
 %% database, so it cannot wait on a lock the way a schema read can.
 -spec connected(binary() | string()) -> {ok, esqlite3:esqlite3()} | {error, term()}.
 connected(DbPath) ->
-    case esqlite3:open(to_filename(DbPath)) of
-        {ok, Conn} ->
-            ok = esqlite3:exec(Conn, ~"PRAGMA foreign_keys = ON"),
-            {ok, Conn};
-        {error, _} = Error ->
-            Error
+    Filename = to_filename(DbPath),
+    case in_a_directory(Filename) of
+        true -> foreign_keys_on(esqlite3:open(Filename));
+        false -> {error, ?SQLITE_CANTOPEN}
     end.
+
+%% esqlite closes the handle twice when SQLite cannot open a file, which
+%% corrupts the heap of the whole node, so a file whose directory is missing,
+%% the usual reason, is refused before esqlite tries. A `file:` URI is not
+%% a path.
+-spec in_a_directory(string()) -> boolean().
+in_a_directory("file:" ++ _Uri) ->
+    true;
+in_a_directory(Filename) ->
+    filelib:is_dir(filename:dirname(Filename)).
+
+-spec foreign_keys_on({ok, esqlite3:esqlite3()} | {error, term()}) ->
+    {ok, esqlite3:esqlite3()} | {error, term()}.
+foreign_keys_on({ok, Conn}) ->
+    ok = esqlite3:exec(Conn, ~"PRAGMA foreign_keys = ON"),
+    {ok, Conn};
+foreign_keys_on({error, _} = Error) ->
+    Error.
 
 -spec utf8_opened(binary() | string()) -> {ok, esqlite3:esqlite3()} | {error, term()}.
 utf8_opened(DbPath) ->

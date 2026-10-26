@@ -237,7 +237,7 @@ pool_outlives_the_process_that_started_it_test() ->
 
 failed_start_returns_an_error_to_the_caller_test() ->
     ?assertMatch(
-        {result, {error, _}},
+        {result, {error, 14}},
         in_fresh(fun() ->
             kura_pool_sqlite:start_pool(pool_for_failed_start, #{
                 database => ~"/nonexistent_dir/x.db", pool_size => 1
@@ -1035,6 +1035,37 @@ waiter_is_refused_when_the_database_leaves_utf8_test() ->
         file:delete(Path)
     end.
 
+open_in_a_missing_directory_is_refused_before_esqlite_test() ->
+    Session = trace:session_create(?MODULE, self(), []),
+    try
+        _ = trace:process(Session, new, true, [call]),
+        1 = trace:function(Session, {esqlite3, open, 1}, true, [local]),
+        ?assertEqual(
+            {result, {error, 14}},
+            in_fresh(fun() ->
+                kura_pool_sqlite:start_pool(pool_for_missing_directory, #{
+                    database => ~"/nonexistent_dir/x.db", pool_size => 1
+                })
+            end)
+        ),
+        ?assertEqual([], traced(Session))
+    after
+        trace:session_destroy(Session)
+    end.
+
+database_named_by_a_file_uri_is_opened_test() ->
+    Name = pool_for_file_uri,
+    Path = db_path(Name),
+    _ = file:delete(Path),
+    {ok, _} = kura_pool_sqlite:start_pool(Name, #{database => <<"file:", Path/binary>>}),
+    try
+        #{} = sql(Name, ~"CREATE TABLE t (id INTEGER)"),
+        ?assert(filelib:is_regular(Path))
+    after
+        kura_pool_sqlite:stop_pool(Name),
+        file:delete(Path)
+    end.
+
 with_held(Name, Test) ->
     {ok, _} = kura_pool_sqlite:start_pool(Name, #{database => ~":memory:", pool_size => 1}),
     try
@@ -1114,7 +1145,8 @@ traced(Session) ->
 
 trace_messages() ->
     receive
-        {trace, _Pid, 'receive', Message} -> [Message | trace_messages()]
+        {trace, _Pid, 'receive', Message} -> [Message | trace_messages()];
+        {trace, _Pid, call, {esqlite3, open, [Filename]}} -> [Filename | trace_messages()]
     after 0 -> []
     end.
 
