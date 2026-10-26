@@ -393,16 +393,15 @@ ids(Pool) ->
     [Id || #{id := Id} <- Rows].
 
 no_connection_raises_test() ->
-    {Pool, Path} = nested_setup(memory, 1),
-    {ok, _Conn, Token} = kura_pool_sqlite:checkout(Pool, #{}),
+    Pool = kura_driver_sqlite_without_connections,
+    {ok, _} = kura_pool_sqlite:start_pool(Pool, #{database => ~":memory:", pool_size => 0}),
     try
         ?assertError(
             {kura_driver_sqlite, {no_connection, no_conns}},
             transaction(Pool, fun() -> {error, from_the_function} end)
         )
     after
-        ok = kura_pool_sqlite:checkin(Pool, Token),
-        nested_teardown({Pool, Path})
+        kura_pool_sqlite:stop_pool(Pool)
     end.
 
 checkin_after_a_raise_test() ->

@@ -96,11 +96,20 @@ before the call has taken the connection's lock. That call can still run
 after the reset. Closing it needs a process that owns each connection and
 runs every statement on it, or support from esqlite.
 
-`checkout/2` takes `#{timeout => Ms}`, 5000 by default, as the timeout of
-its call to the pool. It does not wait for a connection to come free:
-with none free it returns `{error, no_conns}` at once. A checkout that
-times out gives its lease back, so a connection the pool hands out after
-the caller stopped waiting is not lost to it.
+`checkout/2` waits up to `#{timeout => Ms}`, 5000 by default, for a
+connection to come free; `infinity` waits for as long as it takes.
+Callers wait in the order they came, and a connection that comes back, or
+one opened in place of a dropped one, goes to the first of them. A caller
+whose time runs out gets `{error, no_conns}`, and one that dies stops
+waiting. `#{timeout => 0}` does not wait. Nor does any checkout when
+nothing could come back to it: with no connection out or being reset, or
+once the pool has stopped opening connections, it returns
+`{error, no_conns}` at once, and so does every caller still waiting.
+
+A pool too busy to answer within the timeout and another 500 ms returns
+`{error, checkout_timeout}`. A checkout that times out that way gives its
+lease back, so a connection the pool hands out after the caller stopped
+waiting is not lost to it.
 
 A restarted pool opens new connections. Connections leased before the
 restart are no longer the pool's: their checkins are ignored, and they
@@ -138,6 +147,9 @@ connections nobody holds.
 
 -include_lib("kernel/include/logger.hrl").
 
+-define(DEFAULT_WAIT, 5000).
+-define(REPLY_MARGIN, 500).
+
 -define(SETTINGS, [
     ~"query_only",
     ~"writable_schema",
@@ -157,6 +169,13 @@ connections nobody holds.
     lease := reference(), monitor := reference(), dirty := boolean(), given_away := boolean()
 }.
 
+-type waiter() :: #{
+    lease := reference(),
+    from := gen_server:from(),
+    monitor := reference(),
+    timer := reference() | infinity
+}.
+
 -type outcome() :: kept | {kept, [term()]} | dropped | not_utf8.
 
 -type baseline() :: #{settings := [term()], db_path := binary() | string()}.
@@ -171,11 +190,12 @@ connections nobody holds.
     baseline := baseline(),
     available := [esqlite3:esqlite3()],
     out := #{esqlite3:esqlite3() => lease()},
+    waiting := #{integer() => waiter()},
     resetting := #{pid() => {reference(), esqlite3:esqlite3(), gen_server:from() | none}}
 }.
 
 -type request() ::
-    {checkout, pid(), reference()}
+    {checkout, pid(), reference(), timeout()}
     | {checkin, esqlite3:esqlite3(), reference()}
     | {give_away, esqlite3:esqlite3(), reference(), pid()}
     | {dirty, esqlite3:esqlite3()}
@@ -202,7 +222,8 @@ stop_pool(Name) ->
     {ok, kura_pool:conn(), kura_pool:token()} | {error, term()}.
 checkout(Name, Opts) ->
     Lease = make_ref(),
-    case call(Name, {checkout, self(), Lease}, maps:get(timeout, Opts, 5000)) of
+    Wait = wait(Opts),
+    case call(Name, {checkout, self(), Lease, Wait}, answered_within(Wait)) of
         {exit, timeout} ->
             gen_server:cast(Name, {abandon, Lease}),
             {error, checkout_timeout};
@@ -284,6 +305,7 @@ init({Name, DbPath, Size, Supervisor}) ->
                 baseline => baseline(Conns, DbPath),
                 available => Conns,
                 out => #{},
+                waiting => #{},
                 resetting => #{}
             }};
         {error, Reason} ->
@@ -292,20 +314,17 @@ init({Name, DbPath, Size, Supervisor}) ->
 
 -spec handle_call(request(), gen_server:from(), state()) ->
     {reply, term(), state()} | {noreply, state()}.
-handle_call({checkout, Borrower, Lease}, _From, State0) ->
+handle_call({checkout, Borrower, Lease, Wait}, From, State0) ->
     case replenished(State0) of
-        State = #{name := Name, available := [Conn | Rest], out := Out} ->
+        State = #{name := Name, available := [Conn | Rest]} ->
             Monitor = erlang:monitor(process, Borrower),
-            {reply, {ok, Conn, {Name, Conn, Lease}}, State#{
-                available := Rest,
-                out := Out#{
-                    Conn => #{
-                        lease => Lease, monitor => Monitor, dirty => false, given_away => false
-                    }
-                }
-            }};
+            {reply, {ok, Conn, {Name, Conn, Lease}},
+                lent(Conn, Lease, Monitor, State#{available := Rest})};
         State ->
-            {reply, {error, no_conns}, State}
+            case Wait =/= 0 andalso outstanding(State) of
+                true -> {noreply, queued(Borrower, Lease, Wait, From, State)};
+                false -> {reply, {error, no_conns}, State}
+            end
     end;
 handle_call({checkin, Conn, Lease}, From, State = #{out := Out}) ->
     case Out of
@@ -369,7 +388,16 @@ handle_info({'DOWN', _Monitor, process, Helper, _Reason}, State = #{resetting :=
 handle_info({'DOWN', Ref, process, _Pid, _Reason}, State = #{out := Out}) when is_reference(Ref) ->
     case [{Conn, Held} || Conn := Held = #{monitor := Monitor} <- Out, Monitor =:= Ref] of
         [{Conn, Held}] -> {noreply, returned(Conn, Held, none, State)};
-        [] -> {noreply, State}
+        [] -> {noreply, given_up(withdrawn(monitor, Ref, State), State)}
+    end;
+handle_info({waited, Lease}, State) when is_reference(Lease) ->
+    case withdrawn(lease, Lease, State) of
+        {#{from := From, monitor := Monitor}, Rest} ->
+            true = erlang:demonitor(Monitor, [flush]),
+            ok = gen_server:reply(From, {error, no_conns}),
+            {noreply, Rest};
+        none ->
+            {noreply, State}
     end;
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -412,6 +440,104 @@ call(Name, Request, Timeout) ->
             {exit, shutdown}
     end.
 
+-spec wait(kura_pool:checkout_opts()) -> timeout().
+wait(#{timeout := Wait}) when Wait =:= infinity; is_integer(Wait), Wait >= 0 ->
+    Wait;
+wait(#{timeout := Wait}) ->
+    error({badarg, {timeout, Wait}});
+wait(#{}) ->
+    ?DEFAULT_WAIT.
+
+%% The pool answers a checkout that runs out of time itself, so the call
+%% waits a little longer than that for the answer.
+-spec answered_within(timeout()) -> timeout().
+answered_within(infinity) ->
+    infinity;
+answered_within(Wait) ->
+    Wait + ?REPLY_MARGIN.
+
+-spec lent(esqlite3:esqlite3(), reference(), reference(), state()) -> state().
+lent(Conn, Lease, Monitor, State = #{out := Out}) ->
+    State#{
+        out := Out#{
+            Conn => #{lease => Lease, monitor => Monitor, dirty => false, given_away => false}
+        }
+    }.
+
+%% A connection can only become free by coming back from a lease or a reset,
+%% and not at all once the database has left UTF-8.
+-spec outstanding(state()) -> boolean().
+outstanding(#{not_utf8 := true}) ->
+    false;
+outstanding(#{out := Out, resetting := Resetting}) ->
+    map_size(Out) + map_size(Resetting) > 0.
+
+-spec queued(pid(), reference(), timeout(), gen_server:from(), state()) -> state().
+queued(Borrower, Lease, Wait, From, State = #{waiting := Waiting}) ->
+    Waiter = #{
+        lease => Lease,
+        from => From,
+        monitor => erlang:monitor(process, Borrower),
+        timer => timer(Wait, Lease)
+    },
+    State#{waiting := Waiting#{erlang:unique_integer([monotonic]) => Waiter}}.
+
+-spec timer(timeout(), reference()) -> reference() | infinity.
+timer(infinity, _Lease) ->
+    infinity;
+timer(Wait, Lease) ->
+    erlang:send_after(Wait, self(), {waited, Lease}).
+
+-spec withdrawn(lease | monitor, reference(), state()) -> {waiter(), state()} | none.
+withdrawn(Key, Ref, State = #{waiting := Waiting}) ->
+    case [{Arrived, Waiter} || Arrived := Waiter <- Waiting, maps:get(Key, Waiter) =:= Ref] of
+        [{Arrived, Waiter}] -> {Waiter, State#{waiting := maps:remove(Arrived, Waiting)}};
+        [] -> none
+    end.
+
+-spec given_up({waiter(), state()} | none, state()) -> state().
+given_up({#{timer := Timer}, Rest}, _State) ->
+    ok = cancelled(Timer),
+    Rest;
+given_up(none, State) ->
+    State.
+
+-spec cancelled(reference() | infinity) -> ok.
+cancelled(infinity) ->
+    ok;
+cancelled(Timer) ->
+    _ = erlang:cancel_timer(Timer),
+    ok.
+
+%% Waiters only queue while no connection is free, so each connection that
+%% becomes free goes to the first of them. Once nothing can come back, none
+%% of them will be served.
+-spec served(state()) -> state().
+served(State = #{name := Name, available := [Conn | Rest], waiting := Waiting}) ->
+    case maps:next(maps:iterator(Waiting, ordered)) of
+        {Arrived, #{lease := Lease, from := From, monitor := Monitor, timer := Timer}, _} ->
+            ok = cancelled(Timer),
+            ok = gen_server:reply(From, {ok, Conn, {Name, Conn, Lease}}),
+            Others = maps:remove(Arrived, Waiting),
+            served(lent(Conn, Lease, Monitor, State#{available := Rest, waiting := Others}));
+        none ->
+            State
+    end;
+served(State = #{waiting := Waiting}) ->
+    case outstanding(State) of
+        true ->
+            State;
+        false ->
+            _ = [refused(Waiter) || _ := Waiter <- Waiting],
+            State#{waiting := #{}}
+    end.
+
+-spec refused(waiter()) -> ok.
+refused(#{from := From, monitor := Monitor, timer := Timer}) ->
+    true = erlang:demonitor(Monitor, [flush]),
+    ok = cancelled(Timer),
+    gen_server:reply(From, {error, no_conns}).
+
 -spec returned(esqlite3:esqlite3(), lease(), gen_server:from() | none, state()) -> state().
 returned(
     Conn,
@@ -437,13 +563,13 @@ learned(Settings, State = #{baseline := Baseline}) ->
     state().
 restored(Conn, From, kept, State = #{available := Available}) ->
     ok = replied(From),
-    State#{available := [Conn | Available]};
+    served(State#{available := [Conn | Available]});
 %% esqlite's close is not safe against a statement another process is still
 %% running on the connection, and gives up without closing when its rollback
 %% fails, so a dropped connection is left to its destructor.
 restored(_Conn, From, dropped, State) ->
     ok = replied(From),
-    opened(State);
+    served(opened(State));
 %% Every connection on the file now reads it in another encoding, the idle
 %% ones included, and so would any connection opened in their place.
 restored(_Conn, From, not_utf8, State = #{name := Name, not_utf8 := Logged}) ->
@@ -452,7 +578,7 @@ restored(_Conn, From, not_utf8, State = #{name := Name, not_utf8 := Logged}) ->
         true -> ok;
         false -> ?LOG_ERROR(#{event => database_not_utf8, pool => Name})
     end,
-    State#{available := [], not_utf8 := true}.
+    served(State#{available := [], not_utf8 := true}).
 
 %% A connection that could not be replaced is opened on a later checkout.
 -spec replenished(state()) -> state().
@@ -621,10 +747,18 @@ closed(Conn) ->
     end.
 
 -spec lease_counts(gen_server:format_status()) -> gen_server:format_status().
-lease_counts(Status = #{state := State = #{out := Out, resetting := Resetting}}) when
-    is_map(Out), is_map(Resetting)
+lease_counts(
+    Status = #{state := State = #{out := Out, resetting := Resetting, waiting := Waiting}}
+) when
+    is_map(Out), is_map(Resetting), is_map(Waiting)
 ->
-    Status#{state := State#{out := maps:size(Out), resetting := maps:size(Resetting)}};
+    Status#{
+        state := State#{
+            out := maps:size(Out),
+            resetting := maps:size(Resetting),
+            waiting := maps:size(Waiting)
+        }
+    };
 lease_counts(Status) ->
     Status.
 

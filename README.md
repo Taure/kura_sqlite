@@ -66,6 +66,9 @@ to start on this backend via `kura_capabilities:require/2`.
   `{error, {referenced_by, Table, Referencing}}`, as Postgres refuses it,
   rather than letting SQLite delete its rows and run their `ON DELETE`
   rules.
+- **Checkout waits** up to `#{timeout => Ms}` (5000 by default) for a
+  connection to come free, then returns `{error, no_conns}`.
+  `#{timeout => 0}` does not wait.
 - **UTF-8 only.** `start_pool/2` refuses a database in another encoding
   with `{error, {unsupported_encoding, Encoding}}`. Binaries are stored as
   TEXT, which a UTF-16 database transcodes, so encrypted fields would not
