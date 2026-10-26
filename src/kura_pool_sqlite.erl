@@ -97,7 +97,8 @@ after the reset. Closing it needs a process that owns each connection and
 runs every statement on it, or support from esqlite.
 
 `checkout/2` waits up to `#{timeout => Ms}`, 5000 by default, for a
-connection to come free; `infinity` waits for as long as it takes.
+connection to come free; `infinity` waits for as long as it takes, and
+so does a timeout longer than an Erlang timer can run.
 Callers wait in the order they came, and a connection that comes back, or
 one opened in place of a dropped one, goes to the first of them. A caller
 whose time runs out gets `{error, no_conns}`, and one that dies stops
@@ -163,6 +164,7 @@ connections nobody holds.
 -define(DEFAULT_WAIT, 5000).
 -define(SQLITE_CANTOPEN, 14).
 -define(REPLY_MARGIN, 500).
+-define(MAX_WAIT, (16#FFFFFFFF - ?REPLY_MARGIN)).
 
 -define(SETTINGS, [
     ~"query_only",
@@ -206,7 +208,9 @@ connections nobody holds.
     baseline := baseline(),
     available := [esqlite3:esqlite3()],
     out := #{esqlite3:esqlite3() => lease()},
-    waiting := #{integer() => waiter()},
+    waiting := gb_trees:tree(integer(), waiter()),
+    waiting_leases := #{reference() => integer()},
+    waiting_monitors := #{reference() => integer()},
     resetting := #{pid() => {reference(), esqlite3:esqlite3(), gen_server:from() | none}}
 }.
 
@@ -321,7 +325,9 @@ init({Name, DbPath, Size, Supervisor}) ->
                 baseline => baseline(Conns, DbPath),
                 available => Conns,
                 out => #{},
-                waiting => #{},
+                waiting => gb_trees:empty(),
+                waiting_leases => #{},
+                waiting_monitors => #{},
                 resetting => #{}
             }};
         {error, Reason} ->
@@ -458,7 +464,10 @@ call(Name, Request, Timeout) ->
             {exit, shutdown}
     end.
 
+%% A wait longer than a timer or a call can run is as good as no limit.
 -spec wait(kura_pool:checkout_opts()) -> timeout().
+wait(#{timeout := Wait}) when is_integer(Wait), Wait > ?MAX_WAIT ->
+    infinity;
 wait(#{timeout := Wait}) when Wait =:= infinity; is_integer(Wait), Wait >= 0 ->
     Wait;
 wait(#{timeout := Wait}) ->
@@ -508,14 +517,21 @@ outstanding(#{out := Out, resetting := Resetting}) ->
     map_size(Out) + map_size(Resetting) > 0.
 
 -spec queued(pid(), reference(), timeout(), gen_server:from(), state()) -> state().
-queued(Borrower, Lease, Wait, From, State = #{waiting := Waiting}) ->
-    Waiter = #{
-        lease => Lease,
-        from => From,
-        monitor => erlang:monitor(process, Borrower),
-        timer => timer(Wait, Lease)
-    },
-    State#{waiting := Waiting#{erlang:unique_integer([monotonic]) => Waiter}}.
+queued(
+    Borrower,
+    Lease,
+    Wait,
+    From,
+    State = #{waiting := Waiting, waiting_leases := Leases, waiting_monitors := Monitors}
+) ->
+    Arrived = erlang:unique_integer([monotonic]),
+    Monitor = erlang:monitor(process, Borrower),
+    Waiter = #{lease => Lease, from => From, monitor => Monitor, timer => timer(Wait, Lease)},
+    State#{
+        waiting := gb_trees:insert(Arrived, Waiter, Waiting),
+        waiting_leases := Leases#{Lease => Arrived},
+        waiting_monitors := Monitors#{Monitor => Arrived}
+    }.
 
 -spec timer(timeout(), reference()) -> reference() | infinity.
 timer(infinity, _Lease) ->
@@ -524,11 +540,29 @@ timer(Wait, Lease) ->
     erlang:send_after(Wait, self(), {waited, Lease}).
 
 -spec withdrawn(lease | monitor, reference(), state()) -> {waiter(), state()} | none.
-withdrawn(Key, Ref, State = #{waiting := Waiting}) ->
-    case [{Arrived, Waiter} || Arrived := Waiter <- Waiting, maps:get(Key, Waiter) =:= Ref] of
-        [{Arrived, Waiter}] -> {Waiter, State#{waiting := maps:remove(Arrived, Waiting)}};
-        [] -> none
-    end.
+withdrawn(lease, Lease, State = #{waiting_leases := Leases}) ->
+    dequeued(maps:find(Lease, Leases), State);
+withdrawn(monitor, Monitor, State = #{waiting_monitors := Monitors}) ->
+    dequeued(maps:find(Monitor, Monitors), State).
+
+-spec dequeued({ok, integer()} | error, state()) -> {waiter(), state()} | none.
+dequeued({ok, Arrived}, State = #{waiting := Waiting}) ->
+    Waiter = gb_trees:get(Arrived, Waiting),
+    {Waiter, forgotten(Arrived, Waiter, State)};
+dequeued(error, _State) ->
+    none.
+
+-spec forgotten(integer(), waiter(), state()) -> state().
+forgotten(
+    Arrived,
+    #{lease := Lease, monitor := Monitor},
+    State = #{waiting := Waiting, waiting_leases := Leases, waiting_monitors := Monitors}
+) ->
+    State#{
+        waiting := gb_trees:delete(Arrived, Waiting),
+        waiting_leases := maps:remove(Lease, Leases),
+        waiting_monitors := maps:remove(Monitor, Monitors)
+    }.
 
 -spec given_up({waiter(), state()} | none, state()) -> state().
 given_up({#{monitor := Monitor, timer := Timer}, Rest}, _State) ->
@@ -550,13 +584,15 @@ cancelled(Timer) ->
 %% of them will be served.
 -spec served(state()) -> state().
 served(State = #{name := Name, available := [Conn | Rest], waiting := Waiting}) ->
-    case maps:next(maps:iterator(Waiting, ordered)) of
-        {Arrived, #{lease := Lease, from := From, monitor := Monitor, timer := Timer}, _} ->
+    case gb_trees:is_empty(Waiting) of
+        false ->
+            {Arrived, Waiter} = gb_trees:smallest(Waiting),
+            #{lease := Lease, from := From, monitor := Monitor, timer := Timer} = Waiter,
             ok = cancelled(Timer),
             ok = gen_server:reply(From, {ok, Conn, {Name, Conn, Lease}}),
-            Others = maps:remove(Arrived, Waiting),
-            served(lent(Conn, Lease, Monitor, State#{available := Rest, waiting := Others}));
-        none ->
+            Others = forgotten(Arrived, Waiter, State#{available := Rest}),
+            served(lent(Conn, Lease, Monitor, Others));
+        true ->
             State
     end;
 served(State = #{waiting := Waiting}) ->
@@ -564,8 +600,8 @@ served(State = #{waiting := Waiting}) ->
         true ->
             State;
         false ->
-            _ = [refused(Waiter) || _ := Waiter <- Waiting],
-            State#{waiting := #{}}
+            _ = [refused(Waiter) || Waiter <- gb_trees:values(Waiting)],
+            State#{waiting := gb_trees:empty(), waiting_leases := #{}, waiting_monitors := #{}}
     end.
 
 -spec refused(waiter()) -> ok.
@@ -784,15 +820,16 @@ closed(Conn) ->
 
 -spec lease_counts(gen_server:format_status()) -> gen_server:format_status().
 lease_counts(
-    Status = #{state := State = #{out := Out, resetting := Resetting, waiting := Waiting}}
+    Status = #{state := State = #{out := Out, resetting := Resetting, waiting_leases := Waiting}}
 ) when
     is_map(Out), is_map(Resetting), is_map(Waiting)
 ->
+    Counted = maps:without([waiting_leases, waiting_monitors], State),
     Status#{
-        state := State#{
-            out := maps:size(Out),
-            resetting := maps:size(Resetting),
-            waiting := maps:size(Waiting)
+        state := Counted#{
+            out => map_size(Out),
+            resetting => map_size(Resetting),
+            waiting => map_size(Waiting)
         }
     };
 lease_counts(Status) ->

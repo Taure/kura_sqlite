@@ -514,8 +514,10 @@ status_does_not_list_leases_test() ->
         {ok, _Conn, {Name, _, Lease}} = kura_pool_sqlite:checkout(Name, #{}),
         Waiter = waiter(Name, #{}),
         ok = await_waiting(Name, 1),
+        [Waiting] = waiting_leases(Name),
         Status = lists:flatten(io_lib:format("~p", [sys:get_status(Name)])),
         ?assertEqual(nomatch, string:find(Status, ref_to_list(Lease))),
+        ?assertEqual(nomatch, string:find(Status, ref_to_list(Waiting))),
         ?assertNotEqual(nomatch, string:find(Status, "waiting => 1")),
         ok = kill(Waiter)
     after
@@ -950,6 +952,41 @@ checkout_without_a_timeout_waits_test() ->
         ok = released(Waiter)
     end).
 
+checkout_wait_longer_than_a_timer_can_run_waits_test() ->
+    with_held(pool_for_longest_wait, fun(Name, Conn, Token) ->
+        Waiters = [
+            waiter(Name, #{timeout => Wait})
+         || Wait <- [16#FFFFFFFF - 500, 16#FFFFFFFF - 499, 5000000000]
+        ],
+        ok = await_waiting(Name, 3),
+        ok = kura_pool_sqlite:checkin(Name, Token),
+        _ = [
+            begin
+                ?assertMatch({ok, Conn, _}, result_of(Waiter)),
+                ok = released(Waiter)
+            end
+         || Waiter <- Waiters
+        ]
+    end).
+
+waiter_gone_from_the_middle_of_the_queue_is_skipped_test() ->
+    with_held(pool_for_middle_waiter, fun(Name, Conn, Token) ->
+        First = waiter(Name, #{}),
+        ok = await_waiting(Name, 1),
+        Gone = waiter(Name, #{}),
+        ok = await_waiting(Name, 2),
+        Last = waiter(Name, #{}),
+        ok = await_waiting(Name, 3),
+        ok = kill(Gone),
+        ok = await_waiting(Name, 2),
+        ok = kura_pool_sqlite:checkin(Name, Token),
+        ?assertMatch({ok, Conn, _}, result_of(First)),
+        ok = released(First),
+        ?assertMatch({ok, Conn, _}, result_of(Last)),
+        ok = released(Last),
+        ?assertEqual(0, waiting(Name))
+    end).
+
 checkout_with_a_bad_timeout_raises_test() ->
     with_held(pool_for_bad_timeout, fun(Name, _Conn, _Token) ->
         ?assertError({badarg, {timeout, -1}}, kura_pool_sqlite:checkout(Name, #{timeout => -1})),
@@ -1239,12 +1276,12 @@ released(Waiter) ->
 
 waiting(Name) ->
     case sys:get_state(Name) of
-        #{waiting := Waiting} when is_map(Waiting) -> map_size(Waiting)
+        #{waiting_leases := Waiting} when is_map(Waiting) -> map_size(Waiting)
     end.
 
 waiting_leases(Name) ->
     case sys:get_state(Name) of
-        #{waiting := Waiting} when is_map(Waiting) -> [L || _ := #{lease := L} <- Waiting]
+        #{waiting_leases := Waiting} when is_map(Waiting) -> maps:keys(Waiting)
     end.
 
 await_waiting(Name, N) ->
