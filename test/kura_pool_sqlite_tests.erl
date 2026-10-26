@@ -1,5 +1,6 @@
 -module(kura_pool_sqlite_tests).
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("kernel/include/file.hrl").
 
 -export([log/2]).
 
@@ -1053,17 +1054,95 @@ open_in_a_missing_directory_is_refused_before_esqlite_test() ->
         trace:session_destroy(Session)
     end.
 
-database_named_by_a_file_uri_is_opened_test() ->
-    Name = pool_for_file_uri,
-    Path = db_path(Name),
+file_uri_is_refused_before_esqlite_test() ->
+    Path = db_path(pool_for_file_uri),
     _ = file:delete(Path),
-    {ok, _} = kura_pool_sqlite:start_pool(Name, #{database => <<"file:", Path/binary>>}),
+    ?assertEqual({error, uri_not_supported}, opened_with(<<"file:", Path/binary>>)),
+    ?assertEqual({error, uri_not_supported}, opened_with(~"file:/nonexistent_dir/x.db")),
+    ?assertNot(filelib:is_file(Path)).
+
+dangling_symlink_is_refused_before_esqlite_test() ->
+    Link = db_path(pool_for_dangling_symlink),
+    _ = file:delete(Link),
+    ok = file:make_symlink(~"/nonexistent_dir/x.db", Link),
     try
-        #{} = sql(Name, ~"CREATE TABLE t (id INTEGER)"),
-        ?assert(filelib:is_regular(Path))
+        ?assertEqual({error, 14}, opened_with(Link))
     after
-        kura_pool_sqlite:stop_pool(Name),
+        file:delete(Link)
+    end.
+
+path_holding_a_nul_is_refused_before_esqlite_test() ->
+    Path = db_path(pool_for_nul),
+    ?assertEqual({error, invalid_filename}, opened_with(<<Path/binary, 0>>)),
+    ?assertEqual({error, invalid_filename}, opened_with(binary_to_list(Path) ++ [0])),
+    ?assertNot(filelib:is_file(Path)).
+
+string_path_holding_a_wide_character_is_refused_before_esqlite_test() ->
+    ?assertEqual(
+        {error, invalid_filename}, opened_with(binary_to_list(db_path(pool_for_wide)) ++ [16#3042])
+    ).
+
+unreadable_file_is_refused_before_esqlite_test() ->
+    Path = db_path(pool_for_unreadable),
+    ok = file:write_file(Path, ~""),
+    try
+        ok = file:change_mode(Path, 8#000),
+        case file:read_file_info(Path) of
+            {ok, #file_info{access = none}} -> ?assertEqual({error, 14}, opened_with(Path));
+            {ok, #file_info{}} -> ok
+        end
+    after
         file:delete(Path)
+    end.
+
+read_only_file_is_opened_test() ->
+    Path = db_path(pool_for_read_only),
+    ok = file:write_file(Path, ~""),
+    try
+        ok = file:change_mode(Path, 8#444),
+        ?assertMatch({ok, [_]}, opened_with(Path))
+    after
+        file:delete(Path)
+    end.
+
+non_ascii_path_is_opened_and_created_test() ->
+    Path = db_path(pool_for_non_ascii),
+    Name = <<(filename:rootname(Path))/binary, "_", "ö"/utf8, ".db">>,
+    _ = file:delete(Name),
+    try
+        ?assertEqual({ok, [Name]}, opened_with(Name)),
+        ?assert(filelib:is_regular(Name))
+    after
+        file:delete(Name)
+    end.
+
+non_ascii_missing_directory_is_refused_before_esqlite_test() ->
+    ?assertEqual({error, 14}, opened_with(<<"/nonexistent_", "ö"/utf8, "/x.db">>)).
+
+empty_path_opens_a_temporary_database_test() ->
+    ?assertEqual({ok, [~""]}, opened_with(~"")).
+
+%% Starts and stops a one-connection pool on Database, returning what
+%% start_pool/2 returned, or the paths esqlite was asked to open.
+opened_with(Database) ->
+    Name = pool_for_opened_with,
+    Session = trace:session_create(?MODULE, self(), []),
+    try
+        _ = trace:process(Session, new, true, [call]),
+        1 = trace:function(Session, {esqlite3, open, 1}, true, [local]),
+        {result, Started} = in_fresh(fun() ->
+            case kura_pool_sqlite:start_pool(Name, #{database => Database, pool_size => 1}) of
+                {ok, _} -> kura_pool_sqlite:stop_pool(Name);
+                {error, _} = Error -> Error
+            end
+        end),
+        Opened = [list_to_binary(Filename) || Filename <- traced(Session), is_list(Filename)],
+        case Started of
+            ok -> {ok, Opened};
+            {error, _} when Opened =:= [] -> Started
+        end
+    after
+        trace:session_destroy(Session)
     end.
 
 checkout_that_reaches_a_backed_up_pool_late_is_not_queued_test() ->

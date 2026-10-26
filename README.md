@@ -75,6 +75,11 @@ to start on this backend via `kura_capabilities:require/2`.
   with `{error, {unsupported_encoding, Encoding}}`. Binaries are stored as
   TEXT, which a UTF-16 database transcodes, so encrypted fields would not
   read back.
+- **Database paths** must name a regular file the node can read, or one
+  it can create. A directory, a missing directory or a dangling symbolic
+  link is refused with `{error, 14}`. `file:` URIs are refused with
+  `{error, uri_not_supported}`, since SQLite resolves them in ways the
+  pool cannot check before opening.
 - **In-memory** (`<<":memory:">>`) is per-connection. Use `pool_size: 1`
   if multiple checkouts must observe the same data, or use a file path.
 

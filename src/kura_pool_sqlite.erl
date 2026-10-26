@@ -113,12 +113,15 @@ out that way gives its lease or its place in the queue back, so a
 connection the pool hands out after the caller stopped waiting is not lost
 to it.
 
-A database path that is a directory, or whose directory does not exist,
-is refused with `{error, 14}` (`SQLITE_CANTOPEN`) without asking esqlite
-to open it:
 esqlite frees the handle twice when an open fails, which can corrupt the
-memory of the whole node. Other failed opens, such as a file the node may
-not read, still go through esqlite.
+memory of the whole node, so the pool checks a database path before
+esqlite sees it. A path must name a regular file the node can read, or
+one it can create; anything else, such as a directory, a missing
+directory or a dangling symbolic link, is refused with `{error, 14}`
+(`SQLITE_CANTOPEN`). A `file:` URI is refused with
+`{error, uri_not_supported}`, and a path holding a NUL byte, or a string
+path holding a character above 255, with `{error, invalid_filename}`.
+`":memory:"` and `""` open as they are.
 
 A restarted pool opens new connections. Connections leased before the
 restart are no longer the pool's: their checkins are ignored, and they
@@ -154,6 +157,7 @@ connections nobody holds.
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, format_status/1]).
 
+-include_lib("kernel/include/file.hrl").
 -include_lib("kernel/include/logger.hrl").
 
 -define(DEFAULT_WAIT, 5000).
@@ -817,21 +821,55 @@ open_n(DbPath, N, Acc) when N > 0 ->
 %% database, so it cannot wait on a lock the way a schema read can.
 -spec connected(binary() | string()) -> {ok, esqlite3:esqlite3()} | {error, term()}.
 connected(DbPath) ->
-    Filename = to_filename(DbPath),
-    case openable(Filename) of
-        true -> foreign_keys_on(esqlite3:open(Filename));
-        false -> {error, ?SQLITE_CANTOPEN}
+    case openable(filename(DbPath)) of
+        {ok, Filename} -> foreign_keys_on(esqlite3:open(binary_to_list(Filename)));
+        {error, _} = Refused -> Refused
+    end.
+
+-spec filename(binary() | string()) -> binary() | {error, invalid_filename}.
+filename(Path) when is_binary(Path) ->
+    Path;
+filename(Path) ->
+    try
+        list_to_binary(Path)
+    catch
+        error:badarg -> {error, invalid_filename}
     end.
 
 %% esqlite closes the handle twice when SQLite cannot open a file, which
-%% corrupts the heap of the whole node, so the usual reasons, a missing
-%% directory or a path that is itself a directory, are refused before esqlite
-%% tries. A `file:` URI is not a path.
--spec openable(string()) -> boolean().
-openable("file:" ++ _Uri) ->
-    true;
-openable(Filename) ->
-    filelib:is_dir(filename:dirname(Filename)) andalso not filelib:is_dir(Filename).
+%% corrupts the heap of the whole node, so only a file that exists, or that
+%% could just be created, reaches it. A `file:` URI names a file only SQLite
+%% can resolve.
+-spec openable(binary() | {error, invalid_filename}) ->
+    {ok, binary()} | {error, invalid_filename | uri_not_supported | ?SQLITE_CANTOPEN}.
+openable({error, _} = Invalid) ->
+    Invalid;
+openable(Memory) when Memory =:= ~":memory:"; Memory =:= ~"" ->
+    {ok, Memory};
+openable(<<"file:", _/binary>>) ->
+    {error, uri_not_supported};
+openable(Path) ->
+    case binary:match(Path, <<0>>) of
+        nomatch -> regular(Path, file:read_file_info(Path));
+        _ -> {error, invalid_filename}
+    end.
+
+-spec regular(binary(), {ok, #file_info{}} | {error, term()}) ->
+    {ok, binary()} | {error, ?SQLITE_CANTOPEN}.
+regular(Path, {ok, #file_info{type = regular, access = Access}}) when
+    Access =:= read; Access =:= read_write
+->
+    {ok, Path};
+regular(Path, {error, enoent}) ->
+    case file:open(Path, [write, exclusive, raw]) of
+        {ok, File} ->
+            ok = file:close(File),
+            {ok, Path};
+        {error, _} ->
+            {error, ?SQLITE_CANTOPEN}
+    end;
+regular(_Path, _Other) ->
+    {error, ?SQLITE_CANTOPEN}.
 
 -spec foreign_keys_on({ok, esqlite3:esqlite3()} | {error, term()}) ->
     {ok, esqlite3:esqlite3()} | {error, term()}.
@@ -860,10 +898,6 @@ utf8(Conn) ->
             closed = closed(Conn),
             Error
     end.
-
--spec to_filename(binary() | string()) -> string().
-to_filename(B) when is_binary(B) -> binary_to_list(B);
-to_filename(L) when is_list(L) -> L.
 
 -spec close_each([esqlite3:esqlite3()]) -> ok.
 close_each([]) ->
