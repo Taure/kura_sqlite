@@ -113,8 +113,9 @@ out that way gives its lease or its place in the queue back, so a
 connection the pool hands out after the caller stopped waiting is not lost
 to it.
 
-A database file whose directory does not exist is refused with
-`{error, 14}` (`SQLITE_CANTOPEN`) without asking esqlite to open it:
+A database path that is a directory, or whose directory does not exist,
+is refused with `{error, 14}` (`SQLITE_CANTOPEN`) without asking esqlite
+to open it:
 esqlite frees the handle twice when an open fails, which can corrupt the
 memory of the whole node. Other failed opens, such as a file the node may
 not read, still go through esqlite.
@@ -817,20 +818,20 @@ open_n(DbPath, N, Acc) when N > 0 ->
 -spec connected(binary() | string()) -> {ok, esqlite3:esqlite3()} | {error, term()}.
 connected(DbPath) ->
     Filename = to_filename(DbPath),
-    case in_a_directory(Filename) of
+    case openable(Filename) of
         true -> foreign_keys_on(esqlite3:open(Filename));
         false -> {error, ?SQLITE_CANTOPEN}
     end.
 
 %% esqlite closes the handle twice when SQLite cannot open a file, which
-%% corrupts the heap of the whole node, so a file whose directory is missing,
-%% the usual reason, is refused before esqlite tries. A `file:` URI is not
-%% a path.
--spec in_a_directory(string()) -> boolean().
-in_a_directory("file:" ++ _Uri) ->
+%% corrupts the heap of the whole node, so the usual reasons, a missing
+%% directory or a path that is itself a directory, are refused before esqlite
+%% tries. A `file:` URI is not a path.
+-spec openable(string()) -> boolean().
+openable("file:" ++ _Uri) ->
     true;
-in_a_directory(Filename) ->
-    filelib:is_dir(filename:dirname(Filename)).
+openable(Filename) ->
+    filelib:is_dir(filename:dirname(Filename)) andalso not filelib:is_dir(Filename).
 
 -spec foreign_keys_on({ok, esqlite3:esqlite3()} | {error, term()}) ->
     {ok, esqlite3:esqlite3()} | {error, term()}.

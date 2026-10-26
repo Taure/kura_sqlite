@@ -1102,6 +1102,26 @@ abandoned_checkout_leaves_the_queue_test() ->
         ?assertEqual([], [Down || {'DOWN', _, process, _, shutdown} = Down <- Received])
     end).
 
+database_path_that_is_a_directory_is_refused_before_esqlite_test() ->
+    Dir = filename:join(os:getenv("TMPDIR", "/tmp"), "pool_for_directory_path"),
+    _ = file:del_dir_r(Dir),
+    ok = file:make_dir(Dir),
+    Session = trace:session_create(?MODULE, self(), []),
+    try
+        _ = trace:process(Session, new, true, [call]),
+        1 = trace:function(Session, {esqlite3, open, 1}, true, [local]),
+        ?assertEqual(
+            {result, {error, 14}},
+            in_fresh(fun() ->
+                kura_pool_sqlite:start_pool(pool_for_directory_path, #{database => Dir})
+            end)
+        ),
+        ?assertEqual([], traced(Session))
+    after
+        trace:session_destroy(Session),
+        file:del_dir_r(Dir)
+    end.
+
 with_held(Name, Test) ->
     {ok, _} = kura_pool_sqlite:start_pool(Name, #{database => ~":memory:", pool_size => 1}),
     try
