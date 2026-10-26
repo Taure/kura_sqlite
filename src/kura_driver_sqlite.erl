@@ -45,8 +45,10 @@ do the rebuild, check `PRAGMA foreign_key_check`, commit, and turn foreign
 keys back on. kura has no way yet to mark a migration as not
 transactional.
 
-Outside a transaction, a table created by another connection between the
-check and the drop is not seen.
+Outside a transaction the check and the drop run in one
+`BEGIN IMMEDIATE` transaction, so no other connection can add a
+reference between them. A `DROP TABLE` that waits out the busy timeout
+for that transaction returns `{error, busy}`.
 
 ## Transactions
 
@@ -300,9 +302,40 @@ touched(_PoolMod, _Pool, _Conn, _Words) ->
     ok.
 
 -spec run(esqlite3:esqlite3(), binary(), words(), [term()]) -> dynamic().
-run(Conn, SQL, {First, _} = Words, Params) ->
-    case dependents(Conn, SQL, Words) of
-        ok -> prepared(Conn, SQL, Params, command_of(First));
+run(Conn, SQL, {~"DROP", ~"TABLE"}, Params) ->
+    case esqlite3:get_autocommit(Conn) of
+        true -> dropped_alone(Conn, SQL, Params);
+        false -> dropped(Conn, SQL, Params)
+    end;
+run(Conn, SQL, {First, _}, Params) ->
+    prepared(Conn, SQL, Params, command_of(First)).
+
+%% Outside a transaction the check and the drop share one, so no other
+%% connection can add a reference between them.
+-spec dropped_alone(esqlite3:esqlite3(), binary(), [term()]) -> dynamic().
+dropped_alone(Conn, SQL, Params) ->
+    case prepared(Conn, ~"BEGIN IMMEDIATE", [], other) of
+        #{} -> committed_drop(Conn, dropped(Conn, SQL, Params));
+        {error, _} = Error -> Error
+    end.
+
+-spec committed_drop(esqlite3:esqlite3(), dynamic()) -> dynamic().
+committed_drop(Conn, {error, _} = Error) ->
+    _ = esqlite3:exec(Conn, ~"ROLLBACK"),
+    Error;
+committed_drop(Conn, Dropped) ->
+    case prepared(Conn, ~"COMMIT", [], other) of
+        #{} ->
+            Dropped;
+        {error, _} = Error ->
+            _ = esqlite3:exec(Conn, ~"ROLLBACK"),
+            Error
+    end.
+
+-spec dropped(esqlite3:esqlite3(), binary(), [term()]) -> dynamic().
+dropped(Conn, SQL, Params) ->
+    case dependents(Conn, SQL) of
+        ok -> prepared(Conn, SQL, Params, other);
         {error, _} = Refused -> Refused
     end.
 
@@ -321,11 +354,9 @@ prepared(Conn, SQL, Params, Command) ->
 %% it, and its DropTable instruction carries the schema and table.
 %% EXPLAIN output is not a stable interface, so a program in any other shape
 %% is refused rather than let through unchecked.
--spec dependents(esqlite3:esqlite3(), binary(), words()) -> ok | {error, term()}.
-dependents(Conn, SQL, {~"DROP", ~"TABLE"}) ->
-    dropping(Conn, prepared(Conn, iolist_to_binary([~"EXPLAIN ", skipped(SQL)]), [], other));
-dependents(_Conn, _SQL, _Words) ->
-    ok.
+-spec dependents(esqlite3:esqlite3(), binary()) -> ok | {error, term()}.
+dependents(Conn, SQL) ->
+    dropping(Conn, prepared(Conn, iolist_to_binary([~"EXPLAIN ", skipped(SQL)]), [], other)).
 
 -spec dropping(esqlite3:esqlite3(), result()) -> ok | {error, term()}.
 dropping(Conn, #{rows := Program}) ->

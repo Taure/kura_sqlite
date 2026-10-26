@@ -605,13 +605,15 @@ drop_is_not_run_when_the_reference_check_is_busy_test() ->
         {ok, Conn, Token} = kura_pool_sqlite:checkout(Pool, #{}),
         try
             #{} = kura_driver_sqlite:query_on(Conn, ~"PRAGMA busy_timeout = 10", [], #{}),
+            ok = esqlite3:exec(Conn, ~"BEGIN"),
             ok = esqlite3:exec(Other, ~"BEGIN EXCLUSIVE"),
             ?assertEqual(
-                {{error, busy}, []},
-                prepared_drops(fun() ->
+                {{error, busy}, [~"EXPLAIN DROP TABLE parent", referencing]},
+                prepares(fun() ->
                     kura_driver_sqlite:query_on(Conn, ~"DROP TABLE parent", [], #{})
                 end)
             ),
+            ok = esqlite3:exec(Conn, ~"ROLLBACK"),
             ok = esqlite3:exec(Other, ~"ROLLBACK"),
             ?assertMatch(
                 #{rows := [#{parent_id := 1}]},
@@ -624,7 +626,7 @@ drop_is_not_run_when_the_reference_check_is_busy_test() ->
         end
     end).
 
-prepared_drops(Fun) ->
+prepares(Fun) ->
     Session = trace:session_create(?MODULE, self(), []),
     try
         _ = trace:process(Session, new, true, [call]),
@@ -632,7 +634,7 @@ prepared_drops(Fun) ->
         {result, Result} = in_process(Fun),
         Delivered = trace:delivered(Session, all),
         receive
-            {trace_delivered, all, Delivered} -> {Result, drops()}
+            {trace_delivered, all, Delivered} -> {Result, prepared()}
         end
     after
         trace:session_destroy(Session)
@@ -648,12 +650,95 @@ in_process(Fun) ->
             end
     end.
 
-drops() ->
+prepared() ->
     receive
-        {trace, _, call, {esqlite3, prepare, [_, ~"DROP TABLE parent"]}} -> [prepared | drops()];
-        {trace, _, call, _} -> drops()
+        {trace, _, call, {esqlite3, prepare, [_, <<"SELECT DISTINCT t.name", _/binary>>]}} ->
+            [referencing | prepared()];
+        {trace, _, call, {esqlite3, prepare, [_, SQL]}} ->
+            [SQL | prepared()]
     after 0 -> []
     end.
+
+drop_outside_a_transaction_shares_one_with_its_check_test() ->
+    with_parent(fun(Pool) ->
+        {ok, Conn, Token} = kura_pool_sqlite:checkout(Pool, #{}),
+        try
+            ?assertEqual(
+                {{error, {referenced_by, ~"parent", [~"child"]}}, [
+                    ~"BEGIN IMMEDIATE", ~"EXPLAIN DROP TABLE parent", referencing
+                ]},
+                prepares(fun() ->
+                    kura_driver_sqlite:query_on(Conn, ~"DROP TABLE parent", [], #{})
+                end)
+            ),
+            ?assert(esqlite3:get_autocommit(Conn)),
+            ?assertMatch(
+                {#{command := other}, [
+                    ~"BEGIN IMMEDIATE",
+                    ~"EXPLAIN DROP TABLE child",
+                    referencing,
+                    ~"DROP TABLE child",
+                    ~"COMMIT"
+                ]},
+                prepares(fun() ->
+                    kura_driver_sqlite:query_on(Conn, ~"DROP TABLE child", [], #{})
+                end)
+            ),
+            ?assert(esqlite3:get_autocommit(Conn)),
+            ?assertMatch(
+                {error, _}, kura_driver_sqlite:query_on(Conn, ~"SELECT * FROM child", [], #{})
+            )
+        after
+            ok = kura_pool_sqlite:checkin(Pool, Token)
+        end
+    end).
+
+drop_that_cannot_commit_is_rolled_back_test() ->
+    with_parent(fun(Pool) ->
+        Path = nested_path(Pool),
+        {ok, Other} = esqlite3:open(binary_to_list(Path)),
+        {ok, Conn, Token} = kura_pool_sqlite:checkout(Pool, #{}),
+        try
+            #{} = kura_driver_sqlite:query_on(Conn, ~"PRAGMA busy_timeout = 10", [], #{}),
+            ok = esqlite3:exec(Other, ~"BEGIN"),
+            [_] = esqlite3:q(Other, ~"SELECT * FROM child"),
+            ?assertEqual(
+                {error, busy}, kura_driver_sqlite:query_on(Conn, ~"DROP TABLE child", [], #{})
+            ),
+            ?assert(esqlite3:get_autocommit(Conn)),
+            ok = esqlite3:exec(Other, ~"ROLLBACK"),
+            ?assertMatch(
+                #{rows := [#{parent_id := 1}]},
+                kura_driver_sqlite:query_on(Conn, ~"SELECT parent_id FROM child", [], #{})
+            )
+        after
+            _ = esqlite3:exec(Other, ~"ROLLBACK"),
+            _ = esqlite3:close(Other),
+            ok = kura_pool_sqlite:checkin(Pool, Token)
+        end
+    end).
+
+drop_waiting_out_the_busy_timeout_returns_busy_test() ->
+    with_parent(fun(Pool) ->
+        Path = nested_path(Pool),
+        {ok, Other} = esqlite3:open(binary_to_list(Path)),
+        {ok, Conn, Token} = kura_pool_sqlite:checkout(Pool, #{}),
+        try
+            #{} = kura_driver_sqlite:query_on(Conn, ~"PRAGMA busy_timeout = 10", [], #{}),
+            ok = esqlite3:exec(Other, ~"BEGIN IMMEDIATE"),
+            ?assertEqual(
+                {{error, busy}, [~"BEGIN IMMEDIATE"]},
+                prepares(fun() ->
+                    kura_driver_sqlite:query_on(Conn, ~"DROP TABLE child", [], #{})
+                end)
+            ),
+            ?assert(esqlite3:get_autocommit(Conn))
+        after
+            _ = esqlite3:exec(Other, ~"ROLLBACK"),
+            _ = esqlite3:close(Other),
+            ok = kura_pool_sqlite:checkin(Pool, Token)
+        end
+    end).
 
 drop_after_comments_is_refused_test() ->
     with_parent(fun(Pool) ->
