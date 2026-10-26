@@ -243,6 +243,33 @@ failed_start_returns_an_error_to_the_caller_test() ->
         end)
     ).
 
+start_on_a_utf16_database_is_refused_test() ->
+    Path = db_path(pool_for_utf16),
+    _ = file:delete(Path),
+    {ok, Setup} = esqlite3:open(binary_to_list(Path)),
+    ok = esqlite3:exec(Setup, ~"PRAGMA encoding = 'UTF-16'; CREATE TABLE t (id INTEGER)"),
+    ok = esqlite3:close(Setup),
+    try
+        ?assertMatch(
+            {result, {error, {unsupported_encoding, [[~"UTF-16le"]]}}},
+            in_fresh(fun() ->
+                kura_pool_sqlite:start_pool(pool_for_utf16, #{database => Path, pool_size => 1})
+            end)
+        )
+    after
+        file:delete(Path)
+    end.
+
+lease_that_switches_the_encoding_is_not_inherited_test() ->
+    Name = pool_for_encoding_switch,
+    {ok, _} = kura_pool_sqlite:start_pool(Name, #{pool_size => 1}),
+    try
+        #{} = sql(Name, ~"PRAGMA encoding = 'UTF-16'"),
+        ?assertMatch(#{rows := [#{encoding := ~"UTF-8"}]}, sql(Name, ~"PRAGMA encoding"))
+    after
+        kura_pool_sqlite:stop_pool(Name)
+    end.
+
 second_start_of_a_name_returns_already_started_test() ->
     Name = pool_for_second_start,
     Opts = #{database => ~":memory:", pool_size => 1},

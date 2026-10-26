@@ -44,8 +44,8 @@ A lease that ran anything other than `SELECT`, `INSERT`, `UPDATE` or
 left TEMP tables, views or triggers, an attached database, or a
 `query_only`, `writable_schema`, `foreign_keys`, `trusted_schema`,
 `ignore_check_constraints`, `locking_mode`, `synchronous`,
-`recursive_triggers`, `max_page_count`, `busy_timeout` or `journal_mode`
-setting different from what a new connection has, the connection is
+`recursive_triggers`, `max_page_count`, `busy_timeout`, `journal_mode` or
+`encoding` setting different from what a new connection has, the connection is
 dropped and a fresh one opened. WAL is kept in the database file, so a
 lease that switches the journal mode into or out of WAL changes what a new
 connection has, and that is not counted against it. A reopened connection
@@ -62,6 +62,12 @@ them off through the driver has them off for that lease only, since the
 connection is then reopened. One that turns them off directly through
 `esqlite3` keeps them off until the connection is reopened for any of the
 reasons above.
+
+The pool opens only UTF-8 databases. SQLite stores a bound binary as TEXT,
+and in a UTF-16 database TEXT is transcoded, so a binary that is not valid
+text, ciphertext from an `{encrypted, _}` field among them, would not come
+back as it was written. `start_pool/2` on a database in another encoding
+returns `{error, {unsupported_encoding, [[Encoding]]}}`.
 
 `last_insert_rowid()` and `changes()` belong to the connection and are not
 reset, so a lease can read the values the previous lease left.
@@ -124,7 +130,8 @@ connections nobody holds.
     ~"recursive_triggers",
     ~"max_page_count",
     ~"busy_timeout",
-    ~"journal_mode"
+    ~"journal_mode",
+    ~"encoding"
 ]).
 
 -type lease() :: #{
@@ -589,11 +596,19 @@ open_n(DbPath, N, Acc) when N > 0 ->
 -spec connected(binary() | string()) -> {ok, esqlite3:esqlite3()} | {error, term()}.
 connected(DbPath) ->
     case esqlite3:open(to_filename(DbPath)) of
-        {ok, Conn} ->
+        {ok, Conn} -> prepared(Conn);
+        {error, _} = Error -> Error
+    end.
+
+-spec prepared(esqlite3:esqlite3()) -> {ok, esqlite3:esqlite3()} | {error, term()}.
+prepared(Conn) ->
+    case esqlite3:q(Conn, ~"PRAGMA encoding") of
+        [[~"UTF-8"]] ->
             ok = esqlite3:exec(Conn, ~"PRAGMA foreign_keys = ON"),
             {ok, Conn};
-        {error, _} = Error ->
-            Error
+        Encoding ->
+            closed = closed(Conn),
+            {error, {unsupported_encoding, Encoding}}
     end.
 
 -spec to_filename(binary() | string()) -> string().
