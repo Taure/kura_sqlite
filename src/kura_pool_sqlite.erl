@@ -107,9 +107,11 @@ once the pool has stopped opening connections, it returns
 `{error, no_conns}` at once, and so does every caller still waiting.
 
 A pool too busy to answer within the timeout and another 500 ms returns
-`{error, checkout_timeout}`. A checkout that times out that way gives its
-lease back, so a connection the pool hands out after the caller stopped
-waiting is not lost to it.
+`{error, checkout_timeout}`. A checkout carries its deadline, so one the
+pool only reaches after it has passed does not wait, and one that times
+out that way gives its lease or its place in the queue back, so a
+connection the pool hands out after the caller stopped waiting is not lost
+to it.
 
 A database file whose directory does not exist is refused with
 `{error, 14}` (`SQLITE_CANTOPEN`) without asking esqlite to open it:
@@ -183,6 +185,8 @@ connections nobody holds.
     timer := reference() | infinity
 }.
 
+-type deadline() :: integer() | infinity.
+
 -type outcome() :: kept | {kept, [term()]} | dropped | not_utf8.
 
 -type baseline() :: #{settings := [term()], db_path := binary() | string()}.
@@ -202,7 +206,7 @@ connections nobody holds.
 }.
 
 -type request() ::
-    {checkout, pid(), reference(), timeout()}
+    {checkout, pid(), reference(), deadline()}
     | {checkin, esqlite3:esqlite3(), reference()}
     | {give_away, esqlite3:esqlite3(), reference(), pid()}
     | {dirty, esqlite3:esqlite3()}
@@ -230,7 +234,7 @@ stop_pool(Name) ->
 checkout(Name, Opts) ->
     Lease = make_ref(),
     Wait = wait(Opts),
-    case call(Name, {checkout, self(), Lease, Wait}, answered_within(Wait)) of
+    case call(Name, {checkout, self(), Lease, deadline(Wait)}, answered_within(Wait)) of
         {exit, timeout} ->
             gen_server:cast(Name, {abandon, Lease}),
             {error, checkout_timeout};
@@ -321,16 +325,18 @@ init({Name, DbPath, Size, Supervisor}) ->
 
 -spec handle_call(request(), gen_server:from(), state()) ->
     {reply, term(), state()} | {noreply, state()}.
-handle_call({checkout, Borrower, Lease, Wait}, From, State0) ->
+handle_call({checkout, Borrower, Lease, Deadline}, From, State0) ->
     case replenished(State0) of
         State = #{name := Name, available := [Conn | Rest]} ->
             Monitor = erlang:monitor(process, Borrower),
             {reply, {ok, Conn, {Name, Conn, Lease}},
                 lent(Conn, Lease, Monitor, State#{available := Rest})};
         State ->
-            case Wait =/= 0 andalso outstanding(State) of
-                true -> {noreply, queued(Borrower, Lease, Wait, From, State)};
-                false -> {reply, {error, no_conns}, State}
+            case {outstanding(State), remaining(Deadline)} of
+                {true, Wait} when Wait =/= expired ->
+                    {noreply, queued(Borrower, Lease, Wait, From, State)};
+                {_, _} ->
+                    {reply, {error, no_conns}, State}
             end
     end;
 handle_call({checkin, Conn, Lease}, From, State = #{out := Out}) ->
@@ -363,7 +369,7 @@ handle_call(_Request, _From, State) ->
 handle_cast({abandon, Lease}, State = #{out := Out}) ->
     case [{Conn, Held} || Conn := Held = #{lease := L} <- Out, L =:= Lease] of
         [{Conn, Held}] -> {noreply, returned(Conn, Held, none, State)};
-        [] -> {noreply, State}
+        [] -> {noreply, given_up(withdrawn(lease, Lease, State), State)}
     end;
 handle_cast(_Request, State) ->
     {noreply, State}.
@@ -463,6 +469,23 @@ answered_within(infinity) ->
 answered_within(Wait) ->
     Wait + ?REPLY_MARGIN.
 
+%% The request can sit in the pool's mailbox for a while, so it carries
+%% when the caller stops waiting rather than for how long.
+-spec deadline(timeout()) -> deadline().
+deadline(infinity) ->
+    infinity;
+deadline(Wait) ->
+    erlang:monotonic_time(millisecond) + Wait.
+
+-spec remaining(deadline()) -> timeout() | expired.
+remaining(infinity) ->
+    infinity;
+remaining(Deadline) ->
+    case Deadline - erlang:monotonic_time(millisecond) of
+        Left when Left > 0 -> Left;
+        _ -> expired
+    end.
+
 -spec lent(esqlite3:esqlite3(), reference(), reference(), state()) -> state().
 lent(Conn, Lease, Monitor, State = #{out := Out}) ->
     State#{
@@ -503,7 +526,8 @@ withdrawn(Key, Ref, State = #{waiting := Waiting}) ->
     end.
 
 -spec given_up({waiter(), state()} | none, state()) -> state().
-given_up({#{timer := Timer}, Rest}, _State) ->
+given_up({#{monitor := Monitor, timer := Timer}, Rest}, _State) ->
+    true = erlang:demonitor(Monitor, [flush]),
     ok = cancelled(Timer),
     Rest;
 given_up(none, State) ->

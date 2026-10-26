@@ -1066,6 +1066,42 @@ database_named_by_a_file_uri_is_opened_test() ->
         file:delete(Path)
     end.
 
+checkout_that_reaches_a_backed_up_pool_late_is_not_queued_test() ->
+    with_held(pool_for_backlog, fun(Name, Conn, Token) ->
+        Pool = whereis(Name),
+        ok = sys:suspend(Pool),
+        Late = waiter(Name, #{timeout => 100}),
+        Result =
+            receive
+                {checked_out, Late, Checked} -> Checked
+            after 2000 -> error(never_timed_out)
+            end,
+        ok = sys:resume(Pool),
+        ?assertEqual({error, checkout_timeout}, Result),
+        ?assertEqual(0, waiting(Name)),
+        ok = kura_pool_sqlite:checkin(Name, Token),
+        ?assertMatch({ok, Conn, _}, kura_pool_sqlite:checkout(Name, #{timeout => 0})),
+        ok = kill(Late)
+    end).
+
+abandoned_checkout_leaves_the_queue_test() ->
+    with_held(pool_for_abandoned_waiter, fun(Name, Conn, Token) ->
+        Pool = whereis(Name),
+        {ok, Received} = received_by(Pool, fun() ->
+            Gone = waiter(Name, #{timeout => 1000}),
+            ok = await_waiting(Name, 1),
+            [Lease] = [L || _ := #{lease := L} <- maps:get(waiting, sys:get_state(Name))],
+            gen_server:cast(Name, {abandon, Lease}),
+            ok = await_waiting(Name, 0),
+            ok = kura_pool_sqlite:checkin(Name, Token),
+            ?assertMatch({ok, Conn, _}, kura_pool_sqlite:checkout(Name, #{timeout => 0})),
+            ok = kill(Gone),
+            timer:sleep(1100)
+        end),
+        ?assertEqual([], timeouts(Received)),
+        ?assertEqual([], [Down || {'DOWN', _, process, _, shutdown} = Down <- Received])
+    end).
+
 with_held(Name, Test) ->
     {ok, _} = kura_pool_sqlite:start_pool(Name, #{database => ~":memory:", pool_size => 1}),
     try
