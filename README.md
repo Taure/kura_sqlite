@@ -62,12 +62,24 @@ to start on this backend via `kura_capabilities:require/2`.
   to a missing row is refused. SQLite leaves enforcement off by default,
   so a database written without it can hold rows whose references are
   already broken; `PRAGMA foreign_key_check` lists them. Dropping a table
-  that other tables reference deletes its rows first, so their
-  `ON DELETE CASCADE` children go with it, where Postgres refuses the drop.
+  that other tables reference is refused with
+  `{error, {referenced_by, Table, Referencing}}`, as Postgres refuses it,
+  rather than letting SQLite delete its rows and run their `ON DELETE`
+  rules. `PRAGMA foreign_keys` has no effect inside a transaction and every
+  kura migration runs in one, so rebuild a referenced table outside a
+  migration; `kura_driver_sqlite`'s documentation has the steps.
+- **Checkout waits** up to `#{timeout => Ms}` (5000 by default) for a
+  connection to come free, then returns `{error, no_conns}`.
+  `#{timeout => 0}` does not wait.
 - **UTF-8 only.** `start_pool/2` refuses a database in another encoding
   with `{error, {unsupported_encoding, Encoding}}`. Binaries are stored as
   TEXT, which a UTF-16 database transcodes, so encrypted fields would not
   read back.
+- **Database paths** must name a regular file the node can read, or one
+  it can create. A directory, a missing directory or a dangling symbolic
+  link is refused with `{error, 14}`. `file:` URIs are refused with
+  `{error, uri_not_supported}`, since SQLite resolves them in ways the
+  pool cannot check before opening.
 - **In-memory** (`<<":memory:">>`) is per-connection. Use `pool_size: 1`
   if multiple checkouts must observe the same data, or use a file path.
 
