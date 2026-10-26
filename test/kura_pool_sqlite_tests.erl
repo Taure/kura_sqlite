@@ -95,7 +95,7 @@ killed_borrower_releases_the_write_lock_test() ->
     try
         #{} = sql(Name, ~"CREATE TABLE t (id INTEGER)"),
         Borrower = hold_in_transaction(Name, ~"INSERT INTO t VALUES (1)"),
-        ?assertError({case_clause, '$busy'}, sql(Name, ~"INSERT INTO t VALUES (2)")),
+        ?assertEqual({error, busy}, sql(Name, ~"INSERT INTO t VALUES (2)")),
         ok = kill(Borrower),
         {_, First} = checkout_within(Name, 1000),
         {_, Second} = checkout_within(Name, 1000),
@@ -730,7 +730,7 @@ write_after_a_busy_statement_is_committed_test() ->
             end
         end),
         receive
-            {busy, Busied} -> ?assertEqual({case_clause, '$busy'}, Busied)
+            {busy, Busied} -> ?assertEqual({error, busy}, Busied)
         after 2000 -> error(never_busy)
         end,
         ok = esqlite3:exec(Other, ~"ROLLBACK"),

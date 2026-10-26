@@ -14,6 +14,12 @@ other kura drivers return. `Rows` are maps keyed by atom column names.
 `select | insert | update | delete | other` derived from the SQL
 prefix.
 
+## Errors
+
+A statement that fails returns `{error, Reason}`, `Reason` being the
+SQLite result code for most failures. A statement that waits out the
+connection's busy timeout returns `{error, busy}`.
+
 ## Transactions
 
 `transaction/4` wraps the fun in `BEGIN`/`COMMIT` (or `ROLLBACK` on
@@ -294,8 +300,10 @@ tx_conn(Pool) ->
     [#{atom() => term()}] | {error, term()}.
 collect_rows(Stmt, ColNames) ->
     case esqlite3:step(Stmt) of
-        '$done' ->
-            [];
+        %% esqlite3_nif:step/1's spec leaves out '$busy', which esqlite3:step/1
+        %% returns, so dialyzer would take a clause for it as unreachable.
+        Finished when is_atom(Finished) ->
+            maps:get(Finished, #{'$done' => [], '$busy' => {error, busy}});
         {error, _} = Err ->
             Err;
         Row when is_list(Row) ->
