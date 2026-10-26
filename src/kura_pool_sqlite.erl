@@ -73,11 +73,19 @@ and in a UTF-16 database TEXT is transcoded, so a binary that is not valid
 text, ciphertext from an `{encrypted, _}` field among them, would not come
 back as it was written. `start_pool/2` on a database in another encoding
 returns `{error, {unsupported_encoding, Encoding}}`, `Encoding` being, for
-example, `~"UTF-16le"`. The encoding is checked as each connection opens.
-A lease that sets the encoding of an empty file database and creates its
-first table leaves the other connections the pool holds reading the
-database in that encoding until they are next returned; from then on the
-pool cannot open replacements and runs short, logging each failure.
+example, `~"UTF-16le"`. The encoding is checked when the pool starts and
+each time a connection comes back. A connection opened to replace a
+dropped one is not checked until its first lease returns, so the pool
+does not wait on a locked database while it opens one. A lease that sets
+the encoding of an empty file database and creates its first table
+changes it for every connection on that file: each is dropped as it comes
+back, so a lease already holding one, or the first lease of a
+replacement, can still write in that encoding. From then on the pool
+cannot open replacements and runs short, logging each failure. Other ways
+a binary stored as TEXT is changed are outside the pool: statements run
+directly through `esqlite3`, a database file replaced under open
+connections, and SQL text functions (`lower`, `||`, `substr`) applied to
+the value.
 
 `last_insert_rowid()` and `changes()` belong to the connection and are not
 reset, so a lease can read the values the previous lease left.
@@ -469,8 +477,17 @@ reset(Conn, Dirty, Baseline) ->
     _ = esqlite3:exec(Conn, ~""),
     case rolled_back(Conn) of
         true when Dirty -> inspected(Conn, Baseline);
-        true -> kept;
+        true -> still_utf8(Conn);
         false -> unlocked(Conn)
+    end.
+
+%% A lease that fixed the encoding of an empty file database changes it for
+%% every connection on that file, including ones whose leases ran only DML.
+-spec still_utf8(esqlite3:esqlite3()) -> outcome().
+still_utf8(Conn) ->
+    case esqlite3:q(Conn, ~"PRAGMA encoding") of
+        [[~"UTF-8"]] -> kept;
+        _ -> unlocked(Conn)
     end.
 
 -spec outcome(atom(), esqlite3:esqlite3(), lease(), baseline()) -> outcome().
@@ -538,7 +555,7 @@ unchanged(Conn, #{settings := Opened, db_path := DbPath}) ->
 %% and become the baseline if they match it.
 -spec settings_of_new(binary() | string()) -> [term()] | {error, term()}.
 settings_of_new(DbPath) ->
-    case connected(DbPath) of
+    case checked(DbPath) of
         {ok, New} ->
             Settings = settings(New),
             closed = closed(New),
@@ -595,7 +612,7 @@ request_name(Status) ->
 open_n(_DbPath, 0, Acc) ->
     {ok, Acc};
 open_n(DbPath, N, Acc) when N > 0 ->
-    case connected(DbPath) of
+    case checked(DbPath) of
         {ok, Conn} ->
             open_n(DbPath, N - 1, [Conn | Acc]);
         {error, _} = Err ->
@@ -603,18 +620,29 @@ open_n(DbPath, N, Acc) when N > 0 ->
             Err
     end.
 
+%% `foreign_keys` is a flag on the connection and reads nothing from the
+%% database, so it cannot wait on a lock the way a schema read can.
 -spec connected(binary() | string()) -> {ok, esqlite3:esqlite3()} | {error, term()}.
 connected(DbPath) ->
     case esqlite3:open(to_filename(DbPath)) of
-        {ok, Conn} -> prepared(Conn);
+        {ok, Conn} ->
+            ok = esqlite3:exec(Conn, ~"PRAGMA foreign_keys = ON"),
+            {ok, Conn};
+        {error, _} = Error ->
+            Error
+    end.
+
+-spec checked(binary() | string()) -> {ok, esqlite3:esqlite3()} | {error, term()}.
+checked(DbPath) ->
+    case connected(DbPath) of
+        {ok, Conn} -> utf8(Conn);
         {error, _} = Error -> Error
     end.
 
--spec prepared(esqlite3:esqlite3()) -> {ok, esqlite3:esqlite3()} | {error, term()}.
-prepared(Conn) ->
+-spec utf8(esqlite3:esqlite3()) -> {ok, esqlite3:esqlite3()} | {error, term()}.
+utf8(Conn) ->
     case esqlite3:q(Conn, ~"PRAGMA encoding") of
         [[~"UTF-8"]] ->
-            ok = esqlite3:exec(Conn, ~"PRAGMA foreign_keys = ON"),
             {ok, Conn};
         [[Encoding]] ->
             closed = closed(Conn),

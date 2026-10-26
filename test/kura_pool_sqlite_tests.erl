@@ -272,6 +272,27 @@ start_on_a_file_that_is_not_a_database_returns_the_sqlite_error_test() ->
         file:delete(Path)
     end.
 
+connection_that_took_on_another_encoding_is_not_lent_again_test() ->
+    Name = pool_for_shared_encoding,
+    Path = db_path(Name),
+    _ = file:delete(Path),
+    {ok, _} = kura_pool_sqlite:start_pool(Name, #{database => Path, pool_size => 2}),
+    try
+        {Switcher, SwitcherToken} = checkout_within(Name, 1000),
+        {Reader, ReaderToken} = checkout_within(Name, 1000),
+        ok = esqlite3:exec(Switcher, ~"PRAGMA encoding = 'UTF-16le'; CREATE TABLE t (id INTEGER)"),
+        ok = kura_pool_sqlite:dirty(Name, Switcher),
+        [[0]] = esqlite3:q(Reader, ~"SELECT count(*) FROM t"),
+        ok = kura_pool_sqlite:checkin(Name, SwitcherToken),
+        ok = kura_pool_sqlite:checkin(Name, ReaderToken),
+        Lent = [checkout_within(Name, 1000) || _ <- [1, 2]],
+        ?assertEqual([], [Conn || {Conn, _} <- Lent, Conn =:= Switcher orelse Conn =:= Reader]),
+        [ok = kura_pool_sqlite:checkin(Name, Token) || {_, Token} <- Lent]
+    after
+        kura_pool_sqlite:stop_pool(Name),
+        file:delete(Path)
+    end.
+
 lease_that_switches_the_encoding_is_not_inherited_test() ->
     Name = pool_for_encoding_switch,
     {ok, _} = kura_pool_sqlite:start_pool(Name, #{pool_size => 1}),
@@ -978,8 +999,10 @@ checkout_within_loop(Name, Deadline) ->
             end
     end.
 
+%% Named after the OS process too, so runs side by side do not share files.
 db_path(Name) ->
-    iolist_to_binary(filename:join(os:getenv("TMPDIR", "/tmp"), atom_to_list(Name) ++ ".db")).
+    File = atom_to_list(Name) ++ "_" ++ os:getpid() ++ ".db",
+    iolist_to_binary(filename:join(os:getenv("TMPDIR", "/tmp"), File)).
 
 logged() ->
     receive
