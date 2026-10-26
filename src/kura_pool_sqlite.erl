@@ -367,7 +367,7 @@ handle_call(_Request, _From, State) ->
     {reply, {error, unknown_request}, State}.
 
 -spec handle_cast(term(), state()) -> {noreply, state()}.
-handle_cast({abandon, Lease}, State = #{out := Out}) ->
+handle_cast({abandon, Lease}, State = #{out := Out}) when is_reference(Lease) ->
     case [{Conn, Held} || Conn := Held = #{lease := L} <- Out, L =:= Lease] of
         [{Conn, Held}] -> {noreply, returned(Conn, Held, none, State)};
         [] -> {noreply, given_up(withdrawn(lease, Lease, State), State)}

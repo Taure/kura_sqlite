@@ -572,19 +572,23 @@ explain_of_drop_table_has_the_shape_the_check_reads_test() ->
     {ok, Conn} = esqlite3:open(":memory:"),
     try
         ok = esqlite3:exec(Conn, ~"CREATE TABLE t (id INTEGER PRIMARY KEY)"),
-        Program = esqlite3:q(Conn, ~"EXPLAIN DROP TABLE t"),
+        Program = program(Conn, ~"EXPLAIN DROP TABLE t"),
         ?assertMatch(
             [[_, ~"DropTable", 0, _, _, ~"t" | _]],
             [Row || [_, ~"DropTable" | _] = Row <- Program]
         ),
-        Missing = esqlite3:q(Conn, ~"EXPLAIN DROP TABLE IF EXISTS missing"),
+        Missing = program(Conn, ~"EXPLAIN DROP TABLE IF EXISTS missing"),
         ?assertEqual(
             [],
-            [Op || [_, Op | _] <- Missing] --
-                lists:append(lists:duplicate(length(Missing), nothing_dropped()))
+            [Op || [_, Op | _] <- Missing, not lists:member(Op, nothing_dropped())]
         )
     after
         esqlite3:close(Conn)
+    end.
+
+program(Conn, SQL) ->
+    case esqlite3:q(Conn, SQL) of
+        Rows when is_list(Rows) -> Rows
     end.
 
 nothing_dropped() ->

@@ -1068,15 +1068,14 @@ database_named_by_a_file_uri_is_opened_test() ->
 
 checkout_that_reaches_a_backed_up_pool_late_is_not_queued_test() ->
     with_held(pool_for_backlog, fun(Name, Conn, Token) ->
-        Pool = whereis(Name),
-        ok = sys:suspend(Pool),
+        ok = sys:suspend(Name),
         Late = waiter(Name, #{timeout => 100}),
         Result =
             receive
                 {checked_out, Late, Checked} -> Checked
             after 2000 -> error(never_timed_out)
             end,
-        ok = sys:resume(Pool),
+        ok = sys:resume(Name),
         ?assertEqual({error, checkout_timeout}, Result),
         ?assertEqual(0, waiting(Name)),
         ok = kura_pool_sqlite:checkin(Name, Token),
@@ -1090,7 +1089,7 @@ abandoned_checkout_leaves_the_queue_test() ->
         {ok, Received} = received_by(Pool, fun() ->
             Gone = waiter(Name, #{timeout => 1000}),
             ok = await_waiting(Name, 1),
-            [Lease] = [L || _ := #{lease := L} <- maps:get(waiting, sys:get_state(Name))],
+            [Lease] = waiting_leases(Name),
             gen_server:cast(Name, {abandon, Lease}),
             ok = await_waiting(Name, 0),
             ok = kura_pool_sqlite:checkin(Name, Token),
@@ -1162,6 +1161,11 @@ released(Waiter) ->
 waiting(Name) ->
     case sys:get_state(Name) of
         #{waiting := Waiting} when is_map(Waiting) -> map_size(Waiting)
+    end.
+
+waiting_leases(Name) ->
+    case sys:get_state(Name) of
+        #{waiting := Waiting} when is_map(Waiting) -> [L || _ := #{lease := L} <- Waiting]
     end.
 
 await_waiting(Name, N) ->
