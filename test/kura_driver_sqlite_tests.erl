@@ -268,7 +268,6 @@ rejected_commit_raises({Pool, _}) ->
         Pool,
         ~"CREATE TABLE child (parent_id INTEGER REFERENCES parent (id) DEFERRABLE INITIALLY DEFERRED)"
     ),
-    ok = foreign_keys_on(Pool, []),
     ?assertError(
         {kura_driver_sqlite, {commit_failed, _}},
         transaction(Pool, fun() ->
@@ -279,16 +278,6 @@ rejected_commit_raises({Pool, _}) ->
     ?assertEqual([], ids(Pool)),
     ok = transaction(Pool, fun() -> insert(Pool, 2) end),
     ?assertEqual([2], ids(Pool)).
-
-%% The pragma is per connection and ignored inside a transaction.
-foreign_keys_on(Pool, Held) ->
-    case kura_pool_sqlite:checkout(Pool, #{}) of
-        {ok, Conn, Token} ->
-            ok = esqlite3:exec(Conn, ~"PRAGMA foreign_keys = ON"),
-            foreign_keys_on(Pool, [Token | Held]);
-        {error, no_conns} ->
-            lists:foreach(fun(Token) -> ok = kura_pool_sqlite:checkin(Pool, Token) end, Held)
-    end.
 
 statement_after_sqlite_rollback_raises({Pool, _}) ->
     ok = rollback_on_conflict_table(Pool),

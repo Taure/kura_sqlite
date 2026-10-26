@@ -243,6 +243,64 @@ failed_start_returns_an_error_to_the_caller_test() ->
         end)
     ).
 
+start_on_a_utf16_database_is_refused_test() ->
+    Path = db_path(pool_for_utf16),
+    _ = file:delete(Path),
+    {ok, Setup} = esqlite3:open(binary_to_list(Path)),
+    ok = esqlite3:exec(Setup, ~"PRAGMA encoding = 'UTF-16'; CREATE TABLE t (id INTEGER)"),
+    ok = esqlite3:close(Setup),
+    try
+        ?assertMatch(
+            {result, {error, {unsupported_encoding, ~"UTF-16le"}}},
+            in_fresh(fun() ->
+                kura_pool_sqlite:start_pool(pool_for_utf16, #{database => Path, pool_size => 1})
+            end)
+        )
+    after
+        file:delete(Path)
+    end.
+
+start_on_a_file_that_is_not_a_database_returns_the_sqlite_error_test() ->
+    Path = db_path(pool_for_not_a_database),
+    ok = file:write_file(Path, binary:copy(~"not a database", 512)),
+    try
+        {result, {error, Reason}} = in_fresh(fun() ->
+            kura_pool_sqlite:start_pool(pool_for_not_a_database, #{database => Path})
+        end),
+        ?assertEqual(26, Reason)
+    after
+        file:delete(Path)
+    end.
+
+database_switched_to_another_encoding_stops_the_pool_test() ->
+    Name = pool_for_shared_encoding,
+    Path = db_path(Name),
+    _ = file:delete(Path),
+    {ok, _} = kura_pool_sqlite:start_pool(Name, #{database => Path, pool_size => 2}),
+    try
+        {Switcher, SwitcherToken} = checkout_within(Name, 1000),
+        {Reader, ReaderToken} = checkout_within(Name, 1000),
+        ok = esqlite3:exec(Switcher, ~"PRAGMA encoding = 'UTF-16le'; CREATE TABLE t (id INTEGER)"),
+        ok = kura_pool_sqlite:dirty(Name, Switcher),
+        [[0]] = esqlite3:q(Reader, ~"SELECT count(*) FROM t"),
+        ok = kura_pool_sqlite:checkin(Name, SwitcherToken),
+        ok = kura_pool_sqlite:checkin(Name, ReaderToken),
+        ?assertEqual({error, no_conns}, kura_pool_sqlite:checkout(Name, #{}))
+    after
+        kura_pool_sqlite:stop_pool(Name),
+        file:delete(Path)
+    end.
+
+lease_that_switches_the_encoding_is_not_inherited_test() ->
+    Name = pool_for_encoding_switch,
+    {ok, _} = kura_pool_sqlite:start_pool(Name, #{pool_size => 1}),
+    try
+        #{} = sql(Name, ~"PRAGMA encoding = 'UTF-16'"),
+        ?assertMatch(#{rows := [#{encoding := ~"UTF-8"}]}, sql(Name, ~"PRAGMA encoding"))
+    after
+        kura_pool_sqlite:stop_pool(Name)
+    end.
+
 second_start_of_a_name_returns_already_started_test() ->
     Name = pool_for_second_start,
     Opts = #{database => ~":memory:", pool_size => 1},
@@ -487,6 +545,54 @@ writable_schema_is_not_inherited_test() ->
         #{} = sql(Name, ~"PRAGMA writable_schema = ON"),
         ?assertMatch(#{rows := [#{writable_schema := 0}]}, sql(Name, ~"PRAGMA writable_schema"))
     end).
+
+every_connection_enforces_foreign_keys_test() ->
+    Name = pool_for_foreign_keys,
+    {ok, _} = kura_pool_sqlite:start_pool(Name, #{pool_size => 3}),
+    try
+        Leases = [checkout_within(Name, 1000) || _ <- lists:seq(1, 3)],
+        ?assertEqual(
+            [[[1]], [[1]], [[1]]],
+            [esqlite3:q(Conn, ~"PRAGMA foreign_keys") || {Conn, _} <- Leases]
+        ),
+        [ok = kura_pool_sqlite:checkin(Name, Token) || {_, Token} <- Leases]
+    after
+        kura_pool_sqlite:stop_pool(Name)
+    end.
+
+on_delete_cascade_removes_the_children_test() ->
+    with_file_pool(pool_for_cascade, fun(Name) ->
+        #{} = sql(Name, ~"CREATE TABLE parent (id INTEGER PRIMARY KEY)"),
+        #{} = sql(
+            Name,
+            ~"CREATE TABLE child (id INTEGER, parent_id INTEGER REFERENCES parent (id) ON DELETE CASCADE)"
+        ),
+        #{} = sql(Name, ~"INSERT INTO parent VALUES (1)"),
+        #{} = sql(Name, ~"INSERT INTO child VALUES (1, 1)"),
+        #{} = sql(Name, ~"DELETE FROM parent WHERE id = 1"),
+        ?assertMatch(#{rows := []}, sql(Name, ~"SELECT id FROM child"))
+    end).
+
+reference_to_a_missing_row_is_refused_test() ->
+    with_file_pool(pool_for_restrict, fun(Name) ->
+        #{} = sql(Name, ~"CREATE TABLE parent (id INTEGER PRIMARY KEY)"),
+        #{} = sql(Name, ~"CREATE TABLE child (parent_id INTEGER REFERENCES parent (id))"),
+        ?assertEqual({error, 787}, sql(Name, ~"INSERT INTO child VALUES (99)"))
+    end).
+
+replaced_connection_enforces_foreign_keys_test() ->
+    Name = pool_for_replaced_foreign_keys,
+    {ok, _} = kura_pool_sqlite:start_pool(Name, #{pool_size => 1}),
+    try
+        {Closed, ClosedToken} = checkout_within(Name, 1000),
+        ok = esqlite3:close(Closed),
+        ok = kura_pool_sqlite:checkin(Name, ClosedToken),
+        {Fresh, FreshToken} = checkout_within(Name, 1000),
+        ?assertEqual([[1]], esqlite3:q(Fresh, ~"PRAGMA foreign_keys")),
+        ok = kura_pool_sqlite:checkin(Name, FreshToken)
+    after
+        kura_pool_sqlite:stop_pool(Name)
+    end.
 
 safety_settings_are_not_inherited_test_() ->
     [
@@ -892,7 +998,8 @@ checkout_within_loop(Name, Deadline) ->
     end.
 
 db_path(Name) ->
-    iolist_to_binary(filename:join(os:getenv("TMPDIR", "/tmp"), atom_to_list(Name) ++ ".db")).
+    File = atom_to_list(Name) ++ "_" ++ os:getpid() ++ ".db",
+    iolist_to_binary(filename:join(os:getenv("TMPDIR", "/tmp"), File)).
 
 logged() ->
     receive

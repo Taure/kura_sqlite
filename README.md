@@ -57,6 +57,17 @@ to start on this backend via `kura_capabilities:require/2`.
 - **Arrays** are unsupported.
 - **Composite primary and foreign keys** work the same as on Postgres
   (SQLite supports `PRIMARY KEY (a, b)` and row-value `IN`).
+- **Foreign keys** are enforced. The pool turns `PRAGMA foreign_keys` on
+  for every connection it opens, so `ON DELETE` rules fire and a reference
+  to a missing row is refused. SQLite leaves enforcement off by default,
+  so a database written without it can hold rows whose references are
+  already broken; `PRAGMA foreign_key_check` lists them. Dropping a table
+  that other tables reference deletes its rows first, so their
+  `ON DELETE CASCADE` children go with it, where Postgres refuses the drop.
+- **UTF-8 only.** `start_pool/2` refuses a database in another encoding
+  with `{error, {unsupported_encoding, Encoding}}`. Binaries are stored as
+  TEXT, which a UTF-16 database transcodes, so encrypted fields would not
+  read back.
 - **In-memory** (`<<":memory:">>`) is per-connection. Use `pool_size: 1`
   if multiple checkouts must observe the same data, or use a file path.
 
