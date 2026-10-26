@@ -62,8 +62,10 @@ to start on this backend via `kura_capabilities:require/2`.
   to a missing row is refused. SQLite leaves enforcement off by default,
   so a database written without it can hold rows whose references are
   already broken; `PRAGMA foreign_key_check` lists them. Dropping a table
-  that other tables reference deletes its rows first, so their
-  `ON DELETE CASCADE` children go with it, where Postgres refuses the drop.
+  that other tables reference is refused with
+  `{error, {referenced_by, Table, Referencing}}`, as Postgres refuses it,
+  rather than letting SQLite delete its rows and run their `ON DELETE`
+  rules.
 - **UTF-8 only.** `start_pool/2` refuses a database in another encoding
   with `{error, {unsupported_encoding, Encoding}}`. Binaries are stored as
   TEXT, which a UTF-16 database transcodes, so encrypted fields would not

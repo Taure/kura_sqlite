@@ -20,6 +20,21 @@ A statement that fails returns `{error, Reason}`, `Reason` being the
 SQLite result code for most failures. A statement that waits out the
 connection's busy timeout returns `{error, busy}`.
 
+## Dropping a referenced table
+
+With foreign keys on, SQLite empties a table before it drops it, and that
+runs the `ON DELETE` rules of the tables that reference it: `CASCADE`
+deletes their rows and `SET NULL` clears their references. Postgres
+refuses such a drop. So does this driver: a `DROP TABLE` on a table that
+another table references returns
+`{error, {referenced_by, Table, Referencing}}`, `Referencing` listing the
+tables in that schema that reference it, and drops nothing. A table that
+references only itself can be dropped. With foreign keys off on the
+connection the drop deletes no rows and is not checked, so the
+table-rebuild procedure SQLite documents for schema changes still works.
+Outside a transaction, a table created by another connection between the
+check and the drop is not seen.
+
 ## Transactions
 
 `transaction/4` wraps the fun in `BEGIN`/`COMMIT` (or `ROLLBACK` on
@@ -91,6 +106,21 @@ the workload. esqlite sets 2 seconds by default.
     query_on/4,
     transaction/4
 ]).
+
+-define(REFERENCING,
+    ~"""
+    SELECT DISTINCT t.name
+    FROM pragma_database_list AS d
+    JOIN pragma_table_list AS t ON t.schema = d.name,
+        pragma_foreign_key_list(t.name, t.schema) AS f
+    WHERE d.seq = ?2
+        AND t.type = 'table'
+        AND f."table" = ?1 COLLATE NOCASE
+        AND t.name <> ?1 COLLATE NOCASE
+        AND (SELECT foreign_keys FROM pragma_foreign_keys) = 1
+    ORDER BY t.name
+    """
+).
 
 %%----------------------------------------------------------------------
 %% kura_driver callbacks
@@ -251,12 +281,50 @@ touched(_PoolMod, _Pool, _Conn, _SQL) ->
 -spec run(esqlite3:esqlite3(), iodata(), [term()]) -> dynamic().
 run(Conn, SQL, Params) ->
     SQLBin = iolist_to_binary(SQL),
-    case esqlite3:prepare(Conn, SQLBin) of
+    case dependents(Conn, SQLBin) of
+        ok -> prepared(Conn, SQLBin, Params);
+        {error, _} = Refused -> Refused
+    end.
+
+-spec prepared(esqlite3:esqlite3(), binary(), [term()]) -> dynamic().
+prepared(Conn, SQL, Params) ->
+    case esqlite3:prepare(Conn, SQL) of
         {ok, Stmt} ->
-            run_prepared(Stmt, Params, command_of(SQLBin));
+            run_prepared(Stmt, Params, command_of(SQL));
         {error, _} = Err ->
             Err
     end.
+
+%% With foreign keys on, SQLite empties a table before it drops it, and that
+%% runs the ON DELETE rules of every table referencing it. SQLite's own
+%% parser names the table: `EXPLAIN` compiles the statement without running
+%% it, and its DropTable instruction carries the schema and table.
+-spec dependents(esqlite3:esqlite3(), binary()) ->
+    ok | {error, {referenced_by, binary(), [binary()]}}.
+dependents(Conn, SQL) ->
+    case keyword(SQL) of
+        ~"DROP" -> dropping(Conn, esqlite3:q(Conn, [~"EXPLAIN ", SQL]));
+        _ -> ok
+    end.
+
+-spec dropping(esqlite3:esqlite3(), [esqlite3:row()] | {error, term()}) ->
+    ok | {error, {referenced_by, binary(), [binary()]}}.
+dropping(Conn, Program) when is_list(Program) ->
+    case [{Schema, Table} || [_, ~"DropTable", Schema, _, _, Table | _] <- Program] of
+        [{Schema, Table} | _] when is_binary(Table) ->
+            referenced(Table, esqlite3:q(Conn, ?REFERENCING, [Table, Schema]));
+        _ ->
+            ok
+    end;
+dropping(_Conn, {error, _}) ->
+    ok.
+
+-spec referenced(binary(), [esqlite3:row()] | {error, term()}) ->
+    ok | {error, {referenced_by, binary(), [binary()]}}.
+referenced(Table, [_ | _] = Rows) ->
+    {error, {referenced_by, Table, [Name || [Name] <- Rows, is_binary(Name)]}};
+referenced(_Table, _None) ->
+    ok.
 
 %% A statement that stops short of `'$done'`, on an error or `'$busy'`,
 %% holds its connection's implicit transaction open until it is reset, and

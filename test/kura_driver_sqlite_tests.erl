@@ -431,3 +431,120 @@ other_pool_inside_a_transaction_test() ->
         nested_teardown({Outer, OuterPath}),
         nested_teardown({Other, OtherPath})
     end.
+
+drop_of_a_referenced_table_is_refused_test() ->
+    with_parent(fun(Pool) ->
+        ?assertEqual(
+            {error, {referenced_by, ~"parent", [~"child"]}}, sql(Pool, ~"DROP TABLE parent")
+        ),
+        ?assertMatch(#{rows := [#{id := 1}]}, sql(Pool, ~"SELECT id FROM parent")),
+        ?assertMatch(#{rows := [#{parent_id := 1}]}, sql(Pool, ~"SELECT parent_id FROM child"))
+    end).
+
+refusal_names_every_referencing_table_test() ->
+    with_parent(fun(Pool) ->
+        #{} = sql(Pool, ~"CREATE TABLE \"Other\" (p INTEGER REFERENCES PARENT (id))"),
+        #{} = sql(Pool, ~"CREATE TABLE another (p INTEGER, q INTEGER REFERENCES \"parent\" (id))"),
+        ?assertEqual(
+            {error, {referenced_by, ~"parent", [~"Other", ~"another", ~"child"]}},
+            sql(Pool, ~"drop table if exists main.\"Parent\"")
+        )
+    end).
+
+drop_inside_a_transaction_is_refused_test() ->
+    with_parent(fun(Pool) ->
+        ?assertEqual(
+            {error, {referenced_by, ~"parent", [~"child"]}},
+            transaction(Pool, fun() -> sql(Pool, ~"DROP TABLE parent") end)
+        ),
+        ?assertMatch(#{rows := [#{parent_id := 1}]}, sql(Pool, ~"SELECT parent_id FROM child"))
+    end).
+
+drop_on_a_held_connection_is_refused_test() ->
+    with_parent(fun(Pool) ->
+        {ok, Conn, Token} = kura_pool_sqlite:checkout(Pool, #{}),
+        try
+            ?assertEqual(
+                {error, {referenced_by, ~"parent", [~"child"]}},
+                kura_driver_sqlite:query_on(Conn, ~"DROP TABLE parent", [], #{})
+            )
+        after
+            ok = kura_pool_sqlite:checkin(Pool, Token)
+        end
+    end).
+
+table_that_only_references_itself_is_dropped_test() ->
+    with_parent(fun(Pool) ->
+        #{} = sql(
+            Pool, ~"CREATE TABLE tree (id INTEGER PRIMARY KEY, up INTEGER REFERENCES tree (id))"
+        ),
+        ?assertMatch(#{command := other}, sql(Pool, ~"DROP TABLE tree"))
+    end).
+
+parent_is_dropped_once_its_children_are_test() ->
+    with_parent(fun(Pool) ->
+        #{} = sql(Pool, ~"DROP TABLE child"),
+        ?assertMatch(#{command := other}, sql(Pool, ~"DROP TABLE parent")),
+        ?assertMatch({error, _}, sql(Pool, ~"SELECT id FROM parent"))
+    end).
+
+drop_of_a_missing_table_returns_the_sqlite_error_test() ->
+    with_parent(fun(Pool) ->
+        ?assertMatch({error, _}, sql(Pool, ~"DROP TABLE missing")),
+        ?assertMatch(#{command := other}, sql(Pool, ~"DROP TABLE IF EXISTS missing"))
+    end).
+
+other_drops_are_not_checked_test() ->
+    with_parent(fun(Pool) ->
+        #{} = sql(Pool, ~"CREATE INDEX child_parent ON child (parent_id)"),
+        #{} = sql(Pool, ~"CREATE VIEW parents AS SELECT id FROM parent"),
+        ?assertMatch(#{command := other}, sql(Pool, ~"DROP INDEX child_parent")),
+        ?assertMatch(#{command := other}, sql(Pool, ~"DROP VIEW parents"))
+    end).
+
+references_from_another_schema_do_not_count_test() ->
+    with_parent(fun(Pool) ->
+        {ok, Conn, Token} = kura_pool_sqlite:checkout(Pool, #{}),
+        try
+            Query = fun(SQL) -> kura_driver_sqlite:query_on(Conn, SQL, [], #{}) end,
+            #{} = Query(~"CREATE TABLE lone (id INTEGER PRIMARY KEY)"),
+            #{} = Query(~"CREATE TEMP TABLE lone (id INTEGER PRIMARY KEY)"),
+            #{} = Query(~"CREATE TEMP TABLE leaf (p INTEGER REFERENCES lone (id))"),
+            ?assertEqual(
+                {error, {referenced_by, ~"lone", [~"leaf"]}}, Query(~"DROP TABLE temp.lone")
+            ),
+            ?assertMatch(#{command := other}, Query(~"DROP TABLE main.lone"))
+        after
+            ok = kura_pool_sqlite:checkin(Pool, Token)
+        end
+    end).
+
+drop_with_foreign_keys_off_is_not_checked_test() ->
+    with_parent(fun(Pool) ->
+        {ok, Conn, Token} = kura_pool_sqlite:checkout(Pool, #{}),
+        try
+            #{} = kura_driver_sqlite:query_on(Conn, ~"PRAGMA foreign_keys = OFF", [], #{}),
+            ?assertMatch(
+                #{command := other},
+                kura_driver_sqlite:query_on(Conn, ~"DROP TABLE parent", [], #{})
+            ),
+            ?assertEqual([[1]], esqlite3:q(Conn, ~"SELECT parent_id FROM child"))
+        after
+            ok = kura_pool_sqlite:checkin(Pool, Token)
+        end
+    end).
+
+with_parent(Test) ->
+    {Pool, Path} = nested_setup(file, 1),
+    try
+        #{} = sql(Pool, ~"CREATE TABLE parent (id INTEGER PRIMARY KEY)"),
+        #{} = sql(
+            Pool,
+            ~"CREATE TABLE child (parent_id INTEGER REFERENCES parent (id) ON DELETE CASCADE)"
+        ),
+        #{} = sql(Pool, ~"INSERT INTO parent VALUES (1)"),
+        #{} = sql(Pool, ~"INSERT INTO child VALUES (1)"),
+        Test(Pool)
+    after
+        nested_teardown({Pool, Path})
+    end.

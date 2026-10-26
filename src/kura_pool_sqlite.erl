@@ -63,10 +63,10 @@ connection is then reopened. One that turns them off directly through
 `esqlite3` keeps them off until the connection is reopened for any of the
 reasons above.
 
-With foreign keys on, `DROP TABLE` on a table other tables reference first
-deletes its rows, and that runs the children's `ON DELETE` rules:
-`CASCADE` deletes the child rows and `SET NULL` clears their references.
-Postgres refuses to drop such a table instead.
+With foreign keys on, `DROP TABLE` on a table other tables reference would
+first delete its rows and run the children's `ON DELETE` rules, so
+`kura_driver_sqlite` refuses it the way Postgres does; see its
+documentation.
 
 The pool opens only UTF-8 databases. SQLite stores a bound binary as TEXT,
 and in a UTF-16 database TEXT is transcoded, so a binary that is not valid
