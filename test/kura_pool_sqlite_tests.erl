@@ -267,12 +267,12 @@ start_on_a_file_that_is_not_a_database_returns_the_sqlite_error_test() ->
         {result, {error, Reason}} = in_fresh(fun() ->
             kura_pool_sqlite:start_pool(pool_for_not_a_database, #{database => Path})
         end),
-        ?assertNotMatch({unsupported_encoding, _}, Reason)
+        ?assertEqual(26, Reason)
     after
         file:delete(Path)
     end.
 
-connection_that_took_on_another_encoding_is_not_lent_again_test() ->
+database_switched_to_another_encoding_stops_the_pool_test() ->
     Name = pool_for_shared_encoding,
     Path = db_path(Name),
     _ = file:delete(Path),
@@ -285,9 +285,7 @@ connection_that_took_on_another_encoding_is_not_lent_again_test() ->
         [[0]] = esqlite3:q(Reader, ~"SELECT count(*) FROM t"),
         ok = kura_pool_sqlite:checkin(Name, SwitcherToken),
         ok = kura_pool_sqlite:checkin(Name, ReaderToken),
-        Lent = [checkout_within(Name, 1000) || _ <- [1, 2]],
-        ?assertEqual([], [Conn || {Conn, _} <- Lent, Conn =:= Switcher orelse Conn =:= Reader]),
-        [ok = kura_pool_sqlite:checkin(Name, Token) || {_, Token} <- Lent]
+        ?assertEqual({error, no_conns}, kura_pool_sqlite:checkout(Name, #{}))
     after
         kura_pool_sqlite:stop_pool(Name),
         file:delete(Path)
@@ -579,7 +577,7 @@ reference_to_a_missing_row_is_refused_test() ->
     with_file_pool(pool_for_restrict, fun(Name) ->
         #{} = sql(Name, ~"CREATE TABLE parent (id INTEGER PRIMARY KEY)"),
         #{} = sql(Name, ~"CREATE TABLE child (parent_id INTEGER REFERENCES parent (id))"),
-        ?assertMatch({error, _}, sql(Name, ~"INSERT INTO child VALUES (99)"))
+        ?assertEqual({error, 787}, sql(Name, ~"INSERT INTO child VALUES (99)"))
     end).
 
 replaced_connection_enforces_foreign_keys_test() ->
@@ -999,7 +997,6 @@ checkout_within_loop(Name, Deadline) ->
             end
     end.
 
-%% Named after the OS process too, so runs side by side do not share files.
 db_path(Name) ->
     File = atom_to_list(Name) ++ "_" ++ os:getpid() ++ ".db",
     iolist_to_binary(filename:join(os:getenv("TMPDIR", "/tmp"), File)).

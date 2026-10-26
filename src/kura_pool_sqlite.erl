@@ -78,10 +78,11 @@ each time a connection comes back. A connection opened to replace a
 dropped one is not checked until its first lease returns, so the pool
 does not wait on a locked database while it opens one. A lease that sets
 the encoding of an empty file database and creates its first table
-changes it for every connection on that file: each is dropped as it comes
-back, so a lease already holding one, or the first lease of a
-replacement, can still write in that encoding. From then on the pool
-cannot open replacements and runs short, logging each failure. Other ways
+changes it for every connection on that file. The first connection to
+come back reading another encoding stops the pool: it logs
+`database_not_utf8`, drops its idle connections, opens no more, and every
+checkout returns `{error, no_conns}`. Leases out at that moment, and the
+lease that switched it, can still write in that encoding. Other ways
 a binary stored as TEXT is changed are outside the pool: statements run
 directly through `esqlite3`, a database file replaced under open
 connections, and SQL text functions (`lower`, `||`, `substr`) applied to
@@ -156,7 +157,7 @@ connections nobody holds.
     lease := reference(), monitor := reference(), dirty := boolean(), given_away := boolean()
 }.
 
--type outcome() :: kept | {kept, [term()]} | dropped.
+-type outcome() :: kept | {kept, [term()]} | dropped | not_utf8.
 
 -type baseline() :: #{settings := [term()], db_path := binary() | string()}.
 
@@ -166,6 +167,7 @@ connections nobody holds.
     db_path := binary() | string(),
     size := non_neg_integer(),
     short := boolean(),
+    not_utf8 := boolean(),
     baseline := baseline(),
     available := [esqlite3:esqlite3()],
     out := #{esqlite3:esqlite3() => lease()},
@@ -278,6 +280,7 @@ init({Name, DbPath, Size, Supervisor}) ->
                 db_path => DbPath,
                 size => Size,
                 short => false,
+                not_utf8 => false,
                 baseline => baseline(Conns, DbPath),
                 available => Conns,
                 out => #{},
@@ -351,6 +354,8 @@ handle_info({reset, Helper, Outcome}, State = #{resetting := Resetting}) when
             {noreply, restored(Conn, From, kept, learned(Settings, Rest))};
         kept ->
             {noreply, restored(Conn, From, kept, Rest)};
+        not_utf8 ->
+            {noreply, restored(Conn, From, not_utf8, Rest)};
         _ ->
             {noreply, restored(Conn, From, dropped, Rest)}
     end;
@@ -428,7 +433,8 @@ returned(
 learned(Settings, State = #{baseline := Baseline}) ->
     State#{baseline := Baseline#{settings := Settings}}.
 
--spec restored(esqlite3:esqlite3(), gen_server:from() | none, kept | dropped, state()) -> state().
+-spec restored(esqlite3:esqlite3(), gen_server:from() | none, kept | dropped | not_utf8, state()) ->
+    state().
 restored(Conn, From, kept, State = #{available := Available}) ->
     ok = replied(From),
     State#{available := [Conn | Available]};
@@ -437,7 +443,16 @@ restored(Conn, From, kept, State = #{available := Available}) ->
 %% fails, so a dropped connection is left to its destructor.
 restored(_Conn, From, dropped, State) ->
     ok = replied(From),
-    opened(State).
+    opened(State);
+%% Every connection on the file now reads it in another encoding, the idle
+%% ones included, and so would any connection opened in their place.
+restored(_Conn, From, not_utf8, State = #{name := Name, not_utf8 := Logged}) ->
+    ok = replied(From),
+    case Logged of
+        true -> ok;
+        false -> ?LOG_ERROR(#{event => database_not_utf8, pool => Name})
+    end,
+    State#{available := [], not_utf8 := true}.
 
 %% A connection that could not be replaced is opened on a later checkout.
 -spec replenished(state()) -> state().
@@ -449,6 +464,8 @@ replenished(State) ->
     State.
 
 -spec opened(state()) -> state().
+opened(State = #{not_utf8 := true}) ->
+    State;
 opened(State = #{name := Name, db_path := DbPath, available := Available, short := Short}) ->
     case connected(DbPath) of
         {ok, Fresh} ->
@@ -475,19 +492,29 @@ replied(From) -> gen_server:reply(From, ok).
 -spec reset(esqlite3:esqlite3(), boolean(), baseline()) -> outcome().
 reset(Conn, Dirty, Baseline) ->
     _ = esqlite3:exec(Conn, ~""),
-    case rolled_back(Conn) of
-        true when Dirty -> inspected(Conn, Baseline);
-        true -> still_utf8(Conn);
-        false -> unlocked(Conn)
+    case rolled_back(Conn) andalso esqlite3:q(Conn, ~"PRAGMA encoding") of
+        [[~"UTF-8"]] when Dirty -> inspected(Conn, Baseline);
+        [[~"UTF-8"]] -> kept;
+        false -> unlocked(Conn);
+        _ -> not_utf8(Conn, Baseline)
     end.
 
 %% A lease that fixed the encoding of an empty file database changes it for
 %% every connection on that file, including ones whose leases ran only DML.
--spec still_utf8(esqlite3:esqlite3()) -> outcome().
-still_utf8(Conn) ->
-    case esqlite3:q(Conn, ~"PRAGMA encoding") of
-        [[~"UTF-8"]] -> kept;
-        _ -> unlocked(Conn)
+%% One that only set it, on a database still empty or on `:memory:`, changed
+%% its own connection, which a new connection shows.
+-spec not_utf8(esqlite3:esqlite3(), baseline()) -> dropped | not_utf8.
+not_utf8(Conn, #{db_path := DbPath}) ->
+    dropped = unlocked(Conn),
+    Opened = apart(fun() ->
+        case utf8_opened(DbPath) of
+            {ok, New} -> closed(New);
+            {error, Reason} -> Reason
+        end
+    end),
+    case Opened of
+        {unsupported_encoding, _} -> not_utf8;
+        _ -> dropped
     end.
 
 -spec outcome(atom(), esqlite3:esqlite3(), lease(), baseline()) -> outcome().
@@ -505,7 +532,7 @@ outcome(Name, Conn, #{dirty := Dirty, given_away := GivenAway}, Baseline) ->
 %% A lease handed on with `give_away/3` and reclaimed from its new owner may
 %% still be in use by the process that handed it on.
 -spec reclaimed(esqlite3:esqlite3(), boolean(), outcome()) -> outcome().
-reclaimed(Conn, true, Outcome) when Outcome =/= dropped ->
+reclaimed(Conn, true, Outcome) when Outcome =/= dropped, Outcome =/= not_utf8 ->
     unlocked(Conn);
 reclaimed(_Conn, _GivenAway, Outcome) ->
     Outcome.
@@ -555,7 +582,7 @@ unchanged(Conn, #{settings := Opened, db_path := DbPath}) ->
 %% and become the baseline if they match it.
 -spec settings_of_new(binary() | string()) -> [term()] | {error, term()}.
 settings_of_new(DbPath) ->
-    case checked(DbPath) of
+    case utf8_opened(DbPath) of
         {ok, New} ->
             Settings = settings(New),
             closed = closed(New),
@@ -612,7 +639,7 @@ request_name(Status) ->
 open_n(_DbPath, 0, Acc) ->
     {ok, Acc};
 open_n(DbPath, N, Acc) when N > 0 ->
-    case checked(DbPath) of
+    case utf8_opened(DbPath) of
         {ok, Conn} ->
             open_n(DbPath, N - 1, [Conn | Acc]);
         {error, _} = Err ->
@@ -632,8 +659,8 @@ connected(DbPath) ->
             Error
     end.
 
--spec checked(binary() | string()) -> {ok, esqlite3:esqlite3()} | {error, term()}.
-checked(DbPath) ->
+-spec utf8_opened(binary() | string()) -> {ok, esqlite3:esqlite3()} | {error, term()}.
+utf8_opened(DbPath) ->
     case connected(DbPath) of
         {ok, Conn} -> utf8(Conn);
         {error, _} = Error -> Error

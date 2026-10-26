@@ -64,6 +64,10 @@ to start on this backend via `kura_capabilities:require/2`.
   already broken; `PRAGMA foreign_key_check` lists them. Dropping a table
   that other tables reference deletes its rows first, so their
   `ON DELETE CASCADE` children go with it, where Postgres refuses the drop.
+- **UTF-8 only.** `start_pool/2` refuses a database in another encoding
+  with `{error, {unsupported_encoding, Encoding}}`. Binaries are stored as
+  TEXT, which a UTF-16 database transcodes, so encrypted fields would not
+  read back.
 - **In-memory** (`<<":memory:">>`) is per-connection. Use `pool_size: 1`
   if multiple checkouts must observe the same data, or use a file path.
 
