@@ -31,9 +31,20 @@ another table references returns
 tables in that schema that reference it, and drops nothing. A table that
 references only itself can be dropped. A `DROP TABLE` the driver cannot
 check, because SQLite compiled it to a program it does not recognise,
-returns `{error, unrecognised_drop_table}`. With foreign keys off on the
-connection the drop deletes no rows and is not checked, so the
-table-rebuild procedure SQLite documents for schema changes still works.
+returns `{error, unrecognised_drop_table}`.
+
+With foreign keys off on the connection the drop deletes no rows and is
+not checked, which is what SQLite's table-rebuild procedure for schema
+changes relies on. `PRAGMA foreign_keys` has no effect inside a
+transaction, though, and `kura_migrator` runs every migration in one, so
+a migration cannot turn foreign keys off and a rebuild of a referenced
+table inside a migration is refused. Run such a rebuild outside a
+transaction: lease a connection with `kura_pool:with_conn/3`, run
+`PRAGMA foreign_keys = OFF` on it through `query_on/4` before `BEGIN`,
+do the rebuild, check `PRAGMA foreign_key_check`, commit, and turn foreign
+keys back on. kura has no way yet to mark a migration as not
+transactional.
+
 Outside a transaction, a table created by another connection between the
 check and the drop is not seen.
 

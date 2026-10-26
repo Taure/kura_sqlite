@@ -65,7 +65,9 @@ to start on this backend via `kura_capabilities:require/2`.
   that other tables reference is refused with
   `{error, {referenced_by, Table, Referencing}}`, as Postgres refuses it,
   rather than letting SQLite delete its rows and run their `ON DELETE`
-  rules.
+  rules. `PRAGMA foreign_keys` has no effect inside a transaction and every
+  kura migration runs in one, so rebuild a referenced table outside a
+  migration; `kura_driver_sqlite`'s documentation has the steps.
 - **Checkout waits** up to `#{timeout => Ms}` (5000 by default) for a
   connection to come free, then returns `{error, no_conns}`.
   `#{timeout => 0}` does not wait.
