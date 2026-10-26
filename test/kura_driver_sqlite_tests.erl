@@ -572,6 +572,10 @@ explain_of_drop_table_has_the_shape_the_check_reads_test() ->
     {ok, Conn} = esqlite3:open(":memory:"),
     try
         ok = esqlite3:exec(Conn, ~"CREATE TABLE t (id INTEGER PRIMARY KEY)"),
+        {ok, Explain} = esqlite3:prepare(Conn, ~"EXPLAIN DROP TABLE t"),
+        ?assertMatch(
+            [~"addr", ~"opcode", ~"p1", ~"p2", ~"p3", ~"p4" | _], esqlite3:column_names(Explain)
+        ),
         Program = program(Conn, ~"EXPLAIN DROP TABLE t"),
         ?assertMatch(
             [[_, ~"DropTable", 0, _, _, ~"t" | _]],
@@ -593,6 +597,63 @@ program(Conn, SQL) ->
 
 nothing_dropped() ->
     [~"Init", ~"Transaction", ~"JournalMode", ~"Goto", ~"Halt"].
+
+drop_is_not_run_when_the_reference_check_is_busy_test() ->
+    with_parent(fun(Pool) ->
+        Path = nested_path(Pool),
+        {ok, Other} = esqlite3:open(binary_to_list(Path)),
+        {ok, Conn, Token} = kura_pool_sqlite:checkout(Pool, #{}),
+        try
+            #{} = kura_driver_sqlite:query_on(Conn, ~"PRAGMA busy_timeout = 10", [], #{}),
+            ok = esqlite3:exec(Other, ~"BEGIN EXCLUSIVE"),
+            ?assertEqual(
+                {{error, busy}, []},
+                prepared_drops(fun() ->
+                    kura_driver_sqlite:query_on(Conn, ~"DROP TABLE parent", [], #{})
+                end)
+            ),
+            ok = esqlite3:exec(Other, ~"ROLLBACK"),
+            ?assertMatch(
+                #{rows := [#{parent_id := 1}]},
+                kura_driver_sqlite:query_on(Conn, ~"SELECT parent_id FROM child", [], #{})
+            )
+        after
+            _ = esqlite3:exec(Other, ~"ROLLBACK"),
+            _ = esqlite3:close(Other),
+            ok = kura_pool_sqlite:checkin(Pool, Token)
+        end
+    end).
+
+prepared_drops(Fun) ->
+    Session = trace:session_create(?MODULE, self(), []),
+    try
+        _ = trace:process(Session, new, true, [call]),
+        1 = trace:function(Session, {esqlite3, prepare, 2}, true, [local]),
+        {result, Result} = in_process(Fun),
+        Delivered = trace:delivered(Session, all),
+        receive
+            {trace_delivered, all, Delivered} -> {Result, drops()}
+        end
+    after
+        trace:session_destroy(Session)
+    end.
+
+in_process(Fun) ->
+    Self = self(),
+    {Pid, Ref} = spawn_monitor(fun() -> Self ! {self(), Fun()} end),
+    receive
+        {Pid, Result} ->
+            receive
+                {'DOWN', Ref, process, Pid, _} -> {result, Result}
+            end
+    end.
+
+drops() ->
+    receive
+        {trace, _, call, {esqlite3, prepare, [_, ~"DROP TABLE parent"]}} -> [prepared | drops()];
+        {trace, _, call, _} -> drops()
+    after 0 -> []
+    end.
 
 drop_after_comments_is_refused_test() ->
     with_parent(fun(Pool) ->

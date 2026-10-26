@@ -122,6 +122,7 @@ the workload. esqlite sets 2 seconds by default.
 
 -type words() :: {binary(), binary()}.
 -type command() :: select | insert | update | delete | other.
+-type result() :: #{rows := [#{atom() => term()}], _ => _} | {error, term()}.
 
 -define(NOTHING_DROPPED, [~"Init", ~"Transaction", ~"JournalMode", ~"Goto", ~"Halt"]).
 
@@ -322,18 +323,17 @@ prepared(Conn, SQL, Params, Command) ->
 %% is refused rather than let through unchecked.
 -spec dependents(esqlite3:esqlite3(), binary(), words()) -> ok | {error, term()}.
 dependents(Conn, SQL, {~"DROP", ~"TABLE"}) ->
-    dropping(Conn, esqlite3:q(Conn, [~"EXPLAIN ", skipped(SQL)]));
+    dropping(Conn, prepared(Conn, iolist_to_binary([~"EXPLAIN ", skipped(SQL)]), [], other));
 dependents(_Conn, _SQL, _Words) ->
     ok.
 
--spec dropping(esqlite3:esqlite3(), [esqlite3:row()] | {error, term()}) ->
-    ok | {error, term()}.
-dropping(Conn, Program) when is_list(Program) ->
-    case [{Schema, Table} || [_, ~"DropTable", Schema, _, _, Table | _] <- Program] of
+-spec dropping(esqlite3:esqlite3(), result()) -> ok | {error, term()}.
+dropping(Conn, #{rows := Program}) ->
+    case [{Schema, Table} || #{opcode := ~"DropTable", p1 := Schema, p4 := Table} <- Program] of
         [{Schema, Table}] when is_integer(Schema), is_binary(Table) ->
-            referenced(Table, esqlite3:q(Conn, ?REFERENCING, [Table, Schema]));
+            referenced(Table, prepared(Conn, ?REFERENCING, [Table, Schema], select));
         [] ->
-            nothing_dropped([Op || [_, Op | _] <- Program]);
+            nothing_dropped([maps:get(opcode, Row, undefined) || Row <- Program]);
         _ ->
             {error, unrecognised_drop_table}
     end;
@@ -342,19 +342,20 @@ dropping(_Conn, {error, _} = Error) ->
 
 %% `DROP TABLE IF EXISTS` on a missing table compiles to a program that
 %% only opens and ends a transaction.
--spec nothing_dropped([esqlite3:cell()]) -> ok | {error, unrecognised_drop_table}.
+-spec nothing_dropped([term()]) -> ok | {error, unrecognised_drop_table}.
 nothing_dropped(Ops) ->
     case [Op || Op <- Ops, not lists:member(Op, ?NOTHING_DROPPED)] of
         [] -> ok;
         _ -> {error, unrecognised_drop_table}
     end.
 
--spec referenced(binary(), [esqlite3:row()] | {error, term()}) ->
-    ok | {error, {referenced_by, binary(), [binary()]}}.
-referenced(Table, [_ | _] = Rows) ->
-    {error, {referenced_by, Table, [Name || [Name] <- Rows, is_binary(Name)]}};
-referenced(_Table, _None) ->
-    ok.
+-spec referenced(binary(), result()) -> ok | {error, term()}.
+referenced(_Table, #{rows := []}) ->
+    ok;
+referenced(Table, #{rows := Rows}) ->
+    {error, {referenced_by, Table, [Name || #{name := Name} <- Rows, is_binary(Name)]}};
+referenced(_Table, {error, _} = Error) ->
+    Error.
 
 %% A statement that stops short of `'$done'`, on an error or `'$busy'`,
 %% holds its connection's implicit transaction open until it is reset, and
