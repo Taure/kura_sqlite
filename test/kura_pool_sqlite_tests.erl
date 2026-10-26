@@ -251,11 +251,23 @@ start_on_a_utf16_database_is_refused_test() ->
     ok = esqlite3:close(Setup),
     try
         ?assertMatch(
-            {result, {error, {unsupported_encoding, [[~"UTF-16le"]]}}},
+            {result, {error, {unsupported_encoding, ~"UTF-16le"}}},
             in_fresh(fun() ->
                 kura_pool_sqlite:start_pool(pool_for_utf16, #{database => Path, pool_size => 1})
             end)
         )
+    after
+        file:delete(Path)
+    end.
+
+start_on_a_file_that_is_not_a_database_returns_the_sqlite_error_test() ->
+    Path = db_path(pool_for_not_a_database),
+    ok = file:write_file(Path, binary:copy(~"not a database", 512)),
+    try
+        {result, {error, Reason}} = in_fresh(fun() ->
+            kura_pool_sqlite:start_pool(pool_for_not_a_database, #{database => Path})
+        end),
+        ?assertNotMatch({unsupported_encoding, _}, Reason)
     after
         file:delete(Path)
     end.

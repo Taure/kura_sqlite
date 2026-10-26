@@ -63,11 +63,21 @@ connection is then reopened. One that turns them off directly through
 `esqlite3` keeps them off until the connection is reopened for any of the
 reasons above.
 
+With foreign keys on, `DROP TABLE` on a table other tables reference first
+deletes its rows, and that runs the children's `ON DELETE` rules:
+`CASCADE` deletes the child rows and `SET NULL` clears their references.
+Postgres refuses to drop such a table instead.
+
 The pool opens only UTF-8 databases. SQLite stores a bound binary as TEXT,
 and in a UTF-16 database TEXT is transcoded, so a binary that is not valid
 text, ciphertext from an `{encrypted, _}` field among them, would not come
 back as it was written. `start_pool/2` on a database in another encoding
-returns `{error, {unsupported_encoding, [[Encoding]]}}`.
+returns `{error, {unsupported_encoding, Encoding}}`, `Encoding` being, for
+example, `~"UTF-16le"`. The encoding is checked as each connection opens.
+A lease that sets the encoding of an empty file database and creates its
+first table leaves the other connections the pool holds reading the
+database in that encoding until they are next returned; from then on the
+pool cannot open replacements and runs short, logging each failure.
 
 `last_insert_rowid()` and `changes()` belong to the connection and are not
 reset, so a lease can read the values the previous lease left.
@@ -606,9 +616,12 @@ prepared(Conn) ->
         [[~"UTF-8"]] ->
             ok = esqlite3:exec(Conn, ~"PRAGMA foreign_keys = ON"),
             {ok, Conn};
-        Encoding ->
+        [[Encoding]] ->
             closed = closed(Conn),
-            {error, {unsupported_encoding, Encoding}}
+            {error, {unsupported_encoding, Encoding}};
+        {error, _} = Error ->
+            closed = closed(Conn),
+            Error
     end.
 
 -spec to_filename(binary() | string()) -> string().
