@@ -565,3 +565,52 @@ with_parent(Test) ->
     after
         nested_teardown({Pool, Path})
     end.
+
+%% The DROP TABLE check reads SQLite's EXPLAIN output, which SQLite does not
+%% promise to keep stable. If this fails, the check needs updating.
+explain_of_drop_table_has_the_shape_the_check_reads_test() ->
+    {ok, Conn} = esqlite3:open(":memory:"),
+    try
+        ok = esqlite3:exec(Conn, ~"CREATE TABLE t (id INTEGER PRIMARY KEY)"),
+        Program = esqlite3:q(Conn, ~"EXPLAIN DROP TABLE t"),
+        ?assertMatch(
+            [[_, ~"DropTable", 0, _, _, ~"t" | _]],
+            [Row || [_, ~"DropTable" | _] = Row <- Program]
+        ),
+        Missing = esqlite3:q(Conn, ~"EXPLAIN DROP TABLE IF EXISTS missing"),
+        ?assertEqual(
+            [],
+            [Op || [_, Op | _] <- Missing] --
+                lists:append(lists:duplicate(length(Missing), nothing_dropped()))
+        )
+    after
+        esqlite3:close(Conn)
+    end.
+
+nothing_dropped() ->
+    [~"Init", ~"Transaction", ~"JournalMode", ~"Goto", ~"Halt"].
+
+drop_after_comments_is_refused_test() ->
+    with_parent(fun(Pool) ->
+        Refused = {error, {referenced_by, ~"parent", [~"child"]}},
+        ?assertEqual(Refused, sql(Pool, ~"-- roll back\nDROP TABLE parent")),
+        ?assertEqual(Refused, sql(Pool, ~"/* roll back */ drop /* the parent */ table parent")),
+        ?assertEqual(Refused, sql(Pool, ~"\t\f DROP\n\rTABLE parent")),
+        ?assertMatch(#{rows := [#{id := 1}]}, sql(Pool, ~"SELECT id FROM parent"))
+    end).
+
+command_is_read_past_comments_test() ->
+    with_parent(fun(Pool) ->
+        ?assertMatch(
+            #{command := select, rows := [#{id := 1}]},
+            sql(Pool, ~"/* first */ -- second\n  SELECT id FROM parent")
+        ),
+        ?assertMatch(#{command := insert}, sql(Pool, ~"--x\nINSERT INTO parent VALUES (2)")),
+        ?assertMatch(#{command := update}, sql(Pool, ~"/**/UPDATE parent SET id = 3 WHERE id = 2")),
+        ?assertMatch(#{command := delete}, sql(Pool, ~"/* */ delete FROM parent WHERE id = 3"))
+    end).
+
+pragma_after_a_comment_is_other_test() ->
+    with_parent(fun(Pool) ->
+        ?assertMatch(#{command := other}, sql(Pool, ~"-- nothing\nPRAGMA user_version"))
+    end).

@@ -29,7 +29,9 @@ refuses such a drop. So does this driver: a `DROP TABLE` on a table that
 another table references returns
 `{error, {referenced_by, Table, Referencing}}`, `Referencing` listing the
 tables in that schema that reference it, and drops nothing. A table that
-references only itself can be dropped. With foreign keys off on the
+references only itself can be dropped. A `DROP TABLE` the driver cannot
+check, because SQLite compiled it to a program it does not recognise,
+returns `{error, unrecognised_drop_table}`. With foreign keys off on the
 connection the drop deletes no rows and is not checked, so the
 table-rebuild procedure SQLite documents for schema changes still works.
 Outside a transaction, a table created by another connection between the
@@ -107,6 +109,11 @@ the workload. esqlite sets 2 seconds by default.
     transaction/4
 ]).
 
+-type words() :: {binary(), binary()}.
+-type command() :: select | insert | update | delete | other.
+
+-define(NOTHING_DROPPED, [~"Init", ~"Transaction", ~"JournalMode", ~"Goto", ~"Halt"]).
+
 -define(REFERENCING,
     ~"""
     SELECT DISTINCT t.name
@@ -129,21 +136,23 @@ the workload. esqlite sets 2 seconds by default.
 -spec query(module(), atom(), iodata(), [term()], map()) -> dynamic().
 query(PoolMod, Pool, SQL, Params, _Opts) ->
     SQLBin = iolist_to_binary(SQL),
+    Words = leading_words(SQLBin),
     case tx_conn(Pool) of
         undefined ->
             kura_pool:with_conn(PoolMod, Pool, fun(Conn) ->
-                ok = touched(PoolMod, Pool, Conn, SQLBin),
-                run(Conn, SQLBin, Params)
+                ok = touched(PoolMod, Pool, Conn, Words),
+                run(Conn, SQLBin, Words, Params)
             end);
         Conn ->
             ok = still_open(Conn),
-            ok = touched(PoolMod, Pool, Conn, SQLBin),
-            ended(Conn, run(Conn, SQLBin, Params))
+            ok = touched(PoolMod, Pool, Conn, Words),
+            ended(Conn, run(Conn, SQLBin, Words, Params))
     end.
 
 -spec query_on(esqlite3:esqlite3(), iodata(), [term()], map()) -> dynamic().
 query_on(Conn, SQL, Params, _Opts) ->
-    run(Conn, SQL, Params).
+    SQLBin = iolist_to_binary(SQL),
+    run(Conn, SQLBin, leading_words(SQLBin), Params).
 
 -spec transaction(module(), atom(), fun(() -> term()), map()) -> term().
 transaction(PoolMod, Pool, Fun, _Opts) ->
@@ -269,28 +278,27 @@ still_open(Conn) ->
 
 %% A statement other than DML can leave state on the connection that the
 %% next borrower would inherit, so the pool checks it on return.
--spec touched(module(), atom(), esqlite3:esqlite3(), binary()) -> ok.
-touched(kura_pool_sqlite, Pool, Conn, SQL) ->
-    case command_of(SQL) =/= other orelse keyword(SQL) =:= ~"WITH" of
+-spec touched(module(), atom(), esqlite3:esqlite3(), words()) -> ok.
+touched(kura_pool_sqlite, Pool, Conn, {First, _}) ->
+    case command_of(First) =/= other orelse First =:= ~"WITH" of
         true -> ok;
         false -> kura_pool_sqlite:dirty(Pool, Conn)
     end;
-touched(_PoolMod, _Pool, _Conn, _SQL) ->
+touched(_PoolMod, _Pool, _Conn, _Words) ->
     ok.
 
--spec run(esqlite3:esqlite3(), iodata(), [term()]) -> dynamic().
-run(Conn, SQL, Params) ->
-    SQLBin = iolist_to_binary(SQL),
-    case dependents(Conn, SQLBin) of
-        ok -> prepared(Conn, SQLBin, Params);
+-spec run(esqlite3:esqlite3(), binary(), words(), [term()]) -> dynamic().
+run(Conn, SQL, {First, _} = Words, Params) ->
+    case dependents(Conn, SQL, Words) of
+        ok -> prepared(Conn, SQL, Params, command_of(First));
         {error, _} = Refused -> Refused
     end.
 
--spec prepared(esqlite3:esqlite3(), binary(), [term()]) -> dynamic().
-prepared(Conn, SQL, Params) ->
+-spec prepared(esqlite3:esqlite3(), binary(), [term()], command()) -> dynamic().
+prepared(Conn, SQL, Params, Command) ->
     case esqlite3:prepare(Conn, SQL) of
         {ok, Stmt} ->
-            run_prepared(Stmt, Params, command_of(SQL));
+            run_prepared(Stmt, Params, Command);
         {error, _} = Err ->
             Err
     end.
@@ -299,25 +307,36 @@ prepared(Conn, SQL, Params) ->
 %% runs the ON DELETE rules of every table referencing it. SQLite's own
 %% parser names the table: `EXPLAIN` compiles the statement without running
 %% it, and its DropTable instruction carries the schema and table.
--spec dependents(esqlite3:esqlite3(), binary()) ->
-    ok | {error, {referenced_by, binary(), [binary()]}}.
-dependents(Conn, SQL) ->
-    case keyword(SQL) of
-        ~"DROP" -> dropping(Conn, esqlite3:q(Conn, [~"EXPLAIN ", SQL]));
-        _ -> ok
-    end.
+%% EXPLAIN output is not a stable interface, so a program in any other shape
+%% is refused rather than let through unchecked.
+-spec dependents(esqlite3:esqlite3(), binary(), words()) -> ok | {error, term()}.
+dependents(Conn, SQL, {~"DROP", ~"TABLE"}) ->
+    dropping(Conn, esqlite3:q(Conn, [~"EXPLAIN ", SQL]));
+dependents(_Conn, _SQL, _Words) ->
+    ok.
 
 -spec dropping(esqlite3:esqlite3(), [esqlite3:row()] | {error, term()}) ->
-    ok | {error, {referenced_by, binary(), [binary()]}}.
+    ok | {error, term()}.
 dropping(Conn, Program) when is_list(Program) ->
     case [{Schema, Table} || [_, ~"DropTable", Schema, _, _, Table | _] <- Program] of
-        [{Schema, Table} | _] when is_binary(Table) ->
+        [{Schema, Table}] when is_integer(Schema), is_binary(Table) ->
             referenced(Table, esqlite3:q(Conn, ?REFERENCING, [Table, Schema]));
+        [] ->
+            nothing_dropped([Op || [_, Op | _] <- Program]);
         _ ->
-            ok
+            {error, unrecognised_drop_table}
     end;
-dropping(_Conn, {error, _}) ->
-    ok.
+dropping(_Conn, {error, _} = Error) ->
+    Error.
+
+%% `DROP TABLE IF EXISTS` on a missing table compiles to a program that
+%% only opens and ends a transaction.
+-spec nothing_dropped([esqlite3:cell()]) -> ok | {error, unrecognised_drop_table}.
+nothing_dropped(Ops) ->
+    case [Op || Op <- Ops, not lists:member(Op, ?NOTHING_DROPPED)] of
+        [] -> ok;
+        _ -> {error, unrecognised_drop_table}
+    end.
 
 -spec referenced(binary(), [esqlite3:row()] | {error, term()}) ->
     ok | {error, {referenced_by, binary(), [binary()]}}.
@@ -396,28 +415,43 @@ row_to_map([Cell | RestRow], [Name | RestNames], Acc) ->
 -spec name_to_atom(binary()) -> atom().
 name_to_atom(N) -> binary_to_atom(N, utf8).
 
--spec command_of(binary()) -> select | insert | update | delete | other.
-command_of(SQL) ->
-    case keyword(SQL) of
-        ~"SELECT" -> select;
-        ~"INSERT" -> insert;
-        ~"UPDATE" -> update;
-        ~"DELETE" -> delete;
-        _ -> other
+-spec command_of(binary()) -> command().
+command_of(~"SELECT") -> select;
+command_of(~"INSERT") -> insert;
+command_of(~"UPDATE") -> update;
+command_of(~"DELETE") -> delete;
+command_of(_Keyword) -> other.
+
+%% The first two keywords, upper-cased, past whitespace and comments.
+-spec leading_words(binary()) -> words().
+leading_words(SQL) ->
+    {First, Rest} = word(skipped(SQL), ~""),
+    {Second, _} = word(skipped(Rest), ~""),
+    {First, Second}.
+
+-spec skipped(binary()) -> binary().
+skipped(<<Space, Rest/binary>>) when
+    Space =:= $\s; Space =:= $\t; Space =:= $\n; Space =:= $\r; Space =:= $\f
+->
+    skipped(Rest);
+skipped(<<"--", Rest/binary>>) ->
+    skipped(past(Rest, ~"\n"));
+skipped(<<"/*", Rest/binary>>) ->
+    skipped(past(Rest, ~"*/"));
+skipped(SQL) ->
+    SQL.
+
+-spec past(binary(), binary()) -> binary().
+past(SQL, End) ->
+    case binary:split(SQL, End) of
+        [_Comment, Rest] -> Rest;
+        [_Unterminated] -> ~""
     end.
 
--spec keyword(binary()) -> binary().
-keyword(<<First, Rest/binary>>) when
-    First =:= $\s; First =:= $\t; First =:= $\n; First =:= $\r
-->
-    keyword(Rest);
-keyword(SQL) ->
-    upper_word(SQL).
-
--spec upper_word(binary()) -> binary().
-upper_word(<<Letter, Rest/binary>>) when Letter >= $a, Letter =< $z ->
-    <<(Letter - $a + $A), (upper_word(Rest))/binary>>;
-upper_word(<<Letter, Rest/binary>>) when Letter >= $A, Letter =< $Z ->
-    <<Letter, (upper_word(Rest))/binary>>;
-upper_word(_) ->
-    ~"".
+-spec word(binary(), binary()) -> {binary(), binary()}.
+word(<<Letter, Rest/binary>>, Acc) when Letter >= $a, Letter =< $z ->
+    word(Rest, <<Acc/binary, (Letter - $a + $A)>>);
+word(<<Letter, Rest/binary>>, Acc) when Letter >= $A, Letter =< $Z ->
+    word(Rest, <<Acc/binary, Letter>>);
+word(Rest, Acc) ->
+    {Acc, Rest}.
