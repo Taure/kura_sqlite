@@ -618,3 +618,29 @@ pragma_after_a_comment_is_other_test() ->
     with_parent(fun(Pool) ->
         ?assertMatch(#{command := other}, sql(Pool, ~"-- nothing\nPRAGMA user_version"))
     end).
+
+statement_other_than_dml_gets_its_connection_checked_test() ->
+    with_parent(fun(Pool) ->
+        ok = marked(Pool),
+        #{} = sql(Pool, ~"INSERT INTO parent VALUES (5)"),
+        #{} = sql(Pool, ~"-- dml\nWITH x AS (SELECT 1 AS one) SELECT one FROM x"),
+        ?assert(still_marked(Pool)),
+        #{} = sql(Pool, ~"/* scratch */ CREATE TEMP TABLE scratch (id INTEGER)"),
+        ?assertNot(still_marked(Pool)),
+        ok = marked(Pool),
+        ok = transaction(Pool, fun() ->
+            #{} = sql(Pool, ~"CREATE TEMP TABLE inside (id INTEGER)"),
+            ok
+        end),
+        ?assertNot(still_marked(Pool))
+    end).
+
+marked(Pool) ->
+    kura_pool:with_conn(kura_pool_sqlite, Pool, fun(Conn) ->
+        esqlite3:exec(Conn, ~"CREATE TEMP TABLE marker (id INTEGER)")
+    end).
+
+still_marked(Pool) ->
+    kura_pool:with_conn(kura_pool_sqlite, Pool, fun(Conn) ->
+        is_list(esqlite3:q(Conn, ~"SELECT count(*) FROM temp.marker"))
+    end).
