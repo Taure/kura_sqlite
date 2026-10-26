@@ -641,13 +641,9 @@ prepares(Fun) ->
     end.
 
 in_process(Fun) ->
-    Self = self(),
-    {Pid, Ref} = spawn_monitor(fun() -> Self ! {self(), Fun()} end),
+    {Pid, Ref} = spawn_monitor(fun() -> exit({result, Fun()}) end),
     receive
-        {Pid, Result} ->
-            receive
-                {'DOWN', Ref, process, Pid, _} -> {result, Result}
-            end
+        {'DOWN', Ref, process, Pid, Reason} -> Reason
     end.
 
 prepared() ->
