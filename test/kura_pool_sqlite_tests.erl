@@ -488,6 +488,54 @@ writable_schema_is_not_inherited_test() ->
         ?assertMatch(#{rows := [#{writable_schema := 0}]}, sql(Name, ~"PRAGMA writable_schema"))
     end).
 
+every_connection_enforces_foreign_keys_test() ->
+    Name = pool_for_foreign_keys,
+    {ok, _} = kura_pool_sqlite:start_pool(Name, #{pool_size => 3}),
+    try
+        Leases = [checkout_within(Name, 1000) || _ <- lists:seq(1, 3)],
+        ?assertEqual(
+            [[[1]], [[1]], [[1]]],
+            [esqlite3:q(Conn, ~"PRAGMA foreign_keys") || {Conn, _} <- Leases]
+        ),
+        [ok = kura_pool_sqlite:checkin(Name, Token) || {_, Token} <- Leases]
+    after
+        kura_pool_sqlite:stop_pool(Name)
+    end.
+
+on_delete_cascade_removes_the_children_test() ->
+    with_file_pool(pool_for_cascade, fun(Name) ->
+        #{} = sql(Name, ~"CREATE TABLE parent (id INTEGER PRIMARY KEY)"),
+        #{} = sql(
+            Name,
+            ~"CREATE TABLE child (id INTEGER, parent_id INTEGER REFERENCES parent (id) ON DELETE CASCADE)"
+        ),
+        #{} = sql(Name, ~"INSERT INTO parent VALUES (1)"),
+        #{} = sql(Name, ~"INSERT INTO child VALUES (1, 1)"),
+        #{} = sql(Name, ~"DELETE FROM parent WHERE id = 1"),
+        ?assertMatch(#{rows := []}, sql(Name, ~"SELECT id FROM child"))
+    end).
+
+reference_to_a_missing_row_is_refused_test() ->
+    with_file_pool(pool_for_restrict, fun(Name) ->
+        #{} = sql(Name, ~"CREATE TABLE parent (id INTEGER PRIMARY KEY)"),
+        #{} = sql(Name, ~"CREATE TABLE child (parent_id INTEGER REFERENCES parent (id))"),
+        ?assertMatch({error, _}, sql(Name, ~"INSERT INTO child VALUES (99)"))
+    end).
+
+replaced_connection_enforces_foreign_keys_test() ->
+    Name = pool_for_replaced_foreign_keys,
+    {ok, _} = kura_pool_sqlite:start_pool(Name, #{pool_size => 1}),
+    try
+        {Closed, ClosedToken} = checkout_within(Name, 1000),
+        ok = esqlite3:close(Closed),
+        ok = kura_pool_sqlite:checkin(Name, ClosedToken),
+        {Fresh, FreshToken} = checkout_within(Name, 1000),
+        ?assertEqual([[1]], esqlite3:q(Fresh, ~"PRAGMA foreign_keys")),
+        ok = kura_pool_sqlite:checkin(Name, FreshToken)
+    after
+        kura_pool_sqlite:stop_pool(Name)
+    end.
+
 safety_settings_are_not_inherited_test_() ->
     [
         {Setting, fun() ->

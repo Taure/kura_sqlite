@@ -55,10 +55,13 @@ the reopened connection is an empty database, so such a lease loses the
 data that connection held. Statements run on the connection directly
 through `esqlite3` are not seen.
 
-Foreign keys are off on every new connection, SQLite's default. A consumer
-that turns them on through the driver has them for that lease only, and
-one that turns them on directly through `esqlite3` loses them when the
-connection is reopened for any of the reasons above.
+Foreign keys are on for every connection the pool opens, so `REFERENCES`
+and `ON DELETE` rules are enforced. SQLite leaves them off by default, and
+the setting belongs to the connection, not the database. A lease that turns
+them off through the driver has them off for that lease only, since the
+connection is then reopened. One that turns them off directly through
+`esqlite3` keeps them off until the connection is reopened for any of the
+reasons above.
 
 `last_insert_rowid()` and `changes()` belong to the connection and are not
 reset, so a lease can read the values the previous lease left.
@@ -422,7 +425,7 @@ replenished(State) ->
 
 -spec opened(state()) -> state().
 opened(State = #{name := Name, db_path := DbPath, available := Available, short := Short}) ->
-    case esqlite3:open(to_filename(DbPath)) of
+    case connected(DbPath) of
         {ok, Fresh} ->
             State#{available := [Fresh | Available], short := false};
         {error, _} when Short ->
@@ -518,7 +521,7 @@ unchanged(Conn, #{settings := Opened, db_path := DbPath}) ->
 %% and become the baseline if they match it.
 -spec settings_of_new(binary() | string()) -> [term()] | {error, term()}.
 settings_of_new(DbPath) ->
-    case esqlite3:open(to_filename(DbPath)) of
+    case connected(DbPath) of
         {ok, New} ->
             Settings = settings(New),
             closed = closed(New),
@@ -575,12 +578,22 @@ request_name(Status) ->
 open_n(_DbPath, 0, Acc) ->
     {ok, Acc};
 open_n(DbPath, N, Acc) when N > 0 ->
-    case esqlite3:open(to_filename(DbPath)) of
+    case connected(DbPath) of
         {ok, Conn} ->
             open_n(DbPath, N - 1, [Conn | Acc]);
         {error, _} = Err ->
             close_each(Acc),
             Err
+    end.
+
+-spec connected(binary() | string()) -> {ok, esqlite3:esqlite3()} | {error, term()}.
+connected(DbPath) ->
+    case esqlite3:open(to_filename(DbPath)) of
+        {ok, Conn} ->
+            ok = esqlite3:exec(Conn, ~"PRAGMA foreign_keys = ON"),
+            {ok, Conn};
+        {error, _} = Error ->
+            Error
     end.
 
 -spec to_filename(binary() | string()) -> string().
