@@ -322,7 +322,7 @@ prepared(Conn, SQL, Params, Command) ->
 %% is refused rather than let through unchecked.
 -spec dependents(esqlite3:esqlite3(), binary(), words()) -> ok | {error, term()}.
 dependents(Conn, SQL, {~"DROP", ~"TABLE"}) ->
-    dropping(Conn, esqlite3:q(Conn, [~"EXPLAIN ", SQL]));
+    dropping(Conn, esqlite3:q(Conn, [~"EXPLAIN ", skipped(SQL)]));
 dependents(_Conn, _SQL, _Words) ->
     ok.
 
@@ -433,7 +433,8 @@ command_of(~"UPDATE") -> update;
 command_of(~"DELETE") -> delete;
 command_of(_Keyword) -> other.
 
-%% The first two keywords, upper-cased, past whitespace and comments.
+%% The first two keywords, upper-cased, past whitespace, comments and the
+%% empty statements SQLite skips.
 -spec leading_words(binary()) -> words().
 leading_words(SQL) ->
     {First, Rest} = word(skipped(SQL), ~""),
@@ -444,6 +445,8 @@ leading_words(SQL) ->
 skipped(<<Space, Rest/binary>>) when
     Space =:= $\s; Space =:= $\t; Space =:= $\n; Space =:= $\r; Space =:= $\f
 ->
+    skipped(Rest);
+skipped(<<$;, Rest/binary>>) ->
     skipped(Rest);
 skipped(<<"--", Rest/binary>>) ->
     skipped(past(Rest, ~"\n"));

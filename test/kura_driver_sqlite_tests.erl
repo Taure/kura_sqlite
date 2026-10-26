@@ -603,6 +603,21 @@ drop_after_comments_is_refused_test() ->
         ?assertMatch(#{rows := [#{id := 1}]}, sql(Pool, ~"SELECT id FROM parent"))
     end).
 
+drop_after_empty_statements_is_refused_test() ->
+    with_parent(fun(Pool) ->
+        Refused = {error, {referenced_by, ~"parent", [~"child"]}},
+        _ = [
+            ?assertEqual({SQL, Refused}, {SQL, sql(Pool, SQL)})
+         || SQL <- [
+                ~";DROP TABLE parent",
+                ~" ; DROP TABLE parent",
+                ~";;DROP TABLE parent",
+                ~"/*x*/;DROP TABLE parent"
+            ]
+        ],
+        ?assertMatch(#{rows := [#{parent_id := 1}]}, sql(Pool, ~"SELECT parent_id FROM child"))
+    end).
+
 command_is_read_past_comments_test() ->
     with_parent(fun(Pool) ->
         ?assertMatch(
