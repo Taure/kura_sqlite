@@ -1144,7 +1144,7 @@ read_only_file_is_opened_test() ->
 
 non_ascii_path_is_opened_and_created_test() ->
     Path = db_path(pool_for_non_ascii),
-    Name = <<(filename:rootname(Path))/binary, "_", "ö"/utf8, ".db">>,
+    Name = <<Path/binary, "_", "ö"/utf8>>,
     _ = file:delete(Name),
     try
         ?assertEqual({ok, [Name]}, opened_with(Name)),
