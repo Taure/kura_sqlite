@@ -139,7 +139,6 @@ the workload. esqlite sets 2 seconds by default.
         AND t.type = 'table'
         AND f."table" = ?1 COLLATE NOCASE
         AND t.name <> ?1 COLLATE NOCASE
-        AND (SELECT foreign_keys FROM pragma_foreign_keys) = 1
     ORDER BY t.name
     """
 ).
@@ -361,10 +360,22 @@ prepared(Conn, SQL, Params, Command) ->
 %% parser names the table: `EXPLAIN` compiles the statement without running
 %% it, and its DropTable instruction carries the schema and table.
 %% EXPLAIN output is not a stable interface, so a program in any other shape
-%% is refused rather than let through unchecked.
+%% is refused rather than let through unchecked. With foreign keys off the
+%% drop deletes no rows and nothing is checked.
 -spec dependents(esqlite3:esqlite3(), binary()) -> ok | {error, term()}.
 dependents(Conn, SQL) ->
-    dropping(Conn, prepared(Conn, iolist_to_binary([~"EXPLAIN ", skipped(SQL)]), [], other)).
+    case prepared(Conn, ~"PRAGMA foreign_keys", [], other) of
+        #{rows := [#{foreign_keys := 0}]} ->
+            ok;
+        #{rows := [#{foreign_keys := 1}]} ->
+            dropping(
+                Conn, prepared(Conn, iolist_to_binary([~"EXPLAIN ", skipped(SQL)]), [], other)
+            );
+        {error, _} = Error ->
+            Error;
+        #{} ->
+            {error, unrecognised_drop_table}
+    end.
 
 -spec dropping(esqlite3:esqlite3(), result()) -> ok | {error, term()}.
 dropping(Conn, #{rows := Program}) ->

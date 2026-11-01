@@ -551,6 +551,32 @@ drop_with_foreign_keys_off_is_not_checked_test() ->
         end
     end).
 
+drop_with_foreign_keys_off_is_not_explained_test() ->
+    with_parent(fun(Pool) ->
+        {ok, Conn, Token} = kura_pool_sqlite:checkout(Pool, #{}),
+        try
+            #{} = kura_driver_sqlite:query_on(Conn, ~"PRAGMA foreign_keys = OFF", [], #{}),
+            ?assertMatch(
+                {#{command := other}, [
+                    ~"BEGIN IMMEDIATE", ~"PRAGMA foreign_keys", ~"DROP TABLE parent", ~"COMMIT"
+                ]},
+                prepares(fun() ->
+                    kura_driver_sqlite:query_on(Conn, ~"DROP TABLE parent", [], #{})
+                end)
+            ),
+            #{} = kura_driver_sqlite:query_on(Conn, ~"BEGIN", [], #{}),
+            ?assertMatch(
+                {#{command := other}, [~"PRAGMA foreign_keys", ~"DROP TABLE child"]},
+                prepares(fun() ->
+                    kura_driver_sqlite:query_on(Conn, ~"DROP TABLE child", [], #{})
+                end)
+            ),
+            #{} = kura_driver_sqlite:query_on(Conn, ~"ROLLBACK", [], #{})
+        after
+            ok = kura_pool_sqlite:checkin(Pool, Token)
+        end
+    end).
+
 with_parent(Test) ->
     {Pool, Path} = nested_setup(file, 1),
     try
@@ -608,7 +634,7 @@ drop_is_not_run_when_the_reference_check_is_busy_test() ->
             ok = esqlite3:exec(Conn, ~"BEGIN"),
             ok = esqlite3:exec(Other, ~"BEGIN EXCLUSIVE"),
             ?assertEqual(
-                {{error, busy}, [~"EXPLAIN DROP TABLE parent", referencing]},
+                {{error, busy}, [~"PRAGMA foreign_keys", ~"EXPLAIN DROP TABLE parent", referencing]},
                 prepares(fun() ->
                     kura_driver_sqlite:query_on(Conn, ~"DROP TABLE parent", [], #{})
                 end)
@@ -661,7 +687,10 @@ drop_outside_a_transaction_shares_one_with_its_check_test() ->
         try
             ?assertEqual(
                 {{error, {referenced_by, ~"parent", [~"child"]}}, [
-                    ~"BEGIN IMMEDIATE", ~"EXPLAIN DROP TABLE parent", referencing
+                    ~"BEGIN IMMEDIATE",
+                    ~"PRAGMA foreign_keys",
+                    ~"EXPLAIN DROP TABLE parent",
+                    referencing
                 ]},
                 prepares(fun() ->
                     kura_driver_sqlite:query_on(Conn, ~"DROP TABLE parent", [], #{})
@@ -671,6 +700,7 @@ drop_outside_a_transaction_shares_one_with_its_check_test() ->
             ?assertMatch(
                 {#{command := other}, [
                     ~"BEGIN IMMEDIATE",
+                    ~"PRAGMA foreign_keys",
                     ~"EXPLAIN DROP TABLE child",
                     referencing,
                     ~"DROP TABLE child",
@@ -796,11 +826,15 @@ statement_without_a_readable_keyword_is_checked_as_a_drop_test() ->
         try
             Query = fun(SQL) -> kura_driver_sqlite:query_on(Conn, SQL, [], #{}) end,
             ?assertMatch(
-                {{error, _}, [~"BEGIN IMMEDIATE", ~"EXPLAIN (DROP TABLE parent)"]},
+                {{error, _}, [
+                    ~"BEGIN IMMEDIATE", ~"PRAGMA foreign_keys", ~"EXPLAIN (DROP TABLE parent)"
+                ]},
                 prepares(fun() -> Query(~"(DROP TABLE parent)") end)
             ),
             ?assertMatch(
-                {{error, _}, [~"BEGIN IMMEDIATE", ~"EXPLAIN DROP \"TABLE\" parent"]},
+                {{error, _}, [
+                    ~"BEGIN IMMEDIATE", ~"PRAGMA foreign_keys", ~"EXPLAIN DROP \"TABLE\" parent"
+                ]},
                 prepares(fun() -> Query(~"DROP \"TABLE\" parent") end)
             ),
             ?assert(esqlite3:get_autocommit(Conn)),
