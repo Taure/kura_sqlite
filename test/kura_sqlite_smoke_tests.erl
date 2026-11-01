@@ -11,6 +11,7 @@ smoke_test_() ->
             {"jsonb stored as TEXT, decoded back to map", fun jsonb_roundtrip/0},
             {"encrypted column emits BLOB", fun encrypted_ddl_blob/0},
             {"encrypted value round-trips through a BLOB column", fun encrypted_roundtrip/0},
+            {"NULL encrypted value reads back as undefined", fun encrypted_null_reads_undefined/0},
             {"bulk writes report the rows they changed", fun bulk_writes_report_rows_changed/0}
         ]
     end}.
@@ -136,6 +137,23 @@ encrypted_roundtrip() ->
     after
         kura_pool_sqlite:checkin(Name, Tk)
     end.
+
+encrypted_null_reads_undefined() ->
+    ok = vault_table(),
+    {ok, 2} = kura_repo_worker:insert_all(?REPO, kura_sqlite_vault_schema, [
+        #{secret => ~"kept", note => ~"a"},
+        #{secret => undefined, note => undefined}
+    ]),
+    Rows = kura_repo_worker:all(
+        ?REPO, kura_query:order_by(kura_query:from(kura_sqlite_vault_schema), [{id, asc}])
+    ),
+    ?assertMatch(
+        {ok, [
+            #{secret := ~"kept", note := ~"a"},
+            #{secret := undefined, note := undefined}
+        ]},
+        Rows
+    ).
 
 bulk_writes_report_rows_changed() ->
     ok = vault_table(),

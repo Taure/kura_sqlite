@@ -9,7 +9,8 @@ in use.
 ## Result shape
 
 Returns `#{rows := Rows, num_rows := N, command := C}`, the shape the
-other kura drivers return. `Rows` are maps keyed by atom column names.
+other kura drivers return. `Rows` are maps keyed by atom column names,
+and a NULL column value is `null`, as kura expects of every driver.
 `command` is one of
 `select | insert | update | delete | other` derived from the SQL
 prefix. `num_rows` is the number of rows returned, except for an
@@ -487,7 +488,12 @@ row_to_map([], _ColNames, Acc) ->
 row_to_map(_Row, [], Acc) ->
     Acc;
 row_to_map([Cell | RestRow], [Name | RestNames], Acc) ->
-    row_to_map(RestRow, RestNames, Acc#{name_to_atom(Name) => Cell}).
+    row_to_map(RestRow, RestNames, Acc#{name_to_atom(Name) => cell(Cell)}).
+
+%% kura reads a NULL column as `null`, which esqlite returns as `undefined`.
+-spec cell(term()) -> term().
+cell(undefined) -> null;
+cell(Cell) -> Cell.
 
 -spec name_to_atom(binary()) -> atom().
 name_to_atom(N) -> binary_to_atom(N, utf8).

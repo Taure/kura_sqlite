@@ -902,6 +902,40 @@ foreign_keys_turned_off_through_query_on_do_not_outlive_the_lease_test() ->
         ?assertMatch({error, _}, sql(Pool, ~"INSERT INTO child VALUES (42)"))
     end).
 
+null_is_null_in_every_column_type_test() ->
+    {Pool, Path} = nested_setup(memory, 1),
+    try
+        #{} = sql(
+            Pool,
+            ~"CREATE TABLE nulls (i INTEGER, r REAL, t TEXT, b BLOB, n NUMERIC, a ANY_AFFINITY)"
+        ),
+        #{} = sql(Pool, ~"INSERT INTO nulls VALUES (NULL, NULL, NULL, NULL, NULL, NULL)"),
+        ?assertEqual(
+            #{
+                rows => [#{i => null, r => null, t => null, b => null, n => null, a => null}],
+                num_rows => 1,
+                command => select
+            },
+            sql(Pool, ~"SELECT i, r, t, b, n, a FROM nulls")
+        ),
+        ?assertMatch(
+            #{rows := [#{i := null, t := ~"x"}]},
+            kura_driver_sqlite:query(
+                kura_pool_sqlite,
+                Pool,
+                ~"INSERT INTO nulls (i, t) VALUES (?1, ?2) RETURNING i, t",
+                [null, ~"x"],
+                #{}
+            )
+        ),
+        ?assertMatch(
+            #{rows := [#{i := null}]},
+            transaction(Pool, fun() -> sql(Pool, ~"SELECT i FROM nulls WHERE t = 'x'") end)
+        )
+    after
+        nested_teardown({Pool, Path})
+    end.
+
 write_without_returning_counts_the_rows_it_changed_test() ->
     {Pool, Path} = nested_setup(memory, 1),
     try
