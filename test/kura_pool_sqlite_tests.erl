@@ -1188,6 +1188,25 @@ created_database_is_not_group_or_world_writable_test() ->
         file:delete(Path)
     end.
 
+missing_file_in_a_read_only_directory_is_refused_and_not_created_test() ->
+    Dir = filename:join(os:getenv("TMPDIR", "/tmp"), "pool_for_read_only_directory"),
+    _ = file:del_dir_r(Dir),
+    ok = file:make_dir(Dir),
+    Path = iolist_to_binary(filename:join(Dir, "db")),
+    try
+        ok = file:change_mode(Dir, 8#555),
+        case file:read_file_info(Dir) of
+            {ok, #file_info{access = read}} ->
+                ?assertEqual({error, 14}, opened_with(Path)),
+                ?assertEqual({error, enoent}, file:read_link_info(Path));
+            {ok, #file_info{}} ->
+                ok
+        end
+    after
+        _ = file:change_mode(Dir, 8#755),
+        file:del_dir_r(Dir)
+    end.
+
 non_ascii_missing_directory_is_refused_before_esqlite_test() ->
     ?assertEqual({error, 14}, opened_with(<<"/nonexistent_", "ö"/utf8, "/x.db">>)).
 

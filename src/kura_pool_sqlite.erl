@@ -116,9 +116,10 @@ to it.
 
 esqlite frees the handle twice when an open fails, which can corrupt the
 memory of the whole node, so the pool checks a database path before
-esqlite sees it. A path must name a regular file the node can read, or
-one it can create; anything else, such as a directory, a missing
-directory or a dangling symbolic link, is refused with `{error, 14}`
+esqlite sees it. A path must name a regular file the node can read, or a
+missing file in a directory the node can write to, which SQLite then
+creates; anything else, such as a directory, a missing directory or a
+dangling symbolic link, is refused with `{error, 14}`
 (`SQLITE_CANTOPEN`). A `file:` URI is refused with
 `{error, uri_not_supported}`, and a path holding a NUL byte, or a string
 path holding a character above 255, with `{error, invalid_filename}`.
@@ -874,7 +875,7 @@ filename(Path) ->
 
 %% esqlite closes the handle twice when SQLite cannot open a file, which
 %% corrupts the heap of the whole node, so only a file that exists, or that
-%% could just be created, reaches it. A `file:` URI names a file only SQLite
+%% SQLite can create, reaches it. A `file:` URI names a file only SQLite
 %% can resolve.
 -spec openable(binary() | {error, invalid_filename}) ->
     {ok, binary()} | {error, invalid_filename | uri_not_supported | ?SQLITE_CANTOPEN}.
@@ -896,26 +897,16 @@ regular(Path, {ok, #file_info{type = regular, access = Access}}) when
     Access =:= read; Access =:= read_write
 ->
     {ok, Path};
+%% SQLite creates a missing file itself, 0644 less the umask, and fails the
+%% open if it cannot.
 regular(Path, {error, enoent}) ->
-    case file:open(Path, [write, exclusive, raw]) of
-        {ok, File} ->
-            ok = file:close(File),
-            created(Path, file:read_file_info(Path));
-        {error, _} ->
+    case {file:read_file_info(filename:dirname(Path)), file:read_link_info(Path)} of
+        {{ok, #file_info{type = directory, access = read_write}}, {error, enoent}} ->
+            {ok, Path};
+        {_, _} ->
             {error, ?SQLITE_CANTOPEN}
     end;
 regular(_Path, _Other) ->
-    {error, ?SQLITE_CANTOPEN}.
-
-%% `file:open/2` creates with 0666 less the umask, SQLite with 0644 less it.
--spec created(binary(), {ok, #file_info{}} | {error, term()}) ->
-    {ok, binary()} | {error, ?SQLITE_CANTOPEN}.
-created(Path, {ok, #file_info{mode = Mode}}) when is_integer(Mode) ->
-    case file:change_mode(Path, Mode band 8#644) of
-        ok -> {ok, Path};
-        {error, _} -> {error, ?SQLITE_CANTOPEN}
-    end;
-created(_Path, _Other) ->
     {error, ?SQLITE_CANTOPEN}.
 
 -spec foreign_keys_on({ok, esqlite3:esqlite3()} | {error, term()}) ->
