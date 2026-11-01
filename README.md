@@ -94,6 +94,24 @@ to start on this backend via `kura_capabilities:require/2`.
   if multiple checkouts must observe the same data, a shared-cache URI
   such as `<<"file:my_db?mode=memory&cache=shared">>`, or a file path.
 
+## Upgrading from 0.5
+
+- **`file:` URIs** are refused with `{error, uri_not_supported}`, except
+  the in-memory forms listed under Caveats. This breaks any other URI
+  `database` setting.
+- **Checkout waits** for a connection to come free, up to
+  `#{timeout => Ms}`, 5000 by default, instead of returning
+  `{error, no_conns}` at once. A caller whose time runs out gets
+  `{error, checkout_timeout}`; `#{timeout => 0}` keeps the old behaviour.
+- **`DROP TABLE`** on a table another table references is refused with
+  `{error, {referenced_by, Table, Referencing}}`, so a migration rollback
+  that drops a parent before its children fails instead of deleting the
+  children's rows.
+- **Busy database**: a statement that waits out the busy timeout returns
+  `{error, busy}` instead of crashing the caller. esqlite is now `~> 0.10`.
+- **Foreign keys** are on for every pooled connection, and the pool opens
+  only UTF-8 databases.
+
 ## License
 
 MIT.
