@@ -14,6 +14,13 @@ other kura drivers return. `Rows` are maps keyed by atom column names.
 `select | insert | update | delete | other` derived from the SQL
 prefix.
 
+## Parameters
+
+Parameters bind as esqlite binds them: a binary as TEXT, `{blob, Bin}` as
+a BLOB, and `undefined` or `null` as NULL. `kura_dialect_sqlite` passes
+the values of byte-typed schema fields as `{blob, Bin}`; raw SQL can do
+the same.
+
 ## Errors
 
 A statement that fails returns `{error, Reason}`, `Reason` being the

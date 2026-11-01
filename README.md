@@ -76,9 +76,14 @@ to start on this backend via `kura_capabilities:require/2`.
   already holds the last connection and checks out again waits for the
   whole timeout.
 - **UTF-8 only.** `start_pool/2` refuses a database in another encoding
-  with `{error, {unsupported_encoding, Encoding}}`. Binaries are stored as
-  TEXT, which a UTF-16 database transcodes, so encrypted fields would not
-  read back.
+  with `{error, {unsupported_encoding, Encoding}}`.
+- **Byte fields** (`binary`, `{encrypted, _}`, and `{custom, Mod}` types
+  whose `sqlite_type/0` is `BLOB`) are stored as BLOB, so `typeof(col)` is
+  `'blob'` and the bytes do not depend on the database encoding. Queries
+  on them compare against `CAST(? AS BLOB)`. Other binaries, including
+  every value written to a table named by atom or binary rather than a
+  schema, are stored as TEXT. In raw SQL, pass `{blob, Bin}` to bind a
+  BLOB.
 - **Database paths** must name a regular file the node can read, or a
   missing file in a directory the node can read and write, which SQLite
   then creates. A directory, a missing directory, a dangling symbolic link,
@@ -126,6 +131,10 @@ to start on this backend via `kura_capabilities:require/2`.
   `{error, busy}` instead of crashing the caller. esqlite is now `~> 0.10`.
 - **Foreign keys** are on for every pooled connection, and the pool opens
   only UTF-8 databases.
+- **Byte fields** are written as BLOB instead of TEXT. A row written
+  before holds TEXT, which a query on the field no longer matches.
+  Convert each such column once:
+  `UPDATE t SET col = CAST(col AS BLOB) WHERE typeof(col) = 'text'`.
 
 ## License
 
