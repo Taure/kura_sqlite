@@ -16,10 +16,15 @@ prefix.
 
 ## Parameters
 
-Parameters bind as esqlite binds them: a binary as TEXT, `{blob, Bin}` as
-a BLOB, and `undefined` or `null` as NULL. `kura_dialect_sqlite` passes
-the values of byte-typed schema fields as `{blob, Bin}`; raw SQL can do
-the same.
+Parameters bind by position: `undefined` or `null` as NULL, an integer
+as INTEGER, a float as REAL, a binary, string or iolist as TEXT, any
+other atom as the TEXT of its name, and `{blob, Bin}` as a BLOB.
+`{text, T}`, `{int, I}`, `{int64, I}` and `{float, F}` bind as esqlite
+binds them. `kura_dialect_sqlite` passes the values of byte-typed schema
+fields as `{blob, Bin}`; raw SQL can do the same. Any other parameter
+returns `{error, {unsupported_param, Index}}`, `Index` counting from 1.
+esqlite's named binding is not used, so no parameter can choose the
+placeholder it binds to.
 
 ## Byte columns
 
@@ -442,17 +447,46 @@ run_prepared(Stmt, Params, Cmd) ->
             Err
     end.
 
--spec bind_params(esqlite3:esqlite3_stmt(), [term()]) -> ok | {error, term()}.
-bind_params(Stmt, []) ->
-    case esqlite3:bind(Stmt, []) of
-        ok -> ok;
-        {error, _} = E -> E
-    end;
+%% Bound by position here rather than with esqlite3:bind/2, which binds by
+%% name when the first parameter is a 3-tuple or a {Name, Value} pair.
+%% Parameters are the caller's values, untyped; a list goes to esqlite to be
+%% read as iodata, as esqlite3:bind/2 passed it.
+-spec bind_params(esqlite3:esqlite3_stmt(), [dynamic()]) -> ok | {error, term()}.
 bind_params(Stmt, Params) ->
-    case esqlite3:bind(Stmt, Params) of
-        ok -> ok;
-        {error, _} = E -> E
+    bind_params(Stmt, 1, Params).
+
+-spec bind_params(esqlite3:esqlite3_stmt(), pos_integer(), [dynamic()]) -> ok | {error, term()}.
+bind_params(_Stmt, _Index, []) ->
+    ok;
+bind_params(Stmt, Index, [Param | Rest]) ->
+    case bind_param(Stmt, Index, Param) of
+        ok -> bind_params(Stmt, Index + 1, Rest);
+        {error, _} = Error -> Error
     end.
+
+-spec bind_param(esqlite3:esqlite3_stmt(), pos_integer(), dynamic()) -> ok | {error, term()}.
+bind_param(Stmt, Index, Null) when Null =:= null; Null =:= undefined ->
+    esqlite3:bind_null(Stmt, Index);
+bind_param(Stmt, Index, Int) when is_integer(Int) ->
+    esqlite3:bind_int64(Stmt, Index, Int);
+bind_param(Stmt, Index, Float) when is_float(Float) ->
+    esqlite3:bind_double(Stmt, Index, Float);
+bind_param(Stmt, Index, Text) when is_binary(Text); is_list(Text) ->
+    esqlite3:bind_text(Stmt, Index, Text);
+bind_param(Stmt, Index, Atom) when is_atom(Atom) ->
+    esqlite3:bind_text(Stmt, Index, atom_to_binary(Atom, utf8));
+bind_param(Stmt, Index, {blob, Bytes}) when is_binary(Bytes); is_list(Bytes) ->
+    esqlite3:bind_blob(Stmt, Index, Bytes);
+bind_param(Stmt, Index, {text, Text}) when is_binary(Text); is_list(Text) ->
+    esqlite3:bind_text(Stmt, Index, Text);
+bind_param(Stmt, Index, {int, Int}) when is_integer(Int) ->
+    esqlite3:bind_int(Stmt, Index, Int);
+bind_param(Stmt, Index, {int64, Int}) when is_integer(Int) ->
+    esqlite3:bind_int64(Stmt, Index, Int);
+bind_param(Stmt, Index, {float, Float}) when is_float(Float) ->
+    esqlite3:bind_double(Stmt, Index, Float);
+bind_param(_Stmt, Index, _Param) ->
+    {error, {unsupported_param, Index}}.
 
 %% The process dictionary is untyped; what is stored is the connection put
 %% there by the outermost transaction.

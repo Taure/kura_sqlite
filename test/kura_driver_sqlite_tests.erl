@@ -901,3 +901,56 @@ foreign_keys_turned_off_through_query_on_do_not_outlive_the_lease_test() ->
         ),
         ?assertMatch({error, _}, sql(Pool, ~"INSERT INTO child VALUES (42)"))
     end).
+
+%%----------------------------------------------------------------------
+%% Parameters bind by position
+%%----------------------------------------------------------------------
+
+with_conn(Fun) ->
+    {ok, _} = application:ensure_all_started(esqlite),
+    {ok, Conn} = esqlite3:open(":memory:"),
+    try
+        Fun(Conn)
+    after
+        esqlite3:close(Conn)
+    end.
+
+bound(Params) ->
+    with_conn(fun(Conn) ->
+        SQL = ~"SELECT typeof(?1) AS t1, ?1 AS v1, typeof(?2) AS t2, ?2 AS v2",
+        kura_driver_sqlite:query_on(Conn, SQL, Params, #{})
+    end).
+
+params_bind_by_position_test_() ->
+    Cases = [
+        {[null, undefined], {~"null", undefined}, {~"null", undefined}},
+        {[{blob, ~"b"}, ~"t"], {~"blob", ~"b"}, {~"text", ~"t"}},
+        {[1, 2.5], {~"integer", 1}, {~"real", 2.5}},
+        {["chars", [~"io", "list"]], {~"text", ~"chars"}, {~"text", ~"iolist"}},
+        {[true, false], {~"text", ~"true"}, {~"text", ~"false"}},
+        {[{text, ~"t"}, {int64, 7}], {~"text", ~"t"}, {~"integer", 7}},
+        {[{int, 3}, {float, 1.5}], {~"integer", 3}, {~"real", 1.5}}
+    ],
+    [
+        ?_assertMatch(
+            #{rows := [#{t1 := T1, v1 := V1, t2 := T2, v2 := V2}]}, bound(Params)
+        )
+     || {Params, {T1, V1}, {T2, V2}} <- Cases
+    ].
+
+%% esqlite3:bind/2 binds by name when the first parameter is a 3-tuple or a
+%% {Name, Value} pair, which would let a value pick its own position.
+params_shaped_like_named_binds_are_refused_test_() ->
+    [
+        ?_assertEqual(
+            {error, {unsupported_param, 1}}, bound([{~"?2", ~"secret"}, {~"?1", ~"x"}])
+        ),
+        ?_assertEqual(
+            {error, {unsupported_param, 1}}, bound([{text, ~"?2", ~"secret"}, ~"x"])
+        ),
+        ?_assertEqual({error, {unsupported_param, 1}}, bound([{"?2", ~"secret"}, ~"x"])),
+        ?_assertEqual({error, {unsupported_param, 2}}, bound([1, {a, b, c}])),
+        ?_assertEqual({error, {unsupported_param, 2}}, bound([1, #{a => ~"secret"}])),
+        ?_assertEqual({error, {unsupported_param, 1}}, bound([{blob, 1}, 2])),
+        ?_assertEqual({error, {unsupported_param, 1}}, bound([{int, ~"1"}, 2]))
+    ].

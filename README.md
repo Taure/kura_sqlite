@@ -152,6 +152,10 @@ to start on this backend via `kura_capabilities:require/2`.
   `{error, busy}` instead of crashing the caller. esqlite is now `~> 0.10`.
 - **Foreign keys** are on for every pooled connection, and the pool opens
   only UTF-8 databases.
+- **Parameters** bind by position only. A `{Name, Value}` or
+  `{Type, Name, Value}` parameter, which esqlite took as a named bind when
+  it came first, and any other value the driver cannot bind, returns
+  `{error, {unsupported_param, Index}}` instead of binding or crashing.
 - **Byte fields** are written as BLOB instead of TEXT. A row written
   before holds TEXT, which a query on the field no longer matches, and a
   UNIQUE index treats TEXT `'abc'` and BLOB `'abc'` as different values.
