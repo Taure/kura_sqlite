@@ -80,10 +80,21 @@ to start on this backend via `kura_capabilities:require/2`.
   TEXT, which a UTF-16 database transcodes, so encrypted fields would not
   read back.
 - **Database paths** must name a regular file the node can read, or a
-  missing file in a directory the node can write to, which SQLite then
-  creates. A directory, a missing directory, a dangling symbolic link, or
+  missing file in a directory the node can read and write, which SQLite
+  then creates. A directory, a missing directory, a dangling symbolic link,
   a path that comes to 500 bytes or more once made absolute and its
-  symbolic links followed is refused with `{error, 14}`.
+  symbolic links followed, or one that takes more than 100 symbolic links
+  is refused with `{error, 14}`. A path holding a NUL byte, or a string
+  path holding a character above 255, is refused with
+  `{error, invalid_filename}`.
+- **Failed opens.** esqlite 0.10.0 frees the handle twice when an open
+  fails, which can corrupt the node's memory. The path checks keep bad
+  paths away from it, but an open can still fail on a good path, for
+  example when the node runs out of file descriptors. Give the node a
+  generous `nofile` limit. The fix is in mmzeeman/esqlite#108.
+- **In-memory `file:` URIs** need an esqlite built with
+  `SQLITE_USE_URI`, as the default build is. Without it SQLite treats the
+  URI as a file name.
 - **`file:` URIs** are refused with `{error, uri_not_supported}`, since
   SQLite resolves them in ways the pool cannot check before opening. The
   in-memory forms are allowed: `file::memory:`, optionally with
@@ -106,7 +117,11 @@ to start on this backend via `kura_capabilities:require/2`.
 - **`DROP TABLE`** on a table another table references is refused with
   `{error, {referenced_by, Table, Referencing}}`, so a migration rollback
   that drops a parent before its children fails instead of deleting the
-  children's rows.
+  children's rows. A `DROP TABLE` the check cannot read is refused with
+  `{error, unrecognised_drop_table}`, and outside a transaction the check
+  and the drop run in one `BEGIN IMMEDIATE` transaction.
+- **Dangling symbolic links** as the database path are refused with
+  `{error, 14}`. SQLite used to follow the link and create its target.
 - **Busy database**: a statement that waits out the busy timeout returns
   `{error, busy}` instead of crashing the caller. esqlite is now `~> 0.10`.
 - **Foreign keys** are on for every pooled connection, and the pool opens

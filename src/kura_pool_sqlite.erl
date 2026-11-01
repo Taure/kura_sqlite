@@ -97,7 +97,7 @@ runs every statement on it, or support from esqlite.
 
 `checkout/2` waits up to `#{timeout => Ms}`, 5000 by default, for a
 connection to come free; `infinity` waits for as long as it takes, and
-so does a timeout longer than an Erlang timer can run.
+so does a timeout within 500 ms of the Erlang timer limit.
 Callers wait in the order they came, and a connection that comes back, or
 one opened in place of a dropped one, goes to the first of them. A caller
 whose time runs out gets `{error, checkout_timeout}`, and one that dies
@@ -123,14 +123,18 @@ after the caller stopped waiting is not lost to it.
 esqlite frees the handle twice when an open fails, which can corrupt the
 memory of the whole node, so the pool checks a database path before
 esqlite sees it. A path must name a regular file the node can read, or a
-missing file in a directory the node can write to, which SQLite then
-creates; anything else, such as a directory, a missing directory or a
+missing file in a directory the node can read and write, which SQLite
+then creates; anything else, such as a directory, a missing directory or a
 dangling symbolic link, is refused with `{error, 14}`
 (`SQLITE_CANTOPEN`). So is a path SQLite could not resolve: one that,
 made absolute and with its symbolic links followed, comes to 500 bytes or
 more, or takes more than 100 symbolic links. A path holding a NUL byte,
 or a string path holding a character above 255, is refused with
 `{error, invalid_filename}`. `":memory:"` and `""` open as they are.
+The checks cannot stop an open that fails on a path that passed them: the
+path changed between the check and the open, or the node ran out of file
+descriptors or memory. Those still reach the esqlite bug until esqlite
+fixes it.
 
 SQLite resolves a `file:` URI itself, so the pool cannot check what one
 names, and refuses it with `{error, uri_not_supported}`. The in-memory
