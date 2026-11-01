@@ -900,11 +900,22 @@ regular(Path, {error, enoent}) ->
     case file:open(Path, [write, exclusive, raw]) of
         {ok, File} ->
             ok = file:close(File),
-            {ok, Path};
+            created(Path, file:read_file_info(Path));
         {error, _} ->
             {error, ?SQLITE_CANTOPEN}
     end;
 regular(_Path, _Other) ->
+    {error, ?SQLITE_CANTOPEN}.
+
+%% `file:open/2` creates with 0666 less the umask, SQLite with 0644 less it.
+-spec created(binary(), {ok, #file_info{}} | {error, term()}) ->
+    {ok, binary()} | {error, ?SQLITE_CANTOPEN}.
+created(Path, {ok, #file_info{mode = Mode}}) when is_integer(Mode) ->
+    case file:change_mode(Path, Mode band 8#644) of
+        ok -> {ok, Path};
+        {error, _} -> {error, ?SQLITE_CANTOPEN}
+    end;
+created(_Path, _Other) ->
     {error, ?SQLITE_CANTOPEN}.
 
 -spec foreign_keys_on({ok, esqlite3:esqlite3()} | {error, term()}) ->

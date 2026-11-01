@@ -1177,6 +1177,17 @@ non_ascii_path_is_opened_and_created_test() ->
         file:delete(Name)
     end.
 
+created_database_is_not_group_or_world_writable_test() ->
+    Path = db_path(pool_for_created_mode),
+    _ = file:delete(Path),
+    try
+        ?assertEqual({ok, [Path]}, opened_with(Path)),
+        {ok, #file_info{mode = Mode}} = file:read_file_info(Path),
+        ?assertEqual(0, Mode band 8#133)
+    after
+        file:delete(Path)
+    end.
+
 non_ascii_missing_directory_is_refused_before_esqlite_test() ->
     ?assertEqual({error, 14}, opened_with(<<"/nonexistent_", "ö"/utf8, "/x.db">>)).
 
