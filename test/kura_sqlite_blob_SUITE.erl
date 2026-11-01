@@ -23,7 +23,8 @@ text fields stay TEXT (Taure/kura#141).
     unique_text_and_blob_duplicate_is_found_and_resolved/1,
     exclusion_on_a_joined_blob_column_matches/1,
     migrated_byte_columns_refuse_text/1,
-    check_blob_columns_finds_text_rows/1
+    check_blob_columns_finds_text_rows/1,
+    byte_column_default_is_stored_as_blob/1
 ]).
 
 -define(REPO, kura_sqlite_blob_test_repo).
@@ -45,7 +46,8 @@ all() ->
         unique_text_and_blob_duplicate_is_found_and_resolved,
         exclusion_on_a_joined_blob_column_matches,
         migrated_byte_columns_refuse_text,
-        check_blob_columns_finds_text_rows
+        check_blob_columns_finds_text_rows,
+        byte_column_default_is_stored_as_blob
     ].
 
 init_per_suite(Config) ->
@@ -267,6 +269,38 @@ check_blob_columns_finds_text_rows(_Config) ->
         {error, [{check_failed, ~"owners", _, _}]},
         kura_sqlite:check_blob_columns(?REPO, [kura_sqlite_owner_bytes_schema])
     ).
+
+%% A text default would be refused by the column's CHECK on every insert that
+%% leaves the column out.
+byte_column_default_is_stored_as_blob(_Config) ->
+    Create = kura_migrator:compile_operation(
+        ?REPO,
+        {create_table, ~"dflt", [
+            #kura_column{name = id, type = id, primary_key = true, nullable = false},
+            #kura_column{name = data, type = binary, default = ~"abc"}
+        ]}
+    ),
+    #{} = kura_db:query(?REPO, Create, []),
+    try
+        ?assertMatch(#{}, kura_db:query(?REPO, ~"INSERT INTO dflt (id) VALUES (1)", [])),
+        ?assertMatch(
+            #{rows := [#{t := ~"blob", data := ~"abc"}]},
+            kura_db:query(?REPO, ~"SELECT typeof(data) AS t, data FROM dflt", [])
+        ),
+        Alter = kura_migrator:compile_operation(
+            ?REPO,
+            {alter_table, ~"dflt", [
+                {add_column, #kura_column{name = extra, type = binary, default = ~""}}
+            ]}
+        ),
+        ?assertMatch(#{}, kura_db:query(?REPO, Alter, [])),
+        ?assertMatch(
+            #{rows := [#{t := ~"blob"}]},
+            kura_db:query(?REPO, ~"SELECT typeof(extra) AS t FROM dflt", [])
+        )
+    after
+        #{} = kura_db:query(?REPO, ~"DROP TABLE dflt", [])
+    end.
 
 where(Condition) ->
     kura_query:where(kura_query:from(?SCHEMA), Condition).

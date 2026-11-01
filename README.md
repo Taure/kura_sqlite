@@ -95,9 +95,8 @@ to start on this backend via `kura_capabilities:require/2`.
   with `create_table` or `add_column`, is declared
   `BLOB CHECK (typeof(col) IN ('blob', 'null'))`, so a TEXT value written
   by raw SQL is refused rather than stored next to a BLOB with the same
-  bytes. The check is left off a column whose name contains `?`. A text
-  `default` on such a column is a TEXT value too, and is refused when a
-  row takes it.
+  bytes, and its `default` is written as a BLOB literal of the same bytes.
+  The check is left off a column whose name contains `?`.
 - **Joins and CTEs by name.** A `from` or join target named by atom or
   binary rather than a schema module, or a CTE, has no field types, so a
   where-condition on one of its BLOB columns binds TEXT. SQLite orders

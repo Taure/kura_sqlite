@@ -404,6 +404,48 @@ blob_checks_constrain_byte_columns_test_() ->
     ],
     [?_assertEqual({ok, Out}, kura_dialect_sqlite:blob_checks(In)) || {In, Out} <- Cases].
 
+blob_checks_store_a_byte_column_default_as_blob_test_() ->
+    Blob = kura_dialect_sqlite:column_type(binary),
+    Check = ~"BLOB CHECK (typeof(\"d\") IN ('blob', 'null'))",
+    Cases = [
+        {~" NOT NULL DEFAULT 'abc')", ~" NOT NULL DEFAULT X'616263')"},
+        {
+            ~" PRIMARY KEY NOT NULL DEFAULT 'a''b', \"e\" TEXT DEFAULT 'x')",
+            ~" PRIMARY KEY NOT NULL DEFAULT X'612762', \"e\" TEXT DEFAULT 'x')"
+        },
+        {~" DEFAULT ''", ~" DEFAULT X''"},
+        {
+            ~" DEFAULT -1.5e+00 REFERENCES \"o\"(\"id\"))",
+            ~" DEFAULT X'2D312E35652B3030' REFERENCES \"o\"(\"id\"))"
+        }
+    ],
+    [
+        ?_assertEqual(
+            {ok, <<"CREATE TABLE \"t\" (\"d\" ", Check/binary, Out/binary>>},
+            kura_dialect_sqlite:blob_checks(
+                <<"CREATE TABLE \"t\" (\"d\" ", Blob/binary, In/binary>>
+            )
+        )
+     || {In, Out} <- Cases
+    ].
+
+blob_checks_refuse_a_default_they_cannot_read_test_() ->
+    Blob = kura_dialect_sqlite:column_type(binary),
+    [
+        ?_assertEqual(
+            {error, unrecognised_blob_default},
+            kura_dialect_sqlite:blob_checks(
+                <<"CREATE TABLE \"t\" (\"d\" ", Blob/binary, In/binary>>
+            )
+        )
+     || In <- [~" DEFAULT 'abc", ~" DEFAULT x'00')", ~" DEFAULT (1))"]
+    ].
+
+blob_checks_leave_the_default_of_a_placeholder_column_test() ->
+    Blob = kura_dialect_sqlite:column_type(binary),
+    SQL = <<"CREATE TABLE \"t\" (\"d?\" ", Blob/binary, " DEFAULT 'abc')">>,
+    ?assertEqual({ok, SQL}, kura_dialect_sqlite:blob_checks(SQL)).
+
 %% A byte column whose name the rewrite cannot find would be left without its
 %% CHECK, so the statement is refused.
 blob_checks_refuse_a_marker_without_a_column_name_test_() ->

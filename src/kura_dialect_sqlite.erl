@@ -272,8 +272,14 @@ TEXT, is left without the check. A marker inside a quoted literal or
 identifier is not a column. A marker that does not follow a quoted column
 name returns `{error, unrecognised_blob_column}`, rather than leave a byte
 column without its check.
+
+The column's default, which `kura_migrator` writes as a TEXT literal the
+check would refuse, is written as a BLOB literal of the same bytes. A
+default that is neither a quoted literal nor a number returns
+`{error, unrecognised_blob_default}`.
 """.
--spec blob_checks(binary()) -> {ok, binary()} | {error, unrecognised_blob_column}.
+-spec blob_checks(binary()) ->
+    {ok, binary()} | {error, unrecognised_blob_column | unrecognised_blob_default}.
 blob_checks(SQL) ->
     case binary:match(SQL, ?BLOB_COLUMN) of
         nomatch -> {ok, SQL};
@@ -283,12 +289,12 @@ blob_checks(SQL) ->
 %% kura_migrator writes a column as `"name" Type`, so a marker follows the
 %% last quoted name read and a space.
 -spec checked(binary(), binary(), binary() | none) ->
-    {ok, binary()} | {error, unrecognised_blob_column}.
+    {ok, binary()} | {error, unrecognised_blob_column | unrecognised_blob_default}.
 checked(<<>>, Acc, _Name) ->
     {ok, Acc};
 checked(<<?BLOB_MARKER, Rest/binary>>, Acc, Name) when is_binary(Name) ->
     case binary:longest_common_suffix([Acc, <<Name/binary, " ">>]) =:= byte_size(Name) + 1 of
-        true -> checked(Rest, <<Acc/binary, (blob_column(Name))/binary>>, none);
+        true -> blob_column(Name, Rest, Acc);
         false -> {error, unrecognised_blob_column}
     end;
 checked(<<?BLOB_MARKER, _/binary>>, _Acc, none) ->
@@ -314,12 +320,74 @@ quoted(<<Byte, Rest/binary>>, Quote, Acc) ->
 quoted(<<>>, _Quote, Acc) ->
     {Acc, <<>>}.
 
--spec blob_column(binary()) -> binary().
-blob_column(Name) ->
-    case binary:match(Name, ~"?") of
-        nomatch -> <<"BLOB CHECK (typeof(", Name/binary, ") IN ('blob', 'null'))">>;
-        _ -> ?BLOB_COLUMN
+-spec blob_column(binary(), binary(), binary()) ->
+    {ok, binary()} | {error, unrecognised_blob_column | unrecognised_blob_default}.
+blob_column(Name, Rest, Acc) ->
+    case {binary:match(Name, ~"?"), blob_default(Rest)} of
+        {nomatch, {ok, Constraints, Tail}} ->
+            Check = <<"BLOB CHECK (typeof(", Name/binary, ") IN ('blob', 'null'))">>,
+            checked(Tail, <<Acc/binary, Check/binary, Constraints/binary>>, none);
+        {nomatch, {error, _} = Error} ->
+            Error;
+        {_, _} ->
+            checked(Rest, <<Acc/binary, ?BLOB_MARKER>>, none)
     end.
+
+%% kura_migrator writes a column's constraints as
+%% `[ PRIMARY KEY][ NOT NULL][ DEFAULT Value]...`. A default is written as a
+%% TEXT literal, which the CHECK would refuse, so it becomes a BLOB literal
+%% of the same bytes.
+-spec blob_default(binary()) -> {ok, binary(), binary()} | {error, unrecognised_blob_default}.
+blob_default(Rest) ->
+    {Kept, After} = leading(Rest, [~" PRIMARY KEY", ~" NOT NULL"], <<>>),
+    case After of
+        <<" DEFAULT ", Default/binary>> ->
+            case default_bytes(Default) of
+                {ok, Bytes, Tail} ->
+                    Hex = binary:encode_hex(Bytes),
+                    {ok, <<Kept/binary, " DEFAULT X'", Hex/binary, "'">>, Tail};
+                error ->
+                    {error, unrecognised_blob_default}
+            end;
+        _ ->
+            {ok, Kept, After}
+    end.
+
+-spec leading(binary(), [binary()], binary()) -> {binary(), binary()}.
+leading(SQL, [], Acc) ->
+    {Acc, SQL};
+leading(SQL, [Word | Words], Acc) ->
+    Size = byte_size(Word),
+    case SQL of
+        <<Word:Size/binary, Rest/binary>> -> leading(Rest, Words, <<Acc/binary, Word/binary>>);
+        _ -> leading(SQL, Words, Acc)
+    end.
+
+-spec default_bytes(binary()) -> {ok, binary(), binary()} | error.
+default_bytes(<<$', Rest/binary>>) ->
+    literal(Rest, <<>>);
+default_bytes(Default) ->
+    number(Default, <<>>).
+
+-spec literal(binary(), binary()) -> {ok, binary(), binary()} | error.
+literal(<<$', $', Rest/binary>>, Acc) ->
+    literal(Rest, <<Acc/binary, $'>>);
+literal(<<$', Rest/binary>>, Acc) ->
+    {ok, Acc, Rest};
+literal(<<Byte, Rest/binary>>, Acc) ->
+    literal(Rest, <<Acc/binary, Byte>>);
+literal(<<>>, _Acc) ->
+    error.
+
+-spec number(binary(), binary()) -> {ok, binary(), binary()} | error.
+number(<<Byte, Rest/binary>>, Acc) when
+    Byte >= $0, Byte =< $9; Byte =:= $-; Byte =:= $+; Byte =:= $.; Byte =:= $e; Byte =:= $E
+->
+    number(Rest, <<Acc/binary, Byte>>);
+number(_Rest, <<>>) ->
+    error;
+number(Rest, Acc) ->
+    {ok, Acc, Rest}.
 
 -doc """
 The fields of a schema stored in BLOB columns, in field order, leaving out
