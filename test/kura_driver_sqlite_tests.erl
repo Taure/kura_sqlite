@@ -1081,3 +1081,25 @@ keyword_inside_common_table_expressions_is_not_the_command_test() ->
     after
         nested_teardown({Pool, Path})
     end.
+
+nesting_quotes_and_comments_inside_a_cte_body_are_skipped_test() ->
+    {Pool, Path} = nested_setup(memory, 1),
+    try
+        #{num_rows := 2} = sql(Pool, ~"INSERT INTO nested VALUES (1), (2)"),
+        ?assertMatch(
+            #{rows := [], num_rows := 1, command := delete},
+            sql(
+                Pool,
+                ~"""
+                WITH a AS (
+                    SELECT max(id) AS m, ') x' AS s, 1 AS ")", 1 AS `)`, 1 AS [)] -- ) select
+                    FROM nested
+                )
+                DELETE FROM nested WHERE id IN (SELECT m FROM a)
+                """
+            )
+        ),
+        ?assertEqual([1], ids(Pool))
+    after
+        nested_teardown({Pool, Path})
+    end.
