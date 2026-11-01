@@ -28,7 +28,7 @@ jobs:
       pull-requests: write
     with:
       version-file: '.tool-versions'
-      enable-ct: false
+      enable-ct: true
       enable-ex-doc: true
       enable-hank: true
       enable-sheldon: false
