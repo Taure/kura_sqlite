@@ -19,7 +19,8 @@ text fields stay TEXT (Taure/kura#141).
     delete_all_matches_a_blob/1,
     text_rows_converted_with_cast_match/1,
     first_query_on_an_unloaded_custom_type_casts/1,
-    unique_text_and_blob_duplicate_is_found_and_resolved/1
+    unique_text_and_blob_duplicate_is_found_and_resolved/1,
+    exclusion_on_a_joined_blob_column_matches/1
 ]).
 
 -define(REPO, kura_sqlite_blob_test_repo).
@@ -38,7 +39,8 @@ all() ->
         delete_all_matches_a_blob,
         text_rows_converted_with_cast_match,
         first_query_on_an_unloaded_custom_type_casts,
-        unique_text_and_blob_duplicate_is_found_and_resolved
+        unique_text_and_blob_duplicate_is_found_and_resolved,
+        exclusion_on_a_joined_blob_column_matches
     ].
 
 init_per_suite(Config) ->
@@ -180,6 +182,31 @@ unique_text_and_blob_duplicate_is_found_and_resolved(_Config) ->
     #{} = kura_db:query(?REPO, ~"DELETE FROM vault WHERE rowid = ?1", [TextRow]),
     #{} = kura_db:query(?REPO, ?CONVERT, []),
     ?assertMatch({ok, [#{name := ~"new"}]}, kura_repo_worker:all(?REPO, where({data, ?BYTES}))).
+
+%% A where-field is not qualified by its table, so a byte column of a joined
+%% schema is cast like one of the `from` schema.
+exclusion_on_a_joined_blob_column_matches(_Config) ->
+    #{} = kura_db:query(
+        ?REPO, ~"CREATE TABLE owners (owner_id INTEGER PRIMARY KEY, label TEXT)", []
+    ),
+    try
+        #{} = kura_db:query(?REPO, ~"INSERT INTO owners VALUES (1, 'revoked'), (2, 'good')", []),
+        {ok, #{id := 1}} = insert(#{id => 1, name => ~"n", data => ?BYTES}),
+        {ok, #{id := 2}} = insert(#{id => 2, name => ~"n", data => ~"other"}),
+        Joined = kura_query:join(
+            kura_query:from(kura_sqlite_owner_schema), inner, ?SCHEMA, {owner_id, id}
+        ),
+        Labels = fun(Condition) ->
+            {ok, Rows} = kura_repo_worker:all(?REPO, kura_query:where(Joined, Condition)),
+            [Label || #{label := Label} <- Rows]
+        end,
+        ?assertEqual([~"good"], Labels({data, '!=', ?BYTES})),
+        ?assertEqual([~"good"], Labels({data, not_in, [?BYTES]})),
+        ?assertEqual([~"good"], Labels({'not', {data, ?BYTES}})),
+        ?assertEqual([~"revoked"], Labels({data, ?BYTES}))
+    after
+        #{} = kura_db:query(?REPO, ~"DROP TABLE owners", [])
+    end.
 
 where(Condition) ->
     kura_query:where(kura_query:from(?SCHEMA), Condition).

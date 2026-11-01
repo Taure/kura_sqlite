@@ -49,8 +49,15 @@ These binaries still bind as TEXT:
   table whose `join_through` is a binary.
 - values for a field whose name contains `?`, which a fragment would read
   as a placeholder.
-- a where-condition on a byte column of a joined table. Only the fields of
-  the query's `from` schema are looked up.
+- a where-condition on a byte column of a table named by atom or binary
+  rather than a schema module, either as the query's `from` or as a join,
+  or on a column of a CTE. With no field types there is nothing to cast,
+  and SQLite orders every BLOB after every TEXT value, so on such a column
+  `!=`, `not_in`, `NOT (=)`, `>` and `>=` match every row and `=`, `in`,
+  `<` and `<=` match none.
+
+The byte fields of the `from` schema and of every joined schema are
+rewritten, since a where-field is not qualified by its table.
 
 A condition on a byte field with an operator the rewrite cannot cast
 raises `{kura_sqlite, {unsupported_blob_condition, Field, Op}}`. `like`,
@@ -304,14 +311,23 @@ blob_type(_Type) -> false.
 %% A query compiled once is reused with other values, so the cast is written
 %% into the SQL rather than into the parameters.
 -spec blob_query(#kura_query{}) -> #kura_query{}.
-blob_query(#kura_query{from = From, wheres = Wheres, havings = Havings} = Query) ->
-    Blobs = blob_fields(From),
+blob_query(#kura_query{from = From, joins = Joins, wheres = Wheres, havings = Havings} = Query) ->
+    Blobs = joined_blob_fields([From | [Table || {_Type, Table, _On, _As} <- Joins]]),
     Query#kura_query{
         wheres = blob_conditions(Wheres, Blobs),
         havings = blob_conditions(Havings, Blobs),
         ctes = blob_named(Query#kura_query.ctes),
         combinations = blob_named(Query#kura_query.combinations)
     }.
+
+%% A where-field is not qualified by its table, so the byte fields of every
+%% joined schema are rewritten too. A name in two of the tables is an
+%% ambiguous column to SQLite.
+-spec joined_blob_fields([term()]) -> #{atom() => kura_types:kura_type()}.
+joined_blob_fields([]) ->
+    #{};
+joined_blob_fields([Table | Rest]) ->
+    maps:merge(blob_fields(Table), joined_blob_fields(Rest)).
 
 -spec blob_named([{Name, #kura_query{}}]) -> [{Name, #kura_query{}}].
 blob_named(Queries) ->

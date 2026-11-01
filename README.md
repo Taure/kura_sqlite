@@ -80,12 +80,19 @@ to start on this backend via `kura_capabilities:require/2`.
 - **Byte fields** (`binary`, `{encrypted, _}`, and `{custom, Mod}` types
   whose `sqlite_type/0` is `BLOB`) are stored as BLOB, so `typeof(col)` is
   `'blob'` and the bytes do not depend on the database encoding. Queries
-  on them compare against `CAST(? AS BLOB)`. Other binaries are stored as
-  TEXT, and so are these: values written to a table named by atom or
-  binary rather than a schema (including a many-to-many join table whose
-  `join_through` is a binary), values of a field whose name contains `?`,
-  and values in a where-condition on a joined table's byte column. In raw
-  SQL, pass `{blob, Bin}` to bind a BLOB.
+  on them compare against `CAST(? AS BLOB)`, including conditions on a
+  byte column of a joined schema. Other binaries are stored as TEXT, and
+  so are these: values written to a table named by atom or binary rather
+  than a schema (including a many-to-many join table whose `join_through`
+  is a binary), and values of a field whose name contains `?`. In raw SQL,
+  pass `{blob, Bin}` to bind a BLOB.
+- **Joins and CTEs by name.** A `from` or join target named by atom or
+  binary rather than a schema module, or a CTE, has no field types, so a
+  where-condition on one of its BLOB columns binds TEXT. SQLite orders
+  every BLOB after every TEXT value, so on such a column the exclusion
+  operators `!=`, `not_in` and `NOT (=)`, and `>` and `>=`, match every
+  row, while `=`, `in`, `<` and `<=` match none. Join the schema module,
+  or write the condition as a fragment with `CAST(? AS BLOB)`.
 - **Database paths** must name a regular file the node can read, or a
   missing file in a directory the node can read and write, which SQLite
   then creates. A directory, a missing directory, a dangling symbolic link,

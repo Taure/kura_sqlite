@@ -210,6 +210,27 @@ where_on_byte_field_casts_placeholder_test_() ->
      || {Condition, Where, Params} <- Cases
     ].
 
+where_on_joined_byte_field_casts_placeholder_test_() ->
+    Joined = kura_query:join(
+        kura_query:from(kura_sqlite_owner_schema), inner, ?BLOB_SCHEMA, {owner_id, id}
+    ),
+    Cases = [
+        {{data, '!=', ~"d"}, <<"\"data\" != CAST(?1 AS BLOB)">>},
+        {{data, not_in, [~"d"]}, <<"\"data\" NOT IN (CAST(?1 AS BLOB))">>},
+        {{'not', {data, ~"d"}}, <<"NOT (\"data\" = CAST(?1 AS BLOB))">>},
+        {{label, ~"d"}, <<"\"label\" = ?1">>}
+    ],
+    [
+        ?_assertEqual({Where, [~"d"]}, where_sql(Joined, Condition))
+     || {Condition, Where} <- Cases
+    ].
+
+where_on_byte_field_of_a_table_joined_by_name_is_untouched_test() ->
+    Joined = kura_query:join(
+        kura_query:from(kura_sqlite_owner_schema), inner, vault, {owner_id, id}
+    ),
+    ?assertEqual({<<"\"data\" != ?1">>, [~"d"]}, where_sql(Joined, {data, '!=', ~"d"})).
+
 where_on_text_field_is_untouched_test() ->
     ?assertEqual({<<"\"name\" = ?1">>, [~"n"]}, where_sql({name, ~"n"})).
 
@@ -233,8 +254,10 @@ delete_all_casts_where_test() ->
     ).
 
 where_sql(Condition) ->
-    Q = kura_query:where(kura_query:from(?BLOB_SCHEMA), Condition),
-    {SQL, Params} = kura_dialect_sqlite:to_sql(Q),
+    where_sql(kura_query:from(?BLOB_SCHEMA), Condition).
+
+where_sql(Query, Condition) ->
+    {SQL, Params} = kura_dialect_sqlite:to_sql(kura_query:where(Query, Condition)),
     [_, Where] = binary:split(iolist_to_binary(SQL), ~" WHERE "),
     {Where, Params}.
 
