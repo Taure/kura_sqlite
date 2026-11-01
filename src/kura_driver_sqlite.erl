@@ -430,10 +430,14 @@ tx_conn(Pool) ->
     [#{atom() => term()}] | {error, term()}.
 collect_rows(Stmt, ColNames) ->
     case esqlite3:step(Stmt) of
-        %% esqlite3_nif:step/1's spec leaves out '$busy', which esqlite3:step/1
-        %% returns, so dialyzer would take a clause for it as unreachable.
+        %% A '$busy' clause would be unreachable to dialyzer: esqlite3_nif's
+        %% step/1 spec leaves it out.
         Finished when is_atom(Finished) ->
-            maps:get(Finished, #{'$done' => [], '$busy' => {error, busy}});
+            maps:get(
+                Finished,
+                #{'$done' => [], '$busy' => {error, busy}},
+                {error, {unexpected_step, Finished}}
+            );
         {error, _} = Err ->
             Err;
         Row when is_list(Row) ->
@@ -465,8 +469,6 @@ command_of(~"UPDATE") -> update;
 command_of(~"DELETE") -> delete;
 command_of(_Keyword) -> other.
 
-%% The first two keywords, upper-cased, past whitespace, comments and the
-%% empty statements SQLite skips.
 -spec leading_words(binary()) -> words().
 leading_words(SQL) ->
     {First, Rest} = word(skipped(SQL), ~""),

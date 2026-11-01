@@ -754,7 +754,8 @@ drop_after_empty_statements_is_refused_test() ->
                 ~";DROP TABLE parent",
                 ~" ; DROP TABLE parent",
                 ~";;DROP TABLE parent",
-                ~"/*x*/;DROP TABLE parent"
+                ~"/*x*/;DROP TABLE parent",
+                ~"DROP/**/TABLE parent"
             ]
         ],
         ?assertMatch(#{rows := [#{parent_id := 1}]}, sql(Pool, ~"SELECT parent_id FROM child"))
