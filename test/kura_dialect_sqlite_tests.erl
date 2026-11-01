@@ -256,3 +256,78 @@ utf16_database_keeps_inserted_bytes_test() ->
     after
         esqlite3:close(Conn)
     end.
+
+custom_blob_type_is_wrapped_test() ->
+    {_SQL, Params} = kura_dialect_sqlite:insert(
+        ?BLOB_SCHEMA, [digest, tag], #{digest => ~"d", tag => ~"t"}
+    ),
+    ?assertEqual([{blob, ~"d"}, ~"t"], Params).
+
+insert_into_non_schema_module_is_untouched_test() ->
+    {_SQL, Params} = kura_dialect_sqlite:insert(lists, [data], #{data => ~"d"}),
+    ?assertEqual([~"d"], Params).
+
+insert_all_with_opts_wraps_every_row_test() ->
+    {_SQL, Params} = kura_dialect_sqlite:insert_all(
+        ?BLOB_SCHEMA, [data], [#{data => ~"1"}, #{data => ~"2"}], #{returning => true}
+    ),
+    ?assertEqual([{blob, ~"1"}, {blob, ~"2"}], Params).
+
+where_and_on_byte_field_casts_test() ->
+    ?assertEqual(
+        {<<"(\"data\" = CAST(?1 AS BLOB) AND \"name\" = ?2)">>, [~"a", ~"n"]},
+        where_sql({'and', [{data, ~"a"}, {name, ~"n"}]})
+    ).
+
+where_exists_casts_inner_query_test() ->
+    Sub = kura_query:where(kura_query:from(?BLOB_SCHEMA), {data, ~"d"}),
+    {SQL, Params} = kura_dialect_sqlite:to_sql(
+        kura_query:where(kura_query:from(?BLOB_SCHEMA), {not_exists, {subquery, Sub}})
+    ),
+    ?assertNotEqual(
+        nomatch, binary:match(iolist_to_binary(SQL), ~"WHERE \"data\" = CAST(?1 AS BLOB))")
+    ),
+    ?assertEqual([~"d"], Params).
+
+where_row_in_without_byte_field_is_untouched_test() ->
+    ?assertEqual(
+        {<<"(\"id\", \"name\") IN ((?1, ?2))">>, [1, ~"n"]},
+        where_sql({[id, name], in, [{1, ~"n"}]})
+    ).
+
+where_row_in_with_wrong_arity_is_left_to_kura_test() ->
+    Q = kura_query:where(kura_query:from(?BLOB_SCHEMA), {[id, data], in, [{1, ~"a"}, {1}]}),
+    ?assertEqual(
+        compiled(fun() ->
+            {SQL, Params} = kura_dialect_pg:to_sql(Q),
+            {kura_dialect_sqlite:swap_placeholders(SQL), Params}
+        end),
+        compiled(fun() -> kura_dialect_sqlite:to_sql(Q) end)
+    ).
+
+compiled(Compile) ->
+    try Compile() of
+        {SQL, Params} -> {iolist_to_binary(SQL), Params}
+    catch
+        error:Reason -> {error, Reason}
+    end.
+
+to_sql_from_casts_and_numbers_from_start_test() ->
+    Q = kura_query:where(kura_query:from(?BLOB_SCHEMA), {data, ~"d"}),
+    {SQL, Params, Next} = kura_dialect_sqlite:to_sql_from(Q, 3),
+    ?assertNotEqual(nomatch, binary:match(iolist_to_binary(SQL), ~"\"data\" = CAST(?3 AS BLOB)")),
+    ?assertEqual({[~"d"], 4}, {Params, Next}).
+
+where_exists_casts_test() ->
+    Sub = kura_query:where(kura_query:from(?BLOB_SCHEMA), {data, ~"d"}),
+    {SQL, _} = kura_dialect_sqlite:to_sql(
+        kura_query:where(kura_query:from(?BLOB_SCHEMA), {exists, {subquery, Sub}})
+    ),
+    ?assertNotEqual(nomatch, binary:match(iolist_to_binary(SQL), ~"CAST(?1 AS BLOB)")).
+
+cte_and_union_cast_test() ->
+    Byte = kura_query:where(kura_query:from(?BLOB_SCHEMA), {data, ~"d"}),
+    Q = kura_query:union(kura_query:with_cte(Byte, ~"c", Byte), Byte),
+    {SQL, Params} = kura_dialect_sqlite:to_sql(Q),
+    Casts = binary:matches(iolist_to_binary(SQL), ~"AS BLOB)"),
+    ?assertEqual({3, [~"d", ~"d", ~"d"]}, {length(Casts), Params}).
