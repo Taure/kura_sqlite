@@ -122,10 +122,19 @@ creates; anything else, such as a directory, a missing directory or a
 dangling symbolic link, is refused with `{error, 14}`
 (`SQLITE_CANTOPEN`). So is a path SQLite could not resolve: one that,
 made absolute and with its symbolic links followed, comes to 500 bytes or
-more, or takes more than 100 symbolic links. A `file:` URI is refused with
-`{error, uri_not_supported}`, and a path holding a NUL byte, or a string
-path holding a character above 255, with `{error, invalid_filename}`.
-`":memory:"` and `""` open as they are.
+more, or takes more than 100 symbolic links. A path holding a NUL byte,
+or a string path holding a character above 255, is refused with
+`{error, invalid_filename}`. `":memory:"` and `""` open as they are.
+
+SQLite resolves a `file:` URI itself, so the pool cannot check what one
+names, and refuses it with `{error, uri_not_supported}`. The in-memory
+forms, which touch no file, are let through: `file::memory:`, optionally
+followed by `?cache=shared` or `?cache=private`, and `file:Name?mode=memory`,
+`Name` made of ASCII letters, digits, `_`, `-` and `.`, with
+`cache=shared` or `cache=private` as the only other parameter, in either
+order. With `cache=shared` every connection of the pool, and any other
+connection in the node opened with the same URI, shares one database,
+which lasts as long as one of them is open.
 
 A restarted pool opens new connections. Connections leased before the
 restart are no longer the pool's: their checkins are ignored, and they
@@ -880,15 +889,18 @@ filename(Path) ->
 %% esqlite closes the handle twice when SQLite cannot open a file, which
 %% corrupts the heap of the whole node, so only a file that exists, or that
 %% SQLite can create, reaches it. A `file:` URI names a file only SQLite
-%% can resolve.
+%% can resolve, so only the in-memory forms that touch no file pass.
 -spec openable(binary() | {error, invalid_filename}) ->
     {ok, binary()} | {error, invalid_filename | uri_not_supported | ?SQLITE_CANTOPEN}.
 openable({error, _} = Invalid) ->
     Invalid;
 openable(Memory) when Memory =:= ~":memory:"; Memory =:= ~"" ->
     {ok, Memory};
-openable(<<"file:", _/binary>>) ->
-    {error, uri_not_supported};
+openable(<<"file:", Uri/binary>> = Memory) ->
+    case in_memory(binary:split(Uri, ~"?")) of
+        true -> {ok, Memory};
+        false -> {error, uri_not_supported}
+    end;
 openable(Path) ->
     case binary:match(Path, <<0>>) of
         nomatch -> reachable(Path);
@@ -1002,6 +1014,38 @@ regular(Path, {error, enoent}) ->
     end;
 regular(_Path, _Other) ->
     {error, ?SQLITE_CANTOPEN}.
+
+-spec in_memory([binary()]) -> boolean().
+in_memory([~":memory:"]) ->
+    true;
+in_memory([~":memory:", Cache]) ->
+    cache(Cache);
+in_memory([Name, Query]) ->
+    plain(Name) andalso memory_mode(binary:split(Query, ~"&", [global]));
+in_memory(_Uri) ->
+    false.
+
+-spec memory_mode([binary()]) -> boolean().
+memory_mode([~"mode=memory"]) -> true;
+memory_mode([~"mode=memory", Cache]) -> cache(Cache);
+memory_mode([Cache, ~"mode=memory"]) -> cache(Cache);
+memory_mode(_Query) -> false.
+
+-spec cache(binary()) -> boolean().
+cache(Cache) ->
+    Cache =:= ~"cache=shared" orelse Cache =:= ~"cache=private".
+
+-spec plain(binary()) -> boolean().
+plain(Name) ->
+    Name =/= ~"" andalso
+        [
+            Char
+         || <<Char>> <= Name,
+            not (Char >= $a andalso Char =< $z),
+            not (Char >= $A andalso Char =< $Z),
+            not (Char >= $0 andalso Char =< $9),
+            not lists:member(Char, [$_, $-, $.])
+        ] =:= [].
 
 -spec foreign_keys_on({ok, esqlite3:esqlite3()} | {error, term()}) ->
     {ok, esqlite3:esqlite3()} | {error, term()}.

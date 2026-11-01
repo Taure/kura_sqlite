@@ -1120,7 +1120,57 @@ file_uri_is_refused_before_esqlite_test() ->
     _ = file:delete(Path),
     ?assertEqual({error, uri_not_supported}, opened_with(<<"file:", Path/binary>>)),
     ?assertEqual({error, uri_not_supported}, opened_with(~"file:/nonexistent_dir/x.db")),
+    _ = [
+        ?assertEqual({Uri, {error, uri_not_supported}}, {Uri, opened_with(Uri)})
+     || Uri <- [
+            ~"file:x.db",
+            ~"file:",
+            ~"file:?mode=memory",
+            ~"file::memory:?",
+            ~"file::memory:?cache=shared&mode=rw",
+            ~"file::memory:?mode=memory",
+            ~"file::memory:?cache=shared#x",
+            ~"file:mem?mode=ro",
+            ~"file:mem?mode=memory&vfs=unix",
+            ~"file:mem?mode=memory&cache=shared&cache=private",
+            ~"file:mem?mode=memory&",
+            ~"file:mem?mode=memory#x",
+            ~"file:mem%41?mode=memory",
+            ~"file:/mem?mode=memory",
+            ~"file://host/mem?mode=memory"
+        ]
+    ],
     ?assertNot(filelib:is_file(Path)).
+
+in_memory_file_uri_is_opened_test() ->
+    _ = [
+        ?assertEqual({Uri, {ok, [Uri]}}, {Uri, opened_with(Uri)})
+     || Uri <- [
+            ~"file::memory:",
+            ~"file::memory:?cache=shared",
+            ~"file::memory:?cache=private",
+            ~"file:kura_mem?mode=memory",
+            ~"file:kura.mem-1?mode=memory&cache=shared",
+            ~"file:kura_mem?cache=private&mode=memory"
+        ]
+    ].
+
+shared_cache_memory_database_is_shared_by_the_pool_test() ->
+    Name = pool_for_shared_memory,
+    {ok, _} = kura_pool_sqlite:start_pool(Name, #{
+        database => ~"file:kura_pool_shared?mode=memory&cache=shared", pool_size => 2
+    }),
+    try
+        {ok, One, OneToken} = kura_pool_sqlite:checkout(Name, #{}),
+        {ok, Two, TwoToken} = kura_pool_sqlite:checkout(Name, #{}),
+        ?assertNotEqual(One, Two),
+        ok = esqlite3:exec(One, ~"CREATE TABLE shared (id INTEGER); INSERT INTO shared VALUES (1)"),
+        ?assertEqual([[1]], esqlite3:q(Two, ~"SELECT id FROM shared")),
+        ok = kura_pool_sqlite:checkin(Name, OneToken),
+        ok = kura_pool_sqlite:checkin(Name, TwoToken)
+    after
+        kura_pool_sqlite:stop_pool(Name)
+    end.
 
 dangling_symlink_is_refused_before_esqlite_test() ->
     Link = db_path(pool_for_dangling_symlink),

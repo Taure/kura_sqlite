@@ -75,13 +75,20 @@ to start on this backend via `kura_capabilities:require/2`.
   with `{error, {unsupported_encoding, Encoding}}`. Binaries are stored as
   TEXT, which a UTF-16 database transcodes, so encrypted fields would not
   read back.
-- **Database paths** must name a regular file the node can read, or one
-  it can create. A directory, a missing directory or a dangling symbolic
-  link is refused with `{error, 14}`. `file:` URIs are refused with
-  `{error, uri_not_supported}`, since SQLite resolves them in ways the
-  pool cannot check before opening.
+- **Database paths** must name a regular file the node can read, or a
+  missing file in a directory the node can write to, which SQLite then
+  creates. A directory, a missing directory, a dangling symbolic link, or
+  a path that comes to 500 bytes or more once made absolute and its
+  symbolic links followed is refused with `{error, 14}`.
+- **`file:` URIs** are refused with `{error, uri_not_supported}`, since
+  SQLite resolves them in ways the pool cannot check before opening. The
+  in-memory forms are allowed: `file::memory:`, optionally with
+  `?cache=shared` or `?cache=private`, and `file:Name?mode=memory`, `Name`
+  made of ASCII letters, digits, `_`, `-` and `.`, optionally with
+  `cache=shared` or `cache=private`.
 - **In-memory** (`<<":memory:">>`) is per-connection. Use `pool_size: 1`
-  if multiple checkouts must observe the same data, or use a file path.
+  if multiple checkouts must observe the same data, a shared-cache URI
+  such as `<<"file:my_db?mode=memory&cache=shared">>`, or a file path.
 
 ## License
 
