@@ -110,7 +110,8 @@ passed through unchanged.
 %% column_type/1 of a byte column. The comment is the marker blob_checks/1
 %% replaces, since a column's CHECK names it and column_type/1 is not given
 %% the name.
--define(BLOB_COLUMN, ~"BLOB /* kura_sqlite: blob */").
+-define(BLOB_MARKER, "BLOB /* kura_sqlite: blob */").
+-define(BLOB_COLUMN, <<?BLOB_MARKER>>).
 %% kura's ?KURA_IS_UNARY_OP, which the pinned kura does not define yet.
 -define(IS_UNARY_OP(Op), (Op =:= is_nil orelse Op =:= is_not_nil)).
 -define(IS_COMPARISON(Op),
@@ -267,68 +268,57 @@ defines, found by the marker `column_type/1` writes for it.
 A UNIQUE index treats TEXT and BLOB holding the same bytes as different
 values, so a TEXT row in a byte column could be shadowed by a BLOB row
 with the same bytes. A column whose name holds `?`, whose values bind as
-TEXT, is left without the check.
+TEXT, is left without the check. A marker inside a quoted literal or
+identifier is not a column. A marker that does not follow a quoted column
+name returns `{error, unrecognised_blob_column}`, rather than leave a byte
+column without its check.
 """.
--spec blob_checks(binary()) -> binary().
+-spec blob_checks(binary()) -> {ok, binary()} | {error, unrecognised_blob_column}.
 blob_checks(SQL) ->
-    case binary:split(SQL, ?BLOB_COLUMN, [global]) of
-        [SQL] -> SQL;
-        Parts -> iolist_to_binary(checked(Parts))
+    case binary:match(SQL, ?BLOB_COLUMN) of
+        nomatch -> {ok, SQL};
+        _ -> checked(SQL, <<>>, none)
     end.
 
--spec checked([binary()]) -> [binary()].
-checked([Last]) ->
-    [Last];
-checked([Before | Rest]) ->
-    [Before, blob_column(quoted_column(Before)) | checked(Rest)].
-
--spec blob_column({ok, binary()} | error) -> binary().
-blob_column({ok, Quoted}) ->
-    <<"BLOB CHECK (typeof(", Quoted/binary, ") IN ('blob', 'null'))">>;
-blob_column(error) ->
-    ?BLOB_COLUMN.
-
-%% kura_migrator writes a column as `"name" Type`, so the text before the
-%% marker ends with the quoted name and a space.
--spec quoted_column(binary()) -> {ok, binary()} | error.
-quoted_column(Before) ->
-    Size = byte_size(Before),
-    case Size >= 3 andalso binary:part(Before, Size - 2, 2) =:= ~"\" " of
-        true -> opening_quote(Before, Size - 3, Size - 2);
-        false -> error
-    end.
-
-%% Inside a quoted name a quote is doubled, so walking back from the closing
-%% quote, the opening one ends the first run of an odd number of quotes.
--spec opening_quote(binary(), integer(), non_neg_integer()) -> {ok, binary()} | error.
-opening_quote(_SQL, Pos, _Close) when Pos < 0 ->
-    error;
-opening_quote(SQL, Pos, Close) ->
-    case binary:at(SQL, Pos) of
-        $" ->
-            Start = run_start(SQL, Pos),
-            case (Pos - Start) rem 2 of
-                0 -> without_placeholder(binary:part(SQL, Start, Close - Start + 1));
-                1 -> opening_quote(SQL, Start - 1, Close)
-            end;
-        _ ->
-            opening_quote(SQL, Pos - 1, Close)
-    end.
-
--spec run_start(binary(), non_neg_integer()) -> non_neg_integer().
-run_start(SQL, Pos) when Pos > 0 ->
-    case binary:at(SQL, Pos - 1) of
-        $" -> run_start(SQL, Pos - 1);
-        _ -> Pos
+%% kura_migrator writes a column as `"name" Type`, so a marker follows the
+%% last quoted name read and a space.
+-spec checked(binary(), binary(), binary() | none) ->
+    {ok, binary()} | {error, unrecognised_blob_column}.
+checked(<<>>, Acc, _Name) ->
+    {ok, Acc};
+checked(<<?BLOB_MARKER, Rest/binary>>, Acc, Name) when is_binary(Name) ->
+    case binary:longest_common_suffix([Acc, <<Name/binary, " ">>]) =:= byte_size(Name) + 1 of
+        true -> checked(Rest, <<Acc/binary, (blob_column(Name))/binary>>, none);
+        false -> {error, unrecognised_blob_column}
     end;
-run_start(_SQL, Pos) ->
-    Pos.
+checked(<<?BLOB_MARKER, _/binary>>, _Acc, none) ->
+    {error, unrecognised_blob_column};
+checked(<<Quote, Rest/binary>>, Acc, Name) when Quote =:= $'; Quote =:= $" ->
+    {Quoted, Tail} = quoted(Rest, Quote, <<Quote>>),
+    case Quote of
+        $" -> checked(Tail, <<Acc/binary, Quoted/binary>>, Quoted);
+        $' -> checked(Tail, <<Acc/binary, Quoted/binary>>, Name)
+    end;
+checked(<<Byte, Rest/binary>>, Acc, Name) ->
+    checked(Rest, <<Acc/binary, Byte>>, Name).
 
--spec without_placeholder(binary()) -> {ok, binary()} | error.
-without_placeholder(Quoted) ->
-    case binary:match(Quoted, ~"?") of
-        nomatch -> {ok, Quoted};
-        _ -> error
+%% A quoted literal or identifier, the quote doubled inside it. An
+%% unterminated one runs to the end, and SQLite refuses the statement.
+-spec quoted(binary(), byte(), binary()) -> {binary(), binary()}.
+quoted(<<First, Second, Rest/binary>>, Quote, Acc) when First =:= Quote, Second =:= Quote ->
+    quoted(Rest, Quote, <<Acc/binary, Quote, Quote>>);
+quoted(<<First, Rest/binary>>, Quote, Acc) when First =:= Quote ->
+    {<<Acc/binary, Quote>>, Rest};
+quoted(<<Byte, Rest/binary>>, Quote, Acc) ->
+    quoted(Rest, Quote, <<Acc/binary, Byte>>);
+quoted(<<>>, _Quote, Acc) ->
+    {Acc, <<>>}.
+
+-spec blob_column(binary()) -> binary().
+blob_column(Name) ->
+    case binary:match(Name, ~"?") of
+        nomatch -> <<"BLOB CHECK (typeof(", Name/binary, ") IN ('blob', 'null'))">>;
+        _ -> ?BLOB_COLUMN
     end.
 
 -doc """

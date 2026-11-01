@@ -391,12 +391,32 @@ blob_checks_constrain_byte_columns_test_() ->
             <<"CREATE TABLE \"t\" (\"a?\" ", Blob/binary, ")">>,
             <<"CREATE TABLE \"t\" (\"a?\" ", Blob/binary, ")">>
         },
-        {<<"ALTER TABLE \"t\" ALTER COLUMN \"c\" TYPE ", Blob/binary>>, <<
-            "ALTER TABLE \"t\" ALTER COLUMN \"c\" TYPE ", Blob/binary
-        >>},
+        {
+            <<"CREATE TABLE \"t\" (\"a\" TEXT DEFAULT '\"x\" ", Blob/binary, "')">>,
+            <<"CREATE TABLE \"t\" (\"a\" TEXT DEFAULT '\"x\" ", Blob/binary, "')">>
+        },
+        {
+            <<"CREATE TABLE \"t\" (\"a\" TEXT DEFAULT 'it''s', \"b\" ", Blob/binary, ")">>,
+            <<"CREATE TABLE \"t\" (\"a\" TEXT DEFAULT 'it''s', \"b\" ", (Check(~"\"b\""))/binary,
+                ")">>
+        },
         {~"CREATE TABLE \"t\" (\"data\" BLOB)", ~"CREATE TABLE \"t\" (\"data\" BLOB)"}
     ],
-    [?_assertEqual(Out, kura_dialect_sqlite:blob_checks(In)) || {In, Out} <- Cases].
+    [?_assertEqual({ok, Out}, kura_dialect_sqlite:blob_checks(In)) || {In, Out} <- Cases].
+
+%% A byte column whose name the rewrite cannot find would be left without its
+%% CHECK, so the statement is refused.
+blob_checks_refuse_a_marker_without_a_column_name_test_() ->
+    Blob = kura_dialect_sqlite:column_type(binary),
+    [
+        ?_assertEqual({error, unrecognised_blob_column}, kura_dialect_sqlite:blob_checks(SQL))
+     || SQL <- [
+            <<"ALTER TABLE \"t\" ALTER COLUMN \"c\" TYPE ", Blob/binary>>,
+            <<"CREATE TABLE t (c ", Blob/binary, ")">>,
+            <<"CREATE TABLE \"t\" (\"c\"", Blob/binary, ")">>,
+            Blob
+        ]
+    ].
 
 unload(Mod) ->
     _ = code:purge(Mod),

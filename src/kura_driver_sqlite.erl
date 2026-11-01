@@ -30,7 +30,9 @@ placeholder it binds to.
 
 A byte column that `kura_migrator` creates, in `CREATE TABLE` or
 `ALTER TABLE ... ADD COLUMN`, gets `CHECK (typeof(col) IN ('blob',
-'null'))`; see `kura_dialect_sqlite:blob_checks/1`.
+'null'))`; see `kura_dialect_sqlite:blob_checks/1`. A statement holding a
+byte column whose name cannot be read returns
+`{error, unrecognised_blob_column}`.
 
 ## Errors
 
@@ -333,7 +335,10 @@ run(Conn, SQL, {First, Second}, Params) when
         {_, false} -> dropped(Conn, SQL, Params)
     end;
 run(Conn, SQL, {First, _}, Params) when First =:= ~"CREATE"; First =:= ~"ALTER" ->
-    prepared(Conn, kura_dialect_sqlite:blob_checks(SQL), Params, other);
+    case kura_dialect_sqlite:blob_checks(SQL) of
+        {ok, Checked} -> prepared(Conn, Checked, Params, other);
+        {error, _} = Error -> Error
+    end;
 run(Conn, SQL, {First, _}, Params) ->
     prepared(Conn, SQL, Params, command_of(First)).
 

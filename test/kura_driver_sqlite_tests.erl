@@ -954,3 +954,12 @@ params_shaped_like_named_binds_are_refused_test_() ->
         ?_assertEqual({error, {unsupported_param, 1}}, bound([{blob, 1}, 2])),
         ?_assertEqual({error, {unsupported_param, 1}}, bound([{int, ~"1"}, 2]))
     ].
+
+unrecognised_blob_column_is_refused_test() ->
+    Blob = kura_dialect_sqlite:column_type(binary),
+    ?assertEqual(
+        {error, unrecognised_blob_column},
+        with_conn(fun(Conn) ->
+            kura_driver_sqlite:query_on(Conn, <<"CREATE TABLE t (c ", Blob/binary, ")">>, [], #{})
+        end)
+    ).
