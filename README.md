@@ -132,9 +132,42 @@ to start on this backend via `kura_capabilities:require/2`.
 - **Foreign keys** are on for every pooled connection, and the pool opens
   only UTF-8 databases.
 - **Byte fields** are written as BLOB instead of TEXT. A row written
-  before holds TEXT, which a query on the field no longer matches.
-  Convert each such column once:
-  `UPDATE t SET col = CAST(col AS BLOB) WHERE typeof(col) = 'text'`.
+  before holds TEXT, which a query on the field no longer matches, and a
+  UNIQUE index treats TEXT `'abc'` and BLOB `'abc'` as different values.
+  So until a column is converted, an upsert whose conflict target is that
+  column misses the old row and inserts a second one. See below for how
+  to convert, and how to handle rows written before converting.
+
+### Converting byte columns
+
+Convert every `binary`, `{encrypted, _}` and BLOB custom column before
+the new version writes anything. The safest way is a kura migration
+that ships in the same deploy, so it runs before any other write:
+
+```erlang
+up() ->
+    [{execute, ~"UPDATE t SET col = CAST(col AS BLOB) WHERE typeof(col) = 'text'"}].
+
+down() ->
+    [].
+```
+
+On a UTF-8 database the cast keeps the bytes exactly as they are.
+
+If the new version has already written to a UNIQUE column, the column
+can hold the same bytes twice, once as TEXT and once as BLOB, and the
+conversion fails with `UNIQUE constraint failed`. To list the pairs:
+
+```sql
+SELECT old.rowid AS text_row, new.rowid AS blob_row
+FROM t AS old
+JOIN t AS new ON new.col = CAST(old.col AS BLOB)
+WHERE typeof(old.col) = 'text' AND typeof(new.col) = 'blob';
+```
+
+For each pair, keep one row and delete the other, first moving over
+anything that references the row you delete. The BLOB row is the newer
+one. Then run the conversion.
 
 ## License
 

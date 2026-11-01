@@ -18,11 +18,13 @@ text fields stay TEXT (Taure/kura#141).
     insert_all_stores_blob/1,
     delete_all_matches_a_blob/1,
     text_rows_converted_with_cast_match/1,
-    first_query_on_an_unloaded_custom_type_casts/1
+    first_query_on_an_unloaded_custom_type_casts/1,
+    unique_text_and_blob_duplicate_is_found_and_resolved/1
 ]).
 
 -define(REPO, kura_sqlite_blob_test_repo).
 -define(SCHEMA, kura_sqlite_blob_schema).
+-define(CONVERT, ~"UPDATE vault SET data = CAST(data AS BLOB) WHERE typeof(data) = 'text'").
 -define(BYTES, <<0, 255, 254, 128, $a, 0, 192, 193>>).
 
 all() ->
@@ -35,7 +37,8 @@ all() ->
         insert_all_stores_blob,
         delete_all_matches_a_blob,
         text_rows_converted_with_cast_match,
-        first_query_on_an_unloaded_custom_type_casts
+        first_query_on_an_unloaded_custom_type_casts,
+        unique_text_and_blob_duplicate_is_found_and_resolved
     ].
 
 init_per_suite(Config) ->
@@ -135,9 +138,7 @@ text_rows_converted_with_cast_match(_Config) ->
         ?BYTES, {blob, element(2, kura_types:dump({encrypted, string}, ~"s"))}
     ]),
     ?assertEqual([], ids({data, ?BYTES})),
-    #{} = kura_db:query(
-        ?REPO, ~"UPDATE vault SET data = CAST(data AS BLOB) WHERE typeof(data) = 'text'", []
-    ),
+    #{} = kura_db:query(?REPO, ?CONVERT, []),
     ?assertEqual([#{name => ~"text", data => ~"blob", secret => ~"blob"}], storage_classes()),
     ?assertMatch([_], ids({data, ?BYTES})).
 
@@ -153,6 +154,35 @@ first_query_on_an_unloaded_custom_type_casts(_Config) ->
     Q = kura_query:where(kura_query:from(kura_sqlite_lazy_schema), {digest, ?BYTES}),
     ?assertMatch({ok, [_]}, kura_repo_worker:all(?REPO, Q)),
     ?assertMatch({ok, [_]}, kura_repo_worker:all(?REPO, Q)).
+
+%% A UNIQUE index treats TEXT and BLOB as different values, so an upsert
+%% written before the conversion adds a second row and the conversion then
+%% fails. The README's query lists the pair.
+unique_text_and_blob_duplicate_is_found_and_resolved(_Config) ->
+    #{} = kura_db:query(?REPO, ~"CREATE UNIQUE INDEX vault_data ON vault (data)", []),
+    #{} = kura_db:query(?REPO, ~"INSERT INTO vault (name, data) VALUES ('old', ?1)", [?BYTES]),
+    CS = kura_changeset:cast(?SCHEMA, #{}, #{name => ~"new", data => ?BYTES, secret => ~"s"}, [
+        name, data, secret
+    ]),
+    {ok, _} = kura_repo_worker:insert(?REPO, CS, #{on_conflict => {data, nothing}}),
+    ?assertMatch(#{rows := [_, _]}, kura_db:query(?REPO, ~"SELECT id FROM vault", [])),
+    ?assertMatch({error, _}, kura_db:query(?REPO, ?CONVERT, [])),
+    #{rows := [#{text_row := TextRow, blob_row := _}]} = kura_db:query(
+        ?REPO,
+        ~"""
+        SELECT old.rowid AS text_row, new.rowid AS blob_row
+        FROM vault AS old
+        JOIN vault AS new ON new.data = CAST(old.data AS BLOB)
+        WHERE typeof(old.data) = 'text' AND typeof(new.data) = 'blob'
+        """,
+        []
+    ),
+    #{} = kura_db:query(?REPO, ~"DELETE FROM vault WHERE rowid = ?1", [TextRow]),
+    #{} = kura_db:query(?REPO, ?CONVERT, []),
+    ?assertMatch({ok, [#{name := ~"new"}]}, kura_repo_worker:all(?REPO, where({data, ?BYTES}))).
+
+where(Condition) ->
+    kura_query:where(kura_query:from(?SCHEMA), Condition).
 
 insert(Params0) ->
     Params = maps:merge(#{secret => ~"s"}, Params0),
