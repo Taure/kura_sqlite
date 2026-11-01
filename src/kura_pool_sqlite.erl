@@ -337,7 +337,7 @@ init({Name, DbPath, Size, Supervisor}) ->
 -spec handle_call(request(), gen_server:from(), state()) ->
     {reply, term(), state()} | {noreply, state()}.
 handle_call({checkout, Borrower, Lease, Deadline}, From, State0) ->
-    case replenished(State0) of
+    case served(replenished(State0)) of
         State = #{name := Name, available := [Conn | Rest]} ->
             Monitor = erlang:monitor(process, Borrower),
             {reply, {ok, Conn, {Name, Conn, Lease}},
@@ -464,7 +464,6 @@ call(Name, Request, Timeout) ->
             {exit, shutdown}
     end.
 
-%% A wait longer than a timer or a call can run is as good as no limit.
 -spec wait(kura_pool:checkout_opts()) -> timeout().
 wait(#{timeout := Wait}) when is_integer(Wait), Wait > ?MAX_WAIT ->
     infinity;

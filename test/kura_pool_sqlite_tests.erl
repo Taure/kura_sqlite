@@ -856,6 +856,30 @@ connection_that_could_not_be_replaced_is_opened_on_checkout_test() ->
         file:del_dir_r(Dir)
     end.
 
+connection_opened_late_goes_to_a_waiter_first_test() ->
+    Dir = filename:join(os:getenv("TMPDIR", "/tmp"), "pool_for_late_reopen_waiter"),
+    _ = file:del_dir_r(Dir),
+    ok = file:make_dir(Dir),
+    Name = pool_for_late_reopen_waiter,
+    {ok, _} = kura_pool_sqlite:start_pool(Name, #{
+        database => filename:join(Dir, "db"), pool_size => 2
+    }),
+    try
+        {ok, _Held, Token} = kura_pool_sqlite:checkout(Name, #{}),
+        ok = file:del_dir_r(Dir),
+        ok = planted(Name, [~"CREATE TEMP TABLE scratch (id INTEGER)"]),
+        Waiter = waiter(Name, #{}),
+        ok = await_waiting(Name, 1),
+        ok = file:make_dir(Dir),
+        ?assertEqual({error, no_conns}, kura_pool_sqlite:checkout(Name, #{timeout => 0})),
+        ?assertMatch({ok, _, _}, result_of(Waiter)),
+        ok = released(Waiter),
+        ok = kura_pool_sqlite:checkin(Name, Token)
+    after
+        kura_pool_sqlite:stop_pool(Name),
+        file:del_dir_r(Dir)
+    end.
+
 reclaimed_given_away_connection_is_not_lent_again_test() ->
     Name = pool_for_reclaimed_gift,
     {ok, _} = kura_pool_sqlite:start_pool(Name, #{database => ~":memory:", pool_size => 1}),
