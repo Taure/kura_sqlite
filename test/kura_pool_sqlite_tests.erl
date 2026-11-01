@@ -1183,7 +1183,7 @@ created_database_is_not_group_or_world_writable_test() ->
     try
         ?assertEqual({ok, [Path]}, opened_with(Path)),
         {ok, #file_info{mode = Mode}} = file:read_file_info(Path),
-        ?assertEqual(0, Mode band 8#133)
+        ?assert(is_integer(Mode) andalso Mode band 8#133 =:= 0)
     after
         file:delete(Path)
     end.
