@@ -208,8 +208,8 @@ ok = kura_sqlite:check_blob_columns(my_repo, [my_user, my_api_key]).
 It returns `{error, [{text_in_blob_column, Table, Column}]}` for each
 column that still holds a TEXT value, and
 `{error, [{check_failed, Table, Column, Reason}]}` for one it could not
-read. A column created before 0.6 has no CHECK, so raw SQL can still
-write TEXT to it; to add one, rebuild the table as SQLite's
+read. A column created by an earlier kura_sqlite has no CHECK, so raw
+SQL can still write TEXT to it; to add one, rebuild the table as SQLite's
 [ALTER TABLE](https://www.sqlite.org/lang_altertable.html#otheralter)
 page describes.
 

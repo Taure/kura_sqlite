@@ -15,7 +15,7 @@ Checks for a database used through `kura_sqlite`.
 Look for TEXT values in the byte columns (`binary`, `{encrypted, _}`, and
 BLOB custom types) of `Schemas`' tables.
 
-Byte fields have been written as BLOB since 0.6. A row written before
+Byte fields are written as BLOB. A row an earlier kura_sqlite wrote
 holds TEXT, which a query on the field does not match, and a UNIQUE index
 treats it as a different value from a BLOB with the same bytes, so a new
 row can shadow it. Run this after converting the columns, and before
