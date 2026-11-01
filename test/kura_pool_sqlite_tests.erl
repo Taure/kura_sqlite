@@ -1207,6 +1207,65 @@ missing_file_in_a_read_only_directory_is_refused_and_not_created_test() ->
         file:del_dir_r(Dir)
     end.
 
+path_longer_than_sqlite_resolves_is_refused_before_esqlite_test() ->
+    with_deep_directory(pool_for_long_path, fun(Deep) ->
+        Existing = iolist_to_binary(filename:join(Deep, "db")),
+        ok = file:write_file(Existing, ~""),
+        ?assert(byte_size(Existing) > 512),
+        ?assertEqual({error, 14}, opened_with(Existing)),
+        Missing = iolist_to_binary(filename:join(Deep, "new")),
+        ?assertEqual({error, 14}, opened_with(Missing)),
+        ?assertEqual({error, enoent}, file:read_link_info(Missing))
+    end).
+
+relative_path_is_resolved_from_the_working_directory_test() ->
+    with_deep_directory(pool_for_relative_path, fun(Deep) ->
+        ok = file:write_file(filename:join(Deep, "db"), ~""),
+        {ok, Cwd} = file:get_cwd(),
+        try
+            ok = file:set_cwd(Deep),
+            ?assertEqual({error, 14}, opened_with(~"db")),
+            ok = file:set_cwd(filename:join(Deep, "../../..")),
+            Segment = filename:basename(Deep),
+            Back = filename:join([Segment, Segment, Segment]),
+            ?assertEqual({error, 14}, opened_with(iolist_to_binary([Back, "/../db"]))),
+            Up = iolist_to_binary(["./", filename:basename(Deep), "/../missing"]),
+            ?assertEqual({ok, [Up]}, opened_with(Up)),
+            ?assert(filelib:is_regular("missing"))
+        after
+            _ = file:delete("missing"),
+            ok = file:set_cwd(Cwd)
+        end
+    end).
+
+short_link_into_a_deep_directory_is_refused_before_esqlite_test() ->
+    with_deep_directory(pool_for_deep_link, fun(Deep) ->
+        ok = file:write_file(filename:join(Deep, "db"), ~""),
+        Link = db_path(pool_for_deep_link),
+        _ = file:delete(Link),
+        ok = file:make_symlink(Deep, Link),
+        try
+            Path = iolist_to_binary(filename:join(Link, "db")),
+            ?assert(byte_size(Path) < 200),
+            ?assertEqual({error, 14}, opened_with(Path))
+        after
+            file:delete(Link)
+        end
+    end).
+
+link_to_a_file_is_opened_test() ->
+    Path = db_path(pool_for_linked_file),
+    Link = db_path(pool_for_link),
+    _ = file:delete(Link),
+    ok = file:write_file(Path, ~""),
+    ok = file:make_symlink(filename:basename(Path), Link),
+    try
+        ?assertEqual({ok, [Link]}, opened_with(Link))
+    after
+        file:delete(Link),
+        file:delete(Path)
+    end.
+
 non_ascii_missing_directory_is_refused_before_esqlite_test() ->
     ?assertEqual({error, 14}, opened_with(<<"/nonexistent_", "ö"/utf8, "/x.db">>)).
 
@@ -1289,6 +1348,18 @@ database_path_that_is_a_directory_is_refused_before_esqlite_test() ->
     after
         trace:session_destroy(Session),
         file:del_dir_r(Dir)
+    end.
+
+with_deep_directory(Name, Test) ->
+    Top = filename:join(os:getenv("TMPDIR", "/tmp"), atom_to_list(Name)),
+    _ = file:del_dir_r(Top),
+    Segment = binary:copy(~"a", 200),
+    Deep = filename:join([Top, Segment, Segment, Segment]),
+    ok = filelib:ensure_path(Deep),
+    try
+        Test(Deep)
+    after
+        file:del_dir_r(Top)
     end.
 
 with_held(Name, Test) ->

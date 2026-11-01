@@ -120,7 +120,9 @@ esqlite sees it. A path must name a regular file the node can read, or a
 missing file in a directory the node can write to, which SQLite then
 creates; anything else, such as a directory, a missing directory or a
 dangling symbolic link, is refused with `{error, 14}`
-(`SQLITE_CANTOPEN`). A `file:` URI is refused with
+(`SQLITE_CANTOPEN`). So is a path SQLite could not resolve: one that,
+made absolute and with its symbolic links followed, comes to 500 bytes or
+more, or takes more than 100 symbolic links. A `file:` URI is refused with
 `{error, uri_not_supported}`, and a path holding a NUL byte, or a string
 path holding a character above 255, with `{error, invalid_filename}`.
 `":memory:"` and `""` open as they are.
@@ -164,6 +166,8 @@ connections nobody holds.
 
 -define(DEFAULT_WAIT, 5000).
 -define(SQLITE_CANTOPEN, 14).
+-define(MAX_PATHNAME, 500).
+-define(MAX_SYMLINKS, 100).
 -define(REPLY_MARGIN, 500).
 -define(MAX_WAIT, (16#FFFFFFFF - ?REPLY_MARGIN)).
 
@@ -887,8 +891,98 @@ openable(<<"file:", _/binary>>) ->
     {error, uri_not_supported};
 openable(Path) ->
     case binary:match(Path, <<0>>) of
-        nomatch -> regular(Path, file:read_file_info(Path));
+        nomatch -> reachable(Path);
         _ -> {error, invalid_filename}
+    end.
+
+%% SQLite cannot open a file whose path, made absolute and with every
+%% symbolic link in it followed, does not fit its 512-byte buffer, or that
+%% takes more symbolic links than it follows. Both limits are kept with a
+%% margin.
+-spec reachable(binary()) -> {ok, binary()} | {error, ?SQLITE_CANTOPEN}.
+reachable(Path) ->
+    case resolvable(Path) of
+        true -> regular(Path, file:read_file_info(Path));
+        false -> {error, ?SQLITE_CANTOPEN}
+    end.
+
+-spec resolvable(binary()) -> boolean().
+resolvable(<<"/", _/binary>> = Path) ->
+    resolved(~"", 0, elements(Path));
+resolvable(Path) ->
+    case file:get_cwd() of
+        {ok, Cwd} -> resolvable_from(native(Cwd), Path);
+        {error, _} -> false
+    end.
+
+-spec resolvable_from(binary() | error, binary()) -> boolean().
+resolvable_from(Cwd, Path) when is_binary(Cwd) ->
+    resolved(~"", 0, elements(Cwd) ++ elements(Path));
+resolvable_from(error, _Path) ->
+    false.
+
+%% Follows SQLite's unixFullPathname: each element is appended and, if it
+%% is a symbolic link, replaced by its target; `..` drops the element
+%% before it as resolved so far.
+-spec resolved(binary(), non_neg_integer(), [binary()]) -> boolean().
+resolved(Out, _Hops, []) ->
+    byte_size(Out) >= 2;
+resolved(Out, Hops, [~"." | Rest]) ->
+    resolved(Out, Hops, Rest);
+resolved(Out, Hops, [~".." | Rest]) ->
+    resolved(parent(Out), Hops, Rest);
+resolved(Out, Hops, [Name | Rest]) ->
+    Here = <<Out/binary, "/", Name/binary>>,
+    case byte_size(Here) < ?MAX_PATHNAME andalso file:read_link_info(Here) of
+        false ->
+            false;
+        {ok, #file_info{type = symlink}} when Hops >= ?MAX_SYMLINKS ->
+            false;
+        {ok, #file_info{type = symlink}} ->
+            linked(Out, Hops + 1, file:read_link_all(Here), Rest);
+        {ok, #file_info{}} ->
+            resolved(Here, Hops, Rest);
+        {error, enoent} ->
+            resolved(Here, Hops, Rest);
+        {error, _} ->
+            false
+    end.
+
+-spec parent(binary()) -> binary().
+parent(Path) ->
+    parent(Path, byte_size(Path) - 1).
+
+-spec parent(binary(), integer()) -> binary().
+parent(_Path, At) when At =< 0 ->
+    ~"";
+parent(Path, At) ->
+    case binary:at(Path, At) of
+        $/ -> binary:part(Path, 0, At);
+        _ -> parent(Path, At - 1)
+    end.
+
+-spec linked(binary(), non_neg_integer(), {ok, file:filename_all()} | {error, term()}, [binary()]) ->
+    boolean().
+linked(Out, Hops, {ok, Target}, Rest) ->
+    case native(Target) of
+        <<"/", _/binary>> = Absolute -> resolved(~"", Hops, elements(Absolute) ++ Rest);
+        <<_, _/binary>> = Relative -> resolved(Out, Hops, elements(Relative) ++ Rest);
+        _ -> false
+    end;
+linked(_Out, _Hops, {error, _}, _Rest) ->
+    false.
+
+-spec elements(binary()) -> [binary()].
+elements(Path) ->
+    [Element || Element <- binary:split(Path, ~"/", [global]), Element =/= ~""].
+
+-spec native(file:filename_all()) -> binary() | error.
+native(Name) when is_binary(Name) ->
+    Name;
+native(Name) ->
+    case unicode:characters_to_binary(Name, unicode, file:native_name_encoding()) of
+        Bytes when is_binary(Bytes) -> Bytes;
+        _ -> error
     end.
 
 -spec regular(binary(), {ok, #file_info{}} | {error, term()}) ->
