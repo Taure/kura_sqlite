@@ -84,8 +84,13 @@ to start on this backend via `kura_capabilities:require/2`.
   byte column of a joined schema. Other binaries are stored as TEXT, and
   so are these: values written to a table named by atom or binary rather
   than a schema (including a many-to-many join table whose `join_through`
-  is a binary), and values of a field whose name contains `?`. In raw SQL,
-  pass `{blob, Bin}` to bind a BLOB.
+  is a binary), and values of a field, other than an encrypted one, whose
+  name contains `?`. In raw SQL, pass `{blob, Bin}` to bind a BLOB.
+- **Encrypted fields** cannot be compared in a query. A where or having
+  condition on an `{encrypted, _}` field other than `is_nil` and
+  `is_not_nil` raises `{kura_sqlite, {encrypted_field_in_where, Field}}`,
+  since a value encrypted under a fresh nonce never equals the stored
+  ciphertext and the plaintext would go out with the query's parameters.
 - **Byte columns refuse TEXT.** A byte column a kura migration creates,
   with `create_table` or `add_column`, is declared
   `BLOB CHECK (typeof(col) IN ('blob', 'null'))`, so a TEXT value written

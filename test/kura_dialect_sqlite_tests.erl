@@ -1,5 +1,6 @@
 -module(kura_dialect_sqlite_tests).
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("kura/include/kura.hrl").
 
 %%----------------------------------------------------------------------
 %% swap_placeholders/1
@@ -429,6 +430,69 @@ where_left_alone_on_byte_field_test_() ->
         ?_assertEqual({<<"\"data\" IS NOT NULL">>, []}, where_sql({data, is_not_nil})),
         ?_assertEqual({<<"\"data\" IN ()">>, []}, where_sql({data, in, []})),
         ?_assertEqual({<<"\"data\" NOT IN ()">>, []}, where_sql({data, not_in, []}))
+    ].
+
+%% Ciphertext under a fresh nonce never equals another, so a condition on an
+%% encrypted field matches nothing useful and would send the plaintext along
+%% with the query.
+where_on_encrypted_field_raises_test_() ->
+    Sub = kura_query:select(kura_query:from(?BLOB_SCHEMA), [secret]),
+    Conditions = [
+        {secret, ~"pii"},
+        {secret, '=', ~"pii"},
+        {secret, '!=', ~"pii"},
+        {secret, '>', ~"pii"},
+        {secret, like, ~"pii%"},
+        {secret, matches, ~"pii"},
+        {secret, in, [~"pii"]},
+        {secret, in, []},
+        {secret, not_in, [~"pii"]},
+        {secret, in, {subquery, Sub}},
+        {secret, between, {~"a", ~"z"}},
+        {[id, secret], in, [{1, ~"pii"}]},
+        {[id, secret], in, [{1}]},
+        {'not', {secret, '=', ~"pii"}},
+        {'and', [{name, ~"n"}, {'or', [{secret, ~"pii"}]}]}
+    ],
+    [
+        ?_assertError(
+            {kura_sqlite, {encrypted_field_in_where, secret}}, where_sql(Condition)
+        )
+     || Condition <- Conditions
+    ].
+
+having_on_encrypted_field_raises_test() ->
+    Q = (kura_query:from(?BLOB_SCHEMA))#kura_query{
+        group_bys = [secret], havings = [{secret, '=', ~"pii"}]
+    },
+    ?assertError(
+        {kura_sqlite, {encrypted_field_in_where, secret}}, kura_dialect_sqlite:to_sql(Q)
+    ).
+
+where_on_joined_encrypted_field_raises_test() ->
+    Joined = kura_query:join(
+        kura_query:from(kura_sqlite_owner_schema), inner, ?BLOB_SCHEMA, {owner_id, id}
+    ),
+    ?assertError(
+        {kura_sqlite, {encrypted_field_in_where, secret}}, where_sql(Joined, {secret, ~"pii"})
+    ).
+
+where_on_encrypted_field_named_with_a_placeholder_raises_test() ->
+    ?assertError(
+        {kura_sqlite, {encrypted_field_in_where, 'secret?'}},
+        where_sql(kura_query:from(kura_sqlite_question_schema), {'secret?', ~"pii"})
+    ).
+
+insert_binds_encrypted_field_named_with_a_placeholder_as_blob_test() ->
+    {_SQL, Params} = kura_dialect_sqlite:insert(
+        kura_sqlite_question_schema, ['secret?', 'data?'], #{'secret?' => ~"s", 'data?' => ~"d"}
+    ),
+    ?assertEqual([{blob, ~"s"}, ~"d"], Params).
+
+where_unary_on_encrypted_field_is_untouched_test_() ->
+    [
+        ?_assertEqual({<<"\"secret\" IS NULL">>, []}, where_sql({secret, is_nil})),
+        ?_assertEqual({<<"\"secret\" IS NOT NULL">>, []}, where_sql({secret, is_not_nil}))
     ].
 
 where_atom_value_on_byte_field_binds_test() ->
