@@ -31,7 +31,8 @@ another table references returns
 tables in that schema that reference it, and drops nothing. A table that
 references only itself can be dropped. A `DROP TABLE` the driver cannot
 check, because SQLite compiled it to a program it does not recognise,
-returns `{error, unrecognised_drop_table}`.
+returns `{error, unrecognised_drop_table}`. A statement whose leading
+keyword the driver cannot read is checked as a `DROP TABLE`.
 
 With foreign keys off on the connection the drop deletes no rows and is
 not checked, which is what SQLite's table-rebuild procedure for schema
@@ -301,11 +302,18 @@ touched(kura_pool_sqlite, Pool, Conn, {First, _}) ->
 touched(_PoolMod, _Pool, _Conn, _Words) ->
     ok.
 
+%% A statement whose leading keywords cannot be read could be a DROP TABLE
+%% the reader does not recognise, so it is checked as one.
 -spec run(esqlite3:esqlite3(), binary(), words(), [term()]) -> dynamic().
-run(Conn, SQL, {~"DROP", ~"TABLE"}, Params) ->
-    case esqlite3:get_autocommit(Conn) of
-        true -> dropped_alone(Conn, SQL, Params);
-        false -> dropped(Conn, SQL, Params)
+run(Conn, SQL, {First, Second}, Params) when
+    {First, Second} =:= {~"DROP", ~"TABLE"};
+    {First, Second} =:= {~"DROP", ~""};
+    First =:= ~""
+->
+    case {skipped(SQL), esqlite3:get_autocommit(Conn)} of
+        {~"", _} -> prepared(Conn, SQL, Params, other);
+        {_, true} -> dropped_alone(Conn, SQL, Params);
+        {_, false} -> dropped(Conn, SQL, Params)
     end;
 run(Conn, SQL, {First, _}, Params) ->
     prepared(Conn, SQL, Params, command_of(First)).
@@ -475,10 +483,9 @@ leading_words(SQL) ->
     {Second, _} = word(skipped(Rest), ~""),
     {First, Second}.
 
+%% SQLite's own whitespace: space and 0x09 to 0x0D.
 -spec skipped(binary()) -> binary().
-skipped(<<Space, Rest/binary>>) when
-    Space =:= $\s; Space =:= $\t; Space =:= $\n; Space =:= $\r; Space =:= $\f
-->
+skipped(<<Space, Rest/binary>>) when Space =:= $\s; Space >= $\t, Space =< $\r ->
     skipped(Rest);
 skipped(<<$;, Rest/binary>>) ->
     skipped(Rest);

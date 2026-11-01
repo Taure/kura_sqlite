@@ -761,6 +761,59 @@ drop_after_empty_statements_is_refused_test() ->
         ?assertMatch(#{rows := [#{parent_id := 1}]}, sql(Pool, ~"SELECT parent_id FROM child"))
     end).
 
+%% SQLite skips 0x0B only inside a run of whitespace that starts with
+%% another whitespace character; on its own it is a syntax error.
+drop_after_a_vertical_tab_is_refused_test() ->
+    with_parent(fun(Pool) ->
+        Refused = {error, {referenced_by, ~"parent", [~"child"]}},
+        Runnable = [
+            ~" \vDROP TABLE parent",
+            ~"\t\v\vDROP TABLE parent",
+            ~"DROP \vTABLE parent",
+            ~"DROP \v\vTABLE parent",
+            ~"/*x*/ \vDROP TABLE parent",
+            ~"; \vDROP TABLE parent",
+            ~" \v; \vDROP TABLE parent",
+            ~"--x\n\v/*y*/ \v;\n\vDROP \v/**/ \vTABLE parent",
+            ~"\t\n\v\f\r DROP TABLE parent"
+        ],
+        ok = kura_pool:with_conn(kura_pool_sqlite, Pool, fun(Conn) ->
+            _ = [{ok, _} = esqlite3:prepare(Conn, SQL) || SQL <- Runnable],
+            ok
+        end),
+        _ = [?assertEqual({SQL, Refused}, {SQL, sql(Pool, SQL)}) || SQL <- Runnable],
+        _ = [
+            ?assertMatch({SQL, {error, _}}, {SQL, sql(Pool, SQL)})
+         || SQL <- [~"\vDROP TABLE parent", ~"DROP\vTABLE parent", ~"/*x*/\vDROP TABLE parent"]
+        ],
+        ?assertMatch(#{rows := [#{id := 1}]}, sql(Pool, ~"SELECT id FROM parent")),
+        ?assertMatch(#{rows := [#{parent_id := 1}]}, sql(Pool, ~"SELECT parent_id FROM child"))
+    end).
+
+statement_without_a_readable_keyword_is_checked_as_a_drop_test() ->
+    with_parent(fun(Pool) ->
+        {ok, Conn, Token} = kura_pool_sqlite:checkout(Pool, #{}),
+        try
+            Query = fun(SQL) -> kura_driver_sqlite:query_on(Conn, SQL, [], #{}) end,
+            ?assertMatch(
+                {{error, _}, [~"BEGIN IMMEDIATE", ~"EXPLAIN (DROP TABLE parent)"]},
+                prepares(fun() -> Query(~"(DROP TABLE parent)") end)
+            ),
+            ?assertMatch(
+                {{error, _}, [~"BEGIN IMMEDIATE", ~"EXPLAIN DROP \"TABLE\" parent"]},
+                prepares(fun() -> Query(~"DROP \"TABLE\" parent") end)
+            ),
+            ?assert(esqlite3:get_autocommit(Conn)),
+            ?assertMatch(
+                {#{command := insert}, [~"INSERT INTO parent VALUES (2)"]},
+                prepares(fun() -> Query(~"INSERT INTO parent VALUES (2)") end)
+            ),
+            ?assertMatch(#{rows := [#{parent_id := 1}]}, Query(~"SELECT parent_id FROM child"))
+        after
+            ok = kura_pool_sqlite:checkin(Pool, Token)
+        end
+    end).
+
 command_is_read_past_comments_test() ->
     with_parent(fun(Pool) ->
         ?assertMatch(
