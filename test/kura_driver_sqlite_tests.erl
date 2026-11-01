@@ -889,3 +889,15 @@ still_marked(Pool) ->
     kura_pool:with_conn(kura_pool_sqlite, Pool, fun(Conn) ->
         is_list(esqlite3:q(Conn, ~"SELECT count(*) FROM temp.marker"))
     end).
+
+foreign_keys_turned_off_through_query_on_do_not_outlive_the_lease_test() ->
+    with_parent(fun(Pool) ->
+        ?assertError(
+            rebuild_failed,
+            kura_pool:with_conn(kura_pool_sqlite, Pool, fun(Conn) ->
+                #{} = kura_driver_sqlite:query_on(Conn, ~"PRAGMA foreign_keys = OFF", [], #{}),
+                error(rebuild_failed)
+            end)
+        ),
+        ?assertMatch({error, _}, sql(Pool, ~"INSERT INTO child VALUES (42)"))
+    end).

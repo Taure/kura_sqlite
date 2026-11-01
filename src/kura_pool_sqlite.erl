@@ -58,10 +58,9 @@ through `esqlite3` are not seen.
 Foreign keys are on for every connection the pool opens, so `REFERENCES`
 and `ON DELETE` rules are enforced. SQLite leaves them off by default, and
 the setting belongs to the connection, not the database. A lease that turns
-them off through the driver has them off for that lease only, since the
-connection is then reopened. One that turns them off directly through
-`esqlite3` keeps them off until the connection is reopened for any of the
-reasons above.
+them off, through the driver or directly through `esqlite3`, has them off
+for that lease only: the pool turns them back on when the connection comes
+back, also when the lease ended with an exception.
 
 With foreign keys on, `DROP TABLE` on a table other tables reference would
 first delete its rows and run the children's `ON DELETE` rules, so
@@ -718,7 +717,10 @@ replied(From) -> gen_server:reply(From, ok).
 -spec reset(esqlite3:esqlite3(), boolean(), baseline()) -> outcome().
 reset(Conn, Dirty, Baseline) ->
     _ = esqlite3:exec(Conn, ~""),
-    case rolled_back(Conn) andalso esqlite3:q(Conn, ~"PRAGMA encoding") of
+    case
+        rolled_back(Conn) andalso foreign_keys_restored(Conn) andalso
+            esqlite3:q(Conn, ~"PRAGMA encoding")
+    of
         [[~"UTF-8"]] when Dirty -> inspected(Conn, Baseline);
         [[~"UTF-8"]] -> kept;
         false -> unlocked(Conn);
@@ -770,6 +772,10 @@ reclaimed(_Conn, _GivenAway, Outcome) ->
 unlocked(Conn) ->
     _ = esqlite3:exec(Conn, ~"PRAGMA locking_mode = NORMAL; SELECT count(*) FROM sqlite_schema"),
     dropped.
+
+-spec foreign_keys_restored(esqlite3:esqlite3()) -> boolean().
+foreign_keys_restored(Conn) ->
+    esqlite3:exec(Conn, ~"PRAGMA foreign_keys = ON") =:= ok.
 
 -spec rolled_back(esqlite3:esqlite3()) -> boolean().
 rolled_back(Conn) ->
