@@ -12,7 +12,9 @@ Returns `#{rows := Rows, num_rows := N, command := C}`, the shape the
 other kura drivers return. `Rows` are maps keyed by atom column names.
 `command` is one of
 `select | insert | update | delete | other` derived from the SQL
-prefix.
+prefix. `num_rows` is the number of rows returned, except for an
+`INSERT`, `UPDATE` or `DELETE` without `RETURNING`, where it is the
+number of rows the statement changed, as Postgres reports it.
 
 ## Errors
 
@@ -350,7 +352,7 @@ dropped(Conn, SQL, Params) ->
 prepared(Conn, SQL, Params, Command) ->
     case esqlite3:prepare(Conn, SQL) of
         {ok, Stmt} ->
-            run_prepared(Stmt, Params, Command);
+            run_prepared(Conn, Stmt, Params, Command);
         {error, _} = Err ->
             Err
     end.
@@ -410,8 +412,9 @@ referenced(_Table, {error, _} = Error) ->
 %% A statement that stops short of `'$done'`, on an error or `'$busy'`,
 %% holds its connection's implicit transaction open until it is reset, and
 %% anything the next borrower writes in autocommit would stay uncommitted.
--spec run_prepared(esqlite3:esqlite3_stmt(), [term()], atom()) -> dynamic().
-run_prepared(Stmt, Params, Cmd) ->
+-spec run_prepared(esqlite3:esqlite3(), esqlite3:esqlite3_stmt(), [term()], command()) ->
+    dynamic().
+run_prepared(Conn, Stmt, Params, Cmd) ->
     case bind_params(Stmt, Params) of
         ok ->
             ColNames = esqlite3:column_names(Stmt),
@@ -419,13 +422,21 @@ run_prepared(Stmt, Params, Cmd) ->
                 {error, _} = Err ->
                     Err;
                 Rows when is_list(Rows) ->
-                    #{rows => Rows, num_rows => length(Rows), command => Cmd}
+                    #{rows => Rows, num_rows => num_rows(Conn, Cmd, ColNames, Rows), command => Cmd}
             after
                 _ = esqlite3:reset(Stmt)
             end;
         {error, _} = Err ->
             Err
     end.
+
+%% Without RETURNING a write returns no rows, so its count is the rows it
+%% changed, as Postgres reports it.
+-spec num_rows(esqlite3:esqlite3(), command(), [binary()], list()) -> non_neg_integer().
+num_rows(Conn, Cmd, [], []) when Cmd =:= insert; Cmd =:= update; Cmd =:= delete ->
+    esqlite3:changes(Conn);
+num_rows(_Conn, _Cmd, _ColNames, Rows) ->
+    length(Rows).
 
 -spec bind_params(esqlite3:esqlite3_stmt(), [term()]) -> ok | {error, term()}.
 bind_params(Stmt, []) ->

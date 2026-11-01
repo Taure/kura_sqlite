@@ -901,3 +901,65 @@ foreign_keys_turned_off_through_query_on_do_not_outlive_the_lease_test() ->
         ),
         ?assertMatch({error, _}, sql(Pool, ~"INSERT INTO child VALUES (42)"))
     end).
+
+write_without_returning_counts_the_rows_it_changed_test() ->
+    {Pool, Path} = nested_setup(memory, 1),
+    try
+        #{} = sql(Pool, ~"CREATE UNIQUE INDEX nested_id ON nested (id)"),
+        ?assertMatch(
+            #{rows := [], num_rows := 3, command := insert},
+            sql(Pool, ~"INSERT INTO nested VALUES (1), (2), (3)")
+        ),
+        ?assertMatch(
+            #{rows := [], num_rows := 1, command := insert},
+            sql(Pool, ~"INSERT INTO nested VALUES (3), (4) ON CONFLICT DO NOTHING")
+        ),
+        ?assertMatch(
+            #{rows := [], num_rows := 2, command := update},
+            sql(Pool, ~"UPDATE nested SET id = id + 10 WHERE id > 2")
+        ),
+        ?assertMatch(
+            #{rows := [], num_rows := 0, command := update},
+            sql(Pool, ~"UPDATE nested SET id = 0 WHERE id > 100")
+        ),
+        ?assertMatch(
+            #{rows := [], num_rows := 2, command := delete},
+            transaction(Pool, fun() -> sql(Pool, ~"DELETE FROM nested WHERE id < 10") end)
+        ),
+        ?assertMatch(
+            #{rows := [], num_rows := 0, command := delete},
+            sql(Pool, ~"DELETE FROM nested WHERE id < 10")
+        )
+    after
+        nested_teardown({Pool, Path})
+    end.
+
+write_with_returning_counts_the_rows_it_returned_test() ->
+    {Pool, Path} = nested_setup(memory, 1),
+    try
+        #{} = sql(Pool, ~"INSERT INTO nested VALUES (1), (2), (3)"),
+        ?assertMatch(
+            #{rows := [_, _], num_rows := 2, command := update},
+            sql(Pool, ~"UPDATE nested SET id = id + 10 WHERE id > 1 RETURNING id")
+        ),
+        ?assertMatch(
+            #{rows := [], num_rows := 0, command := delete},
+            sql(Pool, ~"DELETE FROM nested WHERE id > 100 RETURNING id")
+        )
+    after
+        nested_teardown({Pool, Path})
+    end.
+
+reads_and_other_statements_do_not_report_an_earlier_write_test() ->
+    {Pool, Path} = nested_setup(memory, 1),
+    try
+        #{num_rows := 3} = sql(Pool, ~"INSERT INTO nested VALUES (1), (2), (3)"),
+        ?assertMatch(
+            #{num_rows := 0, command := select}, sql(Pool, ~"SELECT id FROM nested WHERE id > 3")
+        ),
+        ?assertMatch(
+            #{num_rows := 0, command := other}, sql(Pool, ~"CREATE TABLE more (id INTEGER)")
+        )
+    after
+        nested_teardown({Pool, Path})
+    end.
