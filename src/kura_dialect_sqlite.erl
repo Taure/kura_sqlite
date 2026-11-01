@@ -481,7 +481,6 @@ is_schema(Mod) ->
 
 -spec blob_type(kura_types:kura_type()) -> boolean().
 blob_type(binary) -> true;
-blob_type({encrypted, _}) -> true;
 blob_type({custom, _} = Type) -> storage_type(Type) =:= ~"BLOB";
 blob_type(_Type) -> false.
 
@@ -535,8 +534,6 @@ blob_condition(Condition, Blobs) ->
         [] -> cast_condition(Condition, Blobs)
     end.
 
-%% The fields a condition compares with a value. is_nil and is_not_nil
-%% compare with none.
 -spec compared_fields(term()) -> [atom()].
 compared_fields({Field, Unary}) when is_atom(Field), ?IS_UNARY_OP(Unary) ->
     [];
