@@ -31,8 +31,16 @@ storage class, so its bytes do not depend on the database encoding:
   its placeholder in `CAST(? AS BLOB)`. A TEXT value never equals a BLOB
   one in SQLite, so without the cast a bound binary would match nothing.
   The cast is in the SQL rather than the parameters because kura caches a
-  compiled query and reuses it with other values. It keeps the bytes
-  because the pool opens only UTF-8 databases.
+  compiled query and reuses it with other values.
+
+The cast path is correct only because `kura_pool_sqlite` refuses a
+database whose encoding is not UTF-8. The value still binds as TEXT, and
+`CAST(? AS BLOB)` turns it into the database encoding's bytes, which are
+the original bytes only in UTF-8. The intended replacement is a
+`dump_param` hook in kura core, applied in `kura_query_shape:split/1` and
+in the repo worker's dump, so a value is tagged `{blob, Bin}` before it is
+replaced by its marker. Once kura has that hook, this rewrite can be
+deleted.
 
 A table named by atom or binary rather than a schema module has no field
 types, so its values bind as before: a binary as TEXT.
