@@ -127,3 +127,132 @@ composite_delete_roundtrip_test() ->
         kura_pool_sqlite:checkin(Name, Tk),
         kura_pool_sqlite:stop_pool(Name)
     end.
+
+%%----------------------------------------------------------------------
+%% Byte fields bind as BLOB (Taure/kura#141)
+%%----------------------------------------------------------------------
+
+-define(BLOB_SCHEMA, kura_sqlite_blob_schema).
+
+insert_wraps_byte_fields_test() ->
+    {_SQL, Params} = kura_dialect_sqlite:insert(
+        ?BLOB_SCHEMA, [name, data, secret], #{name => ~"n", data => ~"d", secret => ~"s"}
+    ),
+    ?assertEqual([~"n", {blob, ~"d"}, {blob, ~"s"}], Params).
+
+insert_leaves_null_byte_field_test() ->
+    {_SQL, Params} = kura_dialect_sqlite:insert(?BLOB_SCHEMA, [data], #{data => null}),
+    ?assertEqual([null], Params).
+
+insert_into_table_name_is_untouched_test() ->
+    {_SQL, Params} = kura_dialect_sqlite:insert(vault, [data], #{data => ~"d"}),
+    ?assertEqual([~"d"], Params).
+
+upsert_wraps_conflict_values_test() ->
+    {_SQL, Params} = kura_dialect_sqlite:insert(
+        ?BLOB_SCHEMA, [id, data], #{id => 1, data => ~"d"}, #{on_conflict => {id, replace_all}}
+    ),
+    ?assertEqual([1, {blob, ~"d"}, {blob, ~"d"}], Params).
+
+update_wraps_changes_and_keys_test() ->
+    {_SQL, Params} = kura_dialect_sqlite:update(
+        ?BLOB_SCHEMA, [data, name], #{data => ~"d", name => ~"n"}, [{data, ~"k"}]
+    ),
+    ?assertEqual([{blob, ~"d"}, ~"n", {blob, ~"k"}], Params).
+
+delete_wraps_keys_test() ->
+    {_SQL, Params} = kura_dialect_sqlite:delete(?BLOB_SCHEMA, [{data, ~"k"}, {id, 1}]),
+    ?assertEqual([{blob, ~"k"}, 1], Params).
+
+insert_all_wraps_every_row_test() ->
+    {_SQL, Params} = kura_dialect_sqlite:insert_all(
+        ?BLOB_SCHEMA, [name, data], [#{name => ~"a", data => ~"1"}, #{name => ~"b", data => ~"2"}]
+    ),
+    ?assertEqual([~"a", {blob, ~"1"}, ~"b", {blob, ~"2"}], Params).
+
+update_all_wraps_set_values_test() ->
+    Q = kura_query:where(kura_query:from(?BLOB_SCHEMA), {name, ~"n"}),
+    {SQL, Params} = kura_dialect_sqlite:update_all(Q, #{data => ~"d"}),
+    ?assertEqual(<<"UPDATE \"vault\" SET \"data\" = ?1 WHERE \"name\" = ?2">>, SQL),
+    ?assertEqual([{blob, ~"d"}, ~"n"], Params).
+
+where_on_byte_field_casts_placeholder_test_() ->
+    Cases = [
+        {{data, ~"d"}, <<"\"data\" = CAST(?1 AS BLOB)">>, [~"d"]},
+        {{data, '=', ~"d"}, <<"\"data\" = CAST(?1 AS BLOB)">>, [~"d"]},
+        {{data, '!=', ~"d"}, <<"\"data\" != CAST(?1 AS BLOB)">>, [~"d"]},
+        {{data, '>=', ~"d"}, <<"\"data\" >= CAST(?1 AS BLOB)">>, [~"d"]},
+        {{data, in, [~"a", ~"b"]}, <<"\"data\" IN (CAST(?1 AS BLOB), CAST(?2 AS BLOB))">>, [
+            ~"a", ~"b"
+        ]},
+        {{data, not_in, [~"a"]}, <<"\"data\" NOT IN (CAST(?1 AS BLOB))">>, [~"a"]},
+        {
+            {data, between, {~"a", ~"b"}},
+            <<"\"data\" BETWEEN CAST(?1 AS BLOB) AND CAST(?2 AS BLOB)">>,
+            [~"a", ~"b"]
+        },
+        {
+            {[id, data], in, [{1, ~"a"}, {2, ~"b"}]},
+            <<"(\"id\", \"data\") IN ((?1, CAST(?2 AS BLOB)), (?3, CAST(?4 AS BLOB)))">>,
+            [
+                1, ~"a", 2, ~"b"
+            ]
+        },
+        {
+            {'or', [{data, ~"a"}, {name, ~"n"}]},
+            <<"(\"data\" = CAST(?1 AS BLOB) OR \"name\" = ?2)">>,
+            [~"a", ~"n"]
+        },
+        {{'not', {data, ~"a"}}, <<"NOT (\"data\" = CAST(?1 AS BLOB))">>, [~"a"]}
+    ],
+    [
+        ?_assertEqual({Where, Params}, where_sql(Condition))
+     || {Condition, Where, Params} <- Cases
+    ].
+
+where_on_text_field_is_untouched_test() ->
+    ?assertEqual({<<"\"name\" = ?1">>, [~"n"]}, where_sql({name, ~"n"})).
+
+where_unary_on_byte_field_is_untouched_test() ->
+    ?assertEqual({<<"\"data\" IS NULL">>, []}, where_sql({data, is_nil})).
+
+where_in_subquery_casts_inner_query_test() ->
+    Sub = kura_query:where(kura_query:select(kura_query:from(?BLOB_SCHEMA), [id]), {data, ~"d"}),
+    Q = kura_query:where(kura_query:from(?BLOB_SCHEMA), {id, in, {subquery, Sub}}),
+    {SQL, Params} = kura_dialect_sqlite:to_sql(Q),
+    ?assertNotEqual(
+        nomatch, binary:match(iolist_to_binary(SQL), ~"WHERE \"data\" = CAST(?1 AS BLOB))")
+    ),
+    ?assertEqual([~"d"], Params).
+
+delete_all_casts_where_test() ->
+    Q = kura_query:where(kura_query:from(?BLOB_SCHEMA), {data, ~"d"}),
+    ?assertEqual(
+        {<<"DELETE FROM \"vault\" WHERE \"data\" = CAST(?1 AS BLOB)">>, [~"d"]},
+        kura_dialect_sqlite:delete_all(Q)
+    ).
+
+where_sql(Condition) ->
+    Q = kura_query:where(kura_query:from(?BLOB_SCHEMA), Condition),
+    {SQL, Params} = kura_dialect_sqlite:to_sql(Q),
+    [_, Where] = binary:split(iolist_to_binary(SQL), ~" WHERE "),
+    {Where, Params}.
+
+utf16_database_keeps_inserted_bytes_test() ->
+    {ok, _} = application:ensure_all_started(esqlite),
+    {ok, Conn} = esqlite3:open(":memory:"),
+    try
+        ok = esqlite3:exec(Conn, ~"PRAGMA encoding = 'UTF-16'"),
+        ok = esqlite3:exec(Conn, ~"CREATE TABLE vault (id INTEGER PRIMARY KEY, data BLOB)"),
+        Bytes = <<0, 255, 254, 128, $a, 192>>,
+        {SQL, Params} = kura_dialect_sqlite:insert(?BLOB_SCHEMA, [data], #{data => Bytes}),
+        ?assertMatch(
+            #{rows := [#{data := Bytes}]}, kura_driver_sqlite:query_on(Conn, SQL, Params, #{})
+        ),
+        #{rows := [#{data := AsText}]} = kura_driver_sqlite:query_on(
+            Conn, ~"INSERT INTO vault (data) VALUES (?1) RETURNING data", [Bytes], #{}
+        ),
+        ?assertNotEqual(Bytes, AsText)
+    after
+        esqlite3:close(Conn)
+    end.
