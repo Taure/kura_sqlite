@@ -12,7 +12,8 @@ smoke_test_() ->
             {"encrypted column emits BLOB", fun encrypted_ddl_blob/0},
             {"encrypted value round-trips through a BLOB column", fun encrypted_roundtrip/0},
             {"NULL encrypted value reads back as undefined", fun encrypted_null_reads_undefined/0},
-            {"bulk writes report the rows they changed", fun bulk_writes_report_rows_changed/0}
+            {"bulk writes report the rows they changed", fun bulk_writes_report_rows_changed/0},
+            {"aggregate over no rows is null", fun aggregate_over_no_rows_is_null/0}
         ]
     end}.
 
@@ -190,3 +191,13 @@ vault_table() ->
     #{} = kura_db:query(?REPO, ~"DROP TABLE IF EXISTS vault_rows", []),
     #{} = kura_db:query(?REPO, DDL, []),
     ok.
+
+aggregate_over_no_rows_is_null() ->
+    ok = vault_table(),
+    Vault = kura_query:from(kura_sqlite_vault_schema),
+    ?assertEqual({ok, null}, kura_repo_worker:aggregate(?REPO, Vault, {sum, id})),
+    ?assertEqual({ok, null}, kura_repo_worker:aggregate(?REPO, Vault, {max, id})),
+    ?assertEqual({ok, null}, kura_repo_worker:aggregate(?REPO, Vault, {min, id})),
+    ?assertEqual({ok, null}, kura_repo_worker:aggregate(?REPO, Vault, {avg, id})),
+    ?assertEqual({ok, 0}, kura_repo_worker:aggregate(?REPO, Vault, {sum, id}, 0)),
+    ?assertEqual({ok, 0}, kura_repo_worker:count(?REPO, Vault)).
