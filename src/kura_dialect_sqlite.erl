@@ -42,8 +42,20 @@ in the repo worker's dump, so a value is tagged `{blob, Bin}` before it is
 replaced by its marker. Once kura has that hook, this rewrite can be
 deleted.
 
-A table named by atom or binary rather than a schema module has no field
-types, so its values bind as before: a binary as TEXT.
+These binaries still bind as TEXT:
+
+- values for a table named by atom or binary rather than a schema
+  module, which has no field types. That includes a many-to-many join
+  table whose `join_through` is a binary.
+- values for a field whose name contains `?`, which a fragment would read
+  as a placeholder.
+- a where-condition on a byte column of a joined table. Only the fields of
+  the query's `from` schema are looked up.
+
+A condition on a byte field with an operator the rewrite cannot cast
+raises `{kura_sqlite, {unsupported_blob_condition, Field, Op}}`. `like`,
+`ilike`, `is_nil`, `is_not_nil` and an empty `in` or `not_in` list are
+passed through unchanged.
 
 ## Notes
 
