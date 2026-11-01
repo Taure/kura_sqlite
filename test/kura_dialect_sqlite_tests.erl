@@ -341,3 +341,39 @@ unload(Mod) ->
     _ = code:delete(Mod),
     _ = code:purge(Mod),
     ?assertNot(code:is_loaded(Mod)).
+
+where_unsupported_operator_on_byte_field_raises_test_() ->
+    [
+        ?_assertError(
+            {kura_sqlite, {unsupported_blob_condition, data, matches}},
+            where_sql({data, matches, ~"d"})
+        ),
+        ?_assertError(
+            {kura_sqlite, {unsupported_blob_condition, data, between}},
+            where_sql({data, between, ~"d"})
+        ),
+        ?_assertError(
+            {kura_sqlite, {unsupported_blob_condition, data, contains}},
+            where_sql({data, contains, ~"d"})
+        )
+    ].
+
+where_unsupported_operator_on_text_field_is_untouched_test() ->
+    ?assertEqual({<<"\"name\" LIKE ?1">>, [~"n%"]}, where_sql({name, like, ~"n%"})).
+
+where_left_alone_on_byte_field_test_() ->
+    [
+        ?_assertEqual({<<"\"data\" LIKE ?1">>, [~"d%"]}, where_sql({data, like, ~"d%"})),
+        ?_assertEqual({<<"\"data\" ILIKE ?1">>, [~"d%"]}, where_sql({data, ilike, ~"d%"})),
+        ?_assertEqual({<<"\"data\" IS NOT NULL">>, []}, where_sql({data, is_not_nil})),
+        ?_assertEqual({<<"\"data\" IN ()">>, []}, where_sql({data, in, []})),
+        ?_assertEqual({<<"\"data\" NOT IN ()">>, []}, where_sql({data, not_in, []}))
+    ].
+
+where_atom_value_on_byte_field_binds_test() ->
+    ?assertEqual({<<"\"data\" = CAST(?1 AS BLOB)">>, [nil]}, where_sql({data, nil})).
+
+where_fragment_is_untouched_test() ->
+    ?assertEqual(
+        {<<"length(data) > ?1">>, [3]}, where_sql({fragment, ~"length(data) > ?", [3]})
+    ).

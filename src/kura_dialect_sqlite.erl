@@ -68,6 +68,8 @@ types, so its values bind as before: a binary as TEXT.
 ]).
 
 -define(CAST, ~"CAST(? AS BLOB)").
+%% kura's ?KURA_IS_UNARY_OP, which the pinned kura does not define yet.
+-define(IS_UNARY_OP(Op), (Op =:= is_nil orelse Op =:= is_not_nil)).
 -define(IS_COMPARISON(Op),
     (Op =:= '=' orelse Op =:= '!=' orelse Op =:= '<' orelse Op =:= '>' orelse Op =:= '<=' orelse
         Op =:= '>=')
@@ -289,6 +291,8 @@ blob_condition({Op, Conditions}, Blobs) when
     (Op =:= 'and' orelse Op =:= 'or'), is_list(Conditions)
 ->
     {Op, blob_conditions(Conditions, Blobs)};
+blob_condition({fragment, _SQL, _Params} = Condition, _Blobs) ->
+    Condition;
 blob_condition({'not', Condition}, Blobs) ->
     {'not', blob_condition(Condition, Blobs)};
 blob_condition({Exists, {subquery, Sub}}, _Blobs) when Exists =:= exists; Exists =:= not_exists ->
@@ -323,11 +327,20 @@ blob_condition({Field, between, {Low, High}}, Blobs) when
     {fragment, <<(ident(Field))/binary, " BETWEEN ", ?CAST/binary, " AND ", ?CAST/binary>>, [
         Low, High
     ]};
-%% An atom is a unary operator such as `is_nil`, never a byte value.
 blob_condition({Field, Value}, Blobs) when
-    is_atom(Field), not is_atom(Value), is_map_key(Field, Blobs)
+    is_atom(Field), not ?IS_UNARY_OP(Value), is_map_key(Field, Blobs)
 ->
     blob_condition({Field, '=', Value}, Blobs);
+blob_condition({Field, Op, _Value} = Condition, Blobs) when
+    is_atom(Field), (Op =:= like orelse Op =:= ilike), is_map_key(Field, Blobs)
+->
+    Condition;
+blob_condition({Field, In, []} = Condition, Blobs) when
+    is_atom(Field), (In =:= in orelse In =:= not_in), is_map_key(Field, Blobs)
+->
+    Condition;
+blob_condition({Field, Op, _Value}, Blobs) when is_atom(Field), is_map_key(Field, Blobs) ->
+    error({kura_sqlite, {unsupported_blob_condition, Field, Op}});
 blob_condition(Condition, _Blobs) ->
     Condition.
 
