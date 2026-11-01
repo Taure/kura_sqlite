@@ -16,13 +16,15 @@ prefix.
 
 ## Parameters
 
-Parameters bind by position: `undefined` or `null` as NULL, an integer
-as INTEGER, a float as REAL, a binary, string or iolist as TEXT, any
+Parameters bind by position: `undefined` or `null` as NULL, a 64-bit
+integer as INTEGER, a float as REAL, a binary or iodata list as TEXT, any
 other atom as the TEXT of its name, and `{blob, Bin}` as a BLOB.
-`{text, T}`, `{int, I}`, `{int64, I}` and `{float, F}` bind as esqlite
-binds them. `kura_dialect_sqlite` passes the values of byte-typed schema
-fields as `{blob, Bin}`; raw SQL can do the same. Any other parameter
-returns `{error, {unsupported_param, Index}}`, `Index` counting from 1.
+`{text, T}`, `{int, I}` (32-bit), `{int64, I}` and `{float, F}` bind as
+esqlite binds them. `kura_dialect_sqlite` passes the values of byte-typed
+schema fields as `{blob, Bin}`; raw SQL can do the same. Any other
+parameter, including an integer out of range or a list that is not
+iodata, returns `{error, {unsupported_param, Index}}`, `Index` counting
+from 1.
 esqlite's named binding is not used, so no parameter can choose the
 placeholder it binds to.
 
@@ -146,6 +148,9 @@ the workload. esqlite sets 2 seconds by default.
 -type words() :: {binary(), binary()}.
 -type command() :: select | insert | update | delete | other.
 -type result() :: #{rows := [#{atom() => term()}], _ => _} | {error, term()}.
+
+-define(IS_INT64(Int), (is_integer(Int) andalso Int >= -(1 bsl 63) andalso Int < 1 bsl 63)).
+-define(IS_INT32(Int), (is_integer(Int) andalso Int >= -(1 bsl 31) andalso Int < 1 bsl 31)).
 
 -define(NOTHING_DROPPED, [~"Init", ~"Transaction", ~"JournalMode", ~"Goto", ~"Halt"]).
 
@@ -469,28 +474,38 @@ bind_params(Stmt, Index, [Param | Rest]) ->
         {error, _} = Error -> Error
     end.
 
+%% esqlite raises badarg for a value its bind cannot take, such as a list
+%% that is not iodata.
 -spec bind_param(esqlite3:esqlite3_stmt(), pos_integer(), dynamic()) -> ok | {error, term()}.
-bind_param(Stmt, Index, Null) when Null =:= null; Null =:= undefined ->
+bind_param(Stmt, Index, Param) ->
+    try
+        bound(Stmt, Index, Param)
+    catch
+        error:badarg -> {error, {unsupported_param, Index}}
+    end.
+
+-spec bound(esqlite3:esqlite3_stmt(), pos_integer(), dynamic()) -> ok | {error, term()}.
+bound(Stmt, Index, Null) when Null =:= null; Null =:= undefined ->
     esqlite3:bind_null(Stmt, Index);
-bind_param(Stmt, Index, Int) when is_integer(Int) ->
+bound(Stmt, Index, Int) when ?IS_INT64(Int) ->
     esqlite3:bind_int64(Stmt, Index, Int);
-bind_param(Stmt, Index, Float) when is_float(Float) ->
+bound(Stmt, Index, Float) when is_float(Float) ->
     esqlite3:bind_double(Stmt, Index, Float);
-bind_param(Stmt, Index, Text) when is_binary(Text); is_list(Text) ->
+bound(Stmt, Index, Text) when is_binary(Text); is_list(Text) ->
     esqlite3:bind_text(Stmt, Index, Text);
-bind_param(Stmt, Index, Atom) when is_atom(Atom) ->
+bound(Stmt, Index, Atom) when is_atom(Atom) ->
     esqlite3:bind_text(Stmt, Index, atom_to_binary(Atom, utf8));
-bind_param(Stmt, Index, {blob, Bytes}) when is_binary(Bytes); is_list(Bytes) ->
+bound(Stmt, Index, {blob, Bytes}) when is_binary(Bytes); is_list(Bytes) ->
     esqlite3:bind_blob(Stmt, Index, Bytes);
-bind_param(Stmt, Index, {text, Text}) when is_binary(Text); is_list(Text) ->
+bound(Stmt, Index, {text, Text}) when is_binary(Text); is_list(Text) ->
     esqlite3:bind_text(Stmt, Index, Text);
-bind_param(Stmt, Index, {int, Int}) when is_integer(Int) ->
+bound(Stmt, Index, {int, Int}) when ?IS_INT32(Int) ->
     esqlite3:bind_int(Stmt, Index, Int);
-bind_param(Stmt, Index, {int64, Int}) when is_integer(Int) ->
+bound(Stmt, Index, {int64, Int}) when ?IS_INT64(Int) ->
     esqlite3:bind_int64(Stmt, Index, Int);
-bind_param(Stmt, Index, {float, Float}) when is_float(Float) ->
+bound(Stmt, Index, {float, Float}) when is_float(Float) ->
     esqlite3:bind_double(Stmt, Index, Float);
-bind_param(_Stmt, Index, _Param) ->
+bound(_Stmt, Index, _Param) ->
     {error, {unsupported_param, Index}}.
 
 %% The process dictionary is untyped; what is stored is the connection put

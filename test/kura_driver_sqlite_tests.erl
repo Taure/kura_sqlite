@@ -963,3 +963,28 @@ unrecognised_blob_column_is_refused_test() ->
             kura_driver_sqlite:query_on(Conn, <<"CREATE TABLE t (c ", Blob/binary, ")">>, [], #{})
         end)
     ).
+
+params_esqlite_cannot_bind_are_refused_test_() ->
+    [
+        ?_assertEqual({error, {unsupported_param, 1}}, bound([Param, 1]))
+     || Param <- [
+            1 bsl 63,
+            -(1 bsl 63) - 1,
+            {int64, 1 bsl 63},
+            {int, 1 bsl 31},
+            {int, -(1 bsl 31) - 1},
+            [1000],
+            [a],
+            {text, [256]},
+            {blob, [~"ok", -1]}
+        ]
+    ].
+
+params_at_the_integer_limits_bind_test() ->
+    Max = (1 bsl 63) - 1,
+    Min = -(1 bsl 63),
+    ?assertMatch(#{rows := [#{v1 := Max, v2 := Min}]}, bound([Max, Min])),
+    ?assertMatch(
+        #{rows := [#{v1 := 2147483647, v2 := -2147483648}]},
+        bound([{int, 2147483647}, {int, -2147483648}])
+    ).
