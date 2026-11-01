@@ -137,6 +137,10 @@ to start on this backend via `kura_capabilities:require/2`.
   `RETURNING`, also after a `WITH`, reports the rows it changed, so
   `update_all`, `delete_all` and `insert_all` return the real count
   instead of `{ok, 0}`.
+- **Raw query results**: a raw `kura_db:query/3` write without
+  `RETURNING` now reports its real `num_rows` instead of 0, and a
+  `WITH ... SELECT` reports `command := select` instead of `other`.
+  Callers matching on the old values need updating.
 
 ## License
 

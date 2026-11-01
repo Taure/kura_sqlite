@@ -510,8 +510,8 @@ command_of(~"DELETE") -> delete;
 command_of(_Keyword) -> other.
 
 %% SQLite allows only a SELECT inside a common table expression, so the
-%% statement's own keyword is the first word after a top-level group that
-%% is followed by neither `,`, another CTE, nor `AS`, a CTE's column list.
+%% statement's own keyword is the first word after a top-level group not
+%% followed by `,` (another CTE) or `AS` (the group was a column list).
 -spec after_ctes(binary()) -> binary().
 after_ctes(SQL) ->
     case skipped(SQL) of
