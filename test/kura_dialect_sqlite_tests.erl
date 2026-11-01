@@ -331,3 +331,13 @@ cte_and_union_cast_test() ->
     {SQL, Params} = kura_dialect_sqlite:to_sql(Q),
     Casts = binary:matches(iolist_to_binary(SQL), ~"AS BLOB)"),
     ?assertEqual({3, [~"d", ~"d", ~"d"]}, {length(Casts), Params}).
+
+column_type_loads_an_unloaded_custom_type_test() ->
+    unload(kura_sqlite_bytes_type),
+    ?assertEqual(~"BLOB", kura_dialect_sqlite:column_type({custom, kura_sqlite_bytes_type})).
+
+unload(Mod) ->
+    _ = code:purge(Mod),
+    _ = code:delete(Mod),
+    _ = code:purge(Mod),
+    ?assertNot(code:is_loaded(Mod)).

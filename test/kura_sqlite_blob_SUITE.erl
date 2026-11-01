@@ -17,7 +17,8 @@ text fields stay TEXT (Taure/kura#141).
     update_all_stores_blob_and_matches/1,
     insert_all_stores_blob/1,
     delete_all_matches_a_blob/1,
-    text_rows_converted_with_cast_match/1
+    text_rows_converted_with_cast_match/1,
+    first_query_on_an_unloaded_custom_type_casts/1
 ]).
 
 -define(REPO, kura_sqlite_blob_test_repo).
@@ -33,7 +34,8 @@ all() ->
         update_all_stores_blob_and_matches,
         insert_all_stores_blob,
         delete_all_matches_a_blob,
-        text_rows_converted_with_cast_match
+        text_rows_converted_with_cast_match,
+        first_query_on_an_unloaded_custom_type_casts
     ].
 
 init_per_suite(Config) ->
@@ -59,7 +61,7 @@ end_per_suite(_Config) ->
 init_per_testcase(_Case, Config) ->
     #{} = kura_db:query(
         ?REPO,
-        ~"CREATE TABLE vault (id INTEGER PRIMARY KEY, name TEXT, data BLOB, secret BLOB)",
+        ~"CREATE TABLE vault (id INTEGER PRIMARY KEY, name TEXT, data BLOB, secret BLOB, digest BLOB)",
         []
     ),
     Config.
@@ -140,6 +142,18 @@ text_rows_converted_with_cast_match(_Config) ->
     ?assertMatch([_], ids({data, ?BYTES})).
 
 %% A NULL encrypted column cannot be read back yet, so every row has a secret.
+%% The first compile of a query is cached, so a custom type module that is
+%% not loaded yet must still be seen as BLOB.
+first_query_on_an_unloaded_custom_type_casts(_Config) ->
+    #{} = kura_db:query(?REPO, ~"INSERT INTO vault (digest) VALUES (?1)", [{blob, ?BYTES}]),
+    _ = code:purge(kura_sqlite_bytes_type),
+    true = code:delete(kura_sqlite_bytes_type),
+    _ = code:purge(kura_sqlite_bytes_type),
+    false = code:is_loaded(kura_sqlite_bytes_type),
+    Q = kura_query:where(kura_query:from(kura_sqlite_lazy_schema), {digest, ?BYTES}),
+    ?assertMatch({ok, [_]}, kura_repo_worker:all(?REPO, Q)),
+    ?assertMatch({ok, [_]}, kura_repo_worker:all(?REPO, Q)).
+
 insert(Params0) ->
     Params = maps:merge(#{secret => ~"s"}, Params0),
     kura_repo_worker:insert(?REPO, kura_changeset:cast(?SCHEMA, #{}, Params, maps:keys(Params))).
