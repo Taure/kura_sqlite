@@ -101,18 +101,25 @@ connection to come free; `infinity` waits for as long as it takes, and
 so does a timeout longer than an Erlang timer can run.
 Callers wait in the order they came, and a connection that comes back, or
 one opened in place of a dropped one, goes to the first of them. A caller
-whose time runs out gets `{error, no_conns}`, and one that dies stops
-waiting. `#{timeout => 0}` does not wait. Nor does any checkout when
-nothing could come back to it: with no connection out or being reset, or
-once the pool has stopped opening connections, it returns
+whose time runs out gets `{error, checkout_timeout}`, and one that dies
+stops waiting. `#{timeout => 0}` does not wait and returns
+`{error, no_conns}` when no connection is free. Nor does any checkout
+wait when nothing could come back to it: with no connection out or being
+reset, or once the pool has stopped opening connections, it returns
 `{error, no_conns}` at once, and so does every caller still waiting.
 
-A pool too busy to answer within the timeout and another 500 ms returns
-`{error, checkout_timeout}`. A checkout carries its deadline, so one the
-pool only reaches after it has passed does not wait, and one that times
-out that way gives its lease or its place in the queue back, so a
-connection the pool hands out after the caller stopped waiting is not lost
-to it.
+A connection out counts as one that can come back, even when the caller
+holds it itself, so a process that holds the last connection and checks
+out again waits out its timeout and gets `{error, checkout_timeout}`, or,
+with `infinity`, waits for ever. Check out with `#{timeout => 0}` where
+that can happen.
+
+A pool too busy to answer within the timeout and another 500 ms also
+returns `{error, checkout_timeout}`. A checkout carries its deadline, so
+one the pool only reaches after it has passed does not wait and gets
+`{error, checkout_timeout}`, and one that times out that way gives its
+lease or its place in the queue back, so a connection the pool hands out
+after the caller stopped waiting is not lost to it.
 
 esqlite frees the handle twice when an open fails, which can corrupt the
 memory of the whole node, so the pool checks a database path before
@@ -206,7 +213,7 @@ connections nobody holds.
     timer := reference() | infinity
 }.
 
--type deadline() :: integer() | infinity.
+-type deadline() :: integer() | infinity | now.
 
 -type outcome() :: kept | {kept, [term()]} | dropped | not_utf8.
 
@@ -358,10 +365,14 @@ handle_call({checkout, Borrower, Lease, Deadline}, From, State0) ->
                 lent(Conn, Lease, Monitor, State#{available := Rest})};
         State ->
             case {outstanding(State), remaining(Deadline)} of
-                {true, Wait} when Wait =/= expired ->
-                    {noreply, queued(Borrower, Lease, Wait, From, State)};
-                {_, _} ->
-                    {reply, {error, no_conns}, State}
+                {false, _} ->
+                    {reply, {error, no_conns}, State};
+                {true, now} ->
+                    {reply, {error, no_conns}, State};
+                {true, expired} ->
+                    {reply, {error, checkout_timeout}, State};
+                {true, Wait} ->
+                    {noreply, queued(Borrower, Lease, Wait, From, State)}
             end
     end;
 handle_call({checkin, Conn, Lease}, From, State = #{out := Out}) ->
@@ -432,7 +443,7 @@ handle_info({waited, Lease}, State) when is_reference(Lease) ->
     case withdrawn(lease, Lease, State) of
         {#{from := From, monitor := Monitor}, Rest} ->
             true = erlang:demonitor(Monitor, [flush]),
-            ok = gen_server:reply(From, {error, no_conns}),
+            ok = gen_server:reply(From, {error, checkout_timeout}),
             {noreply, Rest};
         none ->
             {noreply, State}
@@ -501,12 +512,16 @@ answered_within(Wait) ->
 -spec deadline(timeout()) -> deadline().
 deadline(infinity) ->
     infinity;
+deadline(0) ->
+    now;
 deadline(Wait) ->
     erlang:monotonic_time(millisecond) + Wait.
 
--spec remaining(deadline()) -> timeout() | expired.
+-spec remaining(deadline()) -> timeout() | now | expired.
 remaining(infinity) ->
     infinity;
+remaining(now) ->
+    now;
 remaining(Deadline) ->
     case Deadline - erlang:monotonic_time(millisecond) of
         Left when Left > 0 -> Left;

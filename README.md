@@ -68,9 +68,13 @@ to start on this backend via `kura_capabilities:require/2`.
   rules. `PRAGMA foreign_keys` has no effect inside a transaction and every
   kura migration runs in one, so rebuild a referenced table outside a
   migration; `kura_driver_sqlite`'s documentation has the steps.
-- **Checkout waits** up to `#{timeout => Ms}` (5000 by default) for a
-  connection to come free, then returns `{error, no_conns}`.
-  `#{timeout => 0}` does not wait.
+- **Checkout waits** up to `#{timeout => Ms}` (5000 by default, or
+  `infinity`) for a connection to come free, then returns
+  `{error, checkout_timeout}`, as `kura_pool_minato` does.
+  `#{timeout => 0}` does not wait and returns `{error, no_conns}`, and so
+  does a checkout when no connection is out to come back. A process that
+  already holds the last connection and checks out again waits for the
+  whole timeout.
 - **UTF-8 only.** `start_pool/2` refuses a database in another encoding
   with `{error, {unsupported_encoding, Encoding}}`. Binaries are stored as
   TEXT, which a UTF-16 database transcodes, so encrypted fields would not

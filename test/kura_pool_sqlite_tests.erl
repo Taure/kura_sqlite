@@ -911,10 +911,10 @@ checkout_waits_for_a_checkin_test() ->
         ok = released(Waiter)
     end).
 
-checkout_that_runs_out_of_time_returns_no_conns_test() ->
+checkout_that_runs_out_of_time_returns_checkout_timeout_test() ->
     with_held(pool_for_waiting_timeout, fun(Name, Conn, Token) ->
         {Elapsed, Result} = timer:tc(kura_pool_sqlite, checkout, [Name, #{timeout => 100}]),
-        ?assertEqual({error, no_conns}, Result),
+        ?assertEqual({error, checkout_timeout}, Result),
         ?assert(Elapsed >= 100000),
         ?assertEqual(0, waiting(Name)),
         ok = kura_pool_sqlite:checkin(Name, Token),
@@ -1008,6 +1008,17 @@ waiter_gone_from_the_middle_of_the_queue_is_skipped_test() ->
         ok = released(First),
         ?assertMatch({ok, Conn, _}, result_of(Last)),
         ok = released(Last),
+        ?assertEqual(0, waiting(Name))
+    end).
+
+checkout_that_reaches_the_pool_after_its_deadline_returns_checkout_timeout_test() ->
+    with_held(pool_for_expired_deadline, fun(Name, _Conn, _Token) ->
+        Expired = erlang:monotonic_time(millisecond) - 1,
+        ?assertEqual(
+            {error, checkout_timeout},
+            gen_server:call(Name, {checkout, self(), make_ref(), Expired})
+        ),
+        ?assertEqual({error, no_conns}, kura_pool_sqlite:checkout(Name, #{timeout => 0})),
         ?assertEqual(0, waiting(Name))
     end).
 
