@@ -507,9 +507,10 @@ byte_fields_are_cached_per_schema_test() ->
     Key = {kura_dialect_sqlite, blob_fields, ?BLOB_SCHEMA},
     _ = persistent_term:erase(Key),
     {_, _} = kura_dialect_sqlite:insert(?BLOB_SCHEMA, [data], #{data => ~"d"}),
-    ?assertMatch(#{data := _, digest := _, secret := _}, persistent_term:get(Key)),
+    Types = kura_schema:field_types(?BLOB_SCHEMA),
+    ?assertMatch({Types, #{data := _, digest := _, secret := _}}, persistent_term:get(Key)),
     ?assertEqual(3, map_size(cached_blob_fields(Key))),
-    persistent_term:put(Key, #{}),
+    persistent_term:put(Key, {Types, #{}}),
     try
         {_, Params} = kura_dialect_sqlite:insert(?BLOB_SCHEMA, [data], #{data => ~"d"}),
         ?assertEqual([~"d"], Params)
@@ -517,7 +518,25 @@ byte_fields_are_cached_per_schema_test() ->
         persistent_term:erase(Key)
     end.
 
+%% kura_schema:forget/1 drops kura's cached field types; a cache entry
+%% computed from other field types is recomputed.
+byte_fields_follow_changed_field_types_test() ->
+    Key = {kura_dialect_sqlite, blob_fields, ?BLOB_SCHEMA},
+    persistent_term:put(Key, {#{data => string}, #{}}),
+    try
+        {_, Params} = kura_dialect_sqlite:insert(?BLOB_SCHEMA, [data], #{data => ~"d"}),
+        ?assertEqual([{blob, ~"d"}], Params),
+        ?assertEqual(3, map_size(cached_blob_fields(Key)))
+    after
+        persistent_term:erase(Key)
+    end.
+
+non_schema_lookup_is_not_cached_test() ->
+    Key = {kura_dialect_sqlite, blob_fields, kura_sqlite_not_yet_a_schema},
+    {_, _} = kura_dialect_sqlite:insert(kura_sqlite_not_yet_a_schema, [data], #{data => ~"d"}),
+    ?assertEqual(undefined, persistent_term:get(Key, undefined)).
+
 cached_blob_fields(Key) ->
     case persistent_term:get(Key) of
-        Blobs when is_map(Blobs) -> Blobs
+        {_Types, Blobs} when is_map(Blobs) -> Blobs
     end.

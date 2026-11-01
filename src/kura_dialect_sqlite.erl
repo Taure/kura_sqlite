@@ -363,22 +363,36 @@ blob_value(Field, Value, Blobs) when is_binary(Value), is_map_key(Field, Blobs) 
 blob_value(_Field, Value, _Blobs) ->
     Value.
 
-%% Kept in persistent_term per module, as kura_schema keeps field types.
+%% Kept in persistent_term per module with the field types they came from,
+%% and recomputed when kura's field types differ, as they do after
+%% kura_schema:forget/1. A module that is not a schema is not cached, since
+%% it may be loaded later.
 -spec blob_fields(term()) -> #{atom() => kura_types:kura_type()}.
 blob_fields(Mod) when is_atom(Mod), Mod =/= undefined ->
     Key = {?MODULE, blob_fields, Mod},
     case cached(Key) of
-        undefined ->
-            Blobs = schema_blob_fields(Mod),
-            persistent_term:put(Key, Blobs),
-            Blobs;
-        Blobs ->
-            Blobs
+        {Types, Blobs} when is_map(Types), is_map(Blobs) ->
+            case kura_schema:field_types(Mod) of
+                Types -> Blobs;
+                Changed -> cache_blob_fields(Key, Changed)
+            end;
+        _ ->
+            case is_schema(Mod) of
+                true -> cache_blob_fields(Key, kura_schema:field_types(Mod));
+                false -> #{}
+            end
     end;
 blob_fields(_Table) ->
     #{}.
 
-%% persistent_term is untyped; what is stored under the key is the map
+-spec cache_blob_fields(term(), #{atom() => kura_types:kura_type()}) ->
+    #{atom() => kura_types:kura_type()}.
+cache_blob_fields(Key, Types) ->
+    Blobs = schema_blob_fields(Types),
+    persistent_term:put(Key, {Types, Blobs}),
+    Blobs.
+
+%% persistent_term is untyped; what is stored under the key is the pair
 %% blob_fields/1 put there.
 -spec cached(term()) -> dynamic().
 cached(Key) ->
@@ -387,23 +401,19 @@ cached(Key) ->
 %% The fields of a schema stored in BLOB columns. A name holding `?` is left
 %% out, since it would be read as a placeholder in a fragment, unless the
 %% field is encrypted: a condition on one is refused before any fragment.
--spec schema_blob_fields(module()) -> #{atom() => kura_types:kura_type()}.
-schema_blob_fields(Mod) ->
-    case is_schema(Mod) of
-        true ->
-            maps:filter(
-                fun
-                    (_Field, {encrypted, _}) ->
-                        true;
-                    (Field, Type) ->
-                        blob_type(Type) andalso
-                            binary:match(atom_to_binary(Field, utf8), ~"?") =:= nomatch
-                end,
-                kura_schema:field_types(Mod)
-            );
-        false ->
-            #{}
-    end.
+-spec schema_blob_fields(#{atom() => kura_types:kura_type()}) ->
+    #{atom() => kura_types:kura_type()}.
+schema_blob_fields(Types) ->
+    maps:filter(
+        fun
+            (_Field, {encrypted, _}) ->
+                true;
+            (Field, Type) ->
+                blob_type(Type) andalso
+                    binary:match(atom_to_binary(Field, utf8), ~"?") =:= nomatch
+        end,
+        Types
+    ).
 
 -spec is_schema(module()) -> boolean().
 is_schema(Mod) ->
