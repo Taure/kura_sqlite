@@ -593,6 +593,12 @@ byte_fields_follow_changed_field_types_test() ->
         persistent_term:erase(Key)
     end.
 
+module_without_fields_is_not_a_schema_test() ->
+    Key = {kura_dialect_sqlite, blob_fields, kura_sqlite_table_only},
+    {_, Params} = kura_dialect_sqlite:insert(kura_sqlite_table_only, [data], #{data => ~"d"}),
+    ?assertEqual([~"d"], Params),
+    ?assertEqual(undefined, persistent_term:get(Key, undefined)).
+
 non_schema_lookup_is_not_cached_test() ->
     Key = {kura_dialect_sqlite, blob_fields, kura_sqlite_not_yet_a_schema},
     {_, _} = kura_dialect_sqlite:insert(kura_sqlite_not_yet_a_schema, [data], #{data => ~"d"}),
