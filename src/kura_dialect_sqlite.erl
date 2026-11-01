@@ -239,10 +239,31 @@ blob_value(Field, Value, Blobs) when is_binary(Value), is_map_key(Field, Blobs) 
 blob_value(_Field, Value, _Blobs) ->
     Value.
 
-%% The fields of a schema stored in BLOB columns. A name holding `?` is left
-%% out, since it would be read as a placeholder in a fragment.
+%% Kept in persistent_term per module, as kura_schema keeps field types.
 -spec blob_fields(term()) -> #{atom() => kura_types:kura_type()}.
 blob_fields(Mod) when is_atom(Mod), Mod =/= undefined ->
+    Key = {?MODULE, blob_fields, Mod},
+    case cached(Key) of
+        undefined ->
+            Blobs = schema_blob_fields(Mod),
+            persistent_term:put(Key, Blobs),
+            Blobs;
+        Blobs ->
+            Blobs
+    end;
+blob_fields(_Table) ->
+    #{}.
+
+%% persistent_term is untyped; what is stored under the key is the map
+%% blob_fields/1 put there.
+-spec cached(term()) -> dynamic().
+cached(Key) ->
+    persistent_term:get(Key, undefined).
+
+%% The fields of a schema stored in BLOB columns. A name holding `?` is left
+%% out, since it would be read as a placeholder in a fragment.
+-spec schema_blob_fields(module()) -> #{atom() => kura_types:kura_type()}.
+schema_blob_fields(Mod) ->
     case is_schema(Mod) of
         true ->
             maps:filter(
@@ -254,9 +275,7 @@ blob_fields(Mod) when is_atom(Mod), Mod =/= undefined ->
             );
         false ->
             #{}
-    end;
-blob_fields(_Table) ->
-    #{}.
+    end.
 
 -spec is_schema(module()) -> boolean().
 is_schema(Mod) ->

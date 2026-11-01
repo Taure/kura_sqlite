@@ -377,3 +377,22 @@ where_fragment_is_untouched_test() ->
     ?assertEqual(
         {<<"length(data) > ?1">>, [3]}, where_sql({fragment, ~"length(data) > ?", [3]})
     ).
+
+byte_fields_are_cached_per_schema_test() ->
+    Key = {kura_dialect_sqlite, blob_fields, ?BLOB_SCHEMA},
+    _ = persistent_term:erase(Key),
+    {_, _} = kura_dialect_sqlite:insert(?BLOB_SCHEMA, [data], #{data => ~"d"}),
+    ?assertMatch(#{data := _, digest := _, secret := _}, persistent_term:get(Key)),
+    ?assertEqual(3, map_size(cached_blob_fields(Key))),
+    persistent_term:put(Key, #{}),
+    try
+        {_, Params} = kura_dialect_sqlite:insert(?BLOB_SCHEMA, [data], #{data => ~"d"}),
+        ?assertEqual([~"d"], Params)
+    after
+        persistent_term:erase(Key)
+    end.
+
+cached_blob_fields(Key) ->
+    case persistent_term:get(Key) of
+        Blobs when is_map(Blobs) -> Blobs
+    end.
