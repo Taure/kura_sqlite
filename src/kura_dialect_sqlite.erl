@@ -59,6 +59,10 @@ These binaries still bind as TEXT:
 The byte fields of the `from` schema and of every joined schema are
 rewritten, since a where-field is not qualified by its table.
 
+A byte column `kura_migrator` creates is declared
+`BLOB CHECK (typeof(col) IN ('blob', 'null'))`, so it refuses a TEXT value
+(see `blob_checks/1`).
+
 A condition on a byte field with an operator the rewrite cannot cast
 raises `{kura_sqlite, {unsupported_blob_condition, Field, Op}}`. `like`,
 `ilike`, `is_nil`, `is_not_nil` and an empty `in` or `not_in` list are
@@ -91,10 +95,16 @@ passed through unchanged.
     insert_all/4,
     column_type/1,
     format_default/1,
-    swap_placeholders/1
+    swap_placeholders/1,
+    blob_checks/1,
+    blob_columns/1
 ]).
 
 -define(CAST, ~"CAST(? AS BLOB)").
+%% column_type/1 of a byte column. The comment is the marker blob_checks/1
+%% replaces, since a column's CHECK names it and column_type/1 is not given
+%% the name.
+-define(BLOB_COLUMN, ~"BLOB /* kura_sqlite: blob */").
 %% kura's ?KURA_IS_UNARY_OP, which the pinned kura does not define yet.
 -define(IS_UNARY_OP(Op), (Op =:= is_nil orelse Op =:= is_not_nil)).
 -define(IS_COMPARISON(Op),
@@ -172,47 +182,54 @@ insert_all(SchemaOrTable, Fields, Rows, Opts) ->
 %%----------------------------------------------------------------------
 
 -spec column_type(kura_types:kura_type()) -> binary().
-column_type(id) ->
+column_type(Type) ->
+    case storage_type(Type) of
+        ~"BLOB" -> ?BLOB_COLUMN;
+        Storage -> Storage
+    end.
+
+-spec storage_type(kura_types:kura_type()) -> binary().
+storage_type(id) ->
     ~"INTEGER";
-column_type(integer) ->
+storage_type(integer) ->
     ~"INTEGER";
-column_type(bigint) ->
+storage_type(bigint) ->
     ~"INTEGER";
-column_type(smallint) ->
+storage_type(smallint) ->
     ~"INTEGER";
-column_type(float) ->
+storage_type(float) ->
     ~"REAL";
-column_type(decimal) ->
+storage_type(decimal) ->
     ~"NUMERIC";
-column_type(string) ->
+storage_type(string) ->
     ~"TEXT";
-column_type(text) ->
+storage_type(text) ->
     ~"TEXT";
-column_type(binary) ->
+storage_type(binary) ->
     ~"BLOB";
-column_type(boolean) ->
+storage_type(boolean) ->
     ~"INTEGER";
-column_type(date) ->
+storage_type(date) ->
     ~"TEXT";
-column_type(time) ->
+storage_type(time) ->
     ~"TEXT";
-column_type(utc_datetime) ->
+storage_type(utc_datetime) ->
     ~"TEXT";
-column_type(naive_datetime) ->
+storage_type(naive_datetime) ->
     ~"TEXT";
-column_type(uuid) ->
+storage_type(uuid) ->
     ~"TEXT";
-column_type(jsonb) ->
+storage_type(jsonb) ->
     ~"TEXT";
-column_type({enum, _}) ->
+storage_type({enum, _}) ->
     ~"TEXT";
-column_type({array, _}) ->
+storage_type({array, _}) ->
     ~"TEXT";
-column_type({embed, _, _}) ->
+storage_type({embed, _, _}) ->
     ~"TEXT";
-column_type({encrypted, _}) ->
+storage_type({encrypted, _}) ->
     ~"BLOB";
-column_type({custom, Mod}) ->
+storage_type({custom, Mod}) ->
     _ = code:ensure_loaded(Mod),
     case erlang:function_exported(Mod, sqlite_type, 0) of
         true -> Mod:sqlite_type();
@@ -234,6 +251,88 @@ format_default(Val) when is_map(Val) ->
 format_default(Val) when is_list(Val) ->
     Json = iolist_to_binary(json:encode(Val)),
     <<"'", Json/binary, "'">>.
+
+-doc """
+Add `CHECK (typeof(col) IN ('blob', 'null'))` to every byte column a
+`CREATE TABLE` or `ALTER TABLE ... ADD COLUMN` from `kura_migrator`
+defines, found by the marker `column_type/1` writes for it.
+`kura_driver_sqlite` applies it to every `CREATE` and `ALTER` statement.
+
+A UNIQUE index treats TEXT and BLOB holding the same bytes as different
+values, so a TEXT row in a byte column could be shadowed by a BLOB row
+with the same bytes. A column whose name holds `?`, whose values bind as
+TEXT, is left without the check.
+""".
+-spec blob_checks(binary()) -> binary().
+blob_checks(SQL) ->
+    case binary:split(SQL, ?BLOB_COLUMN, [global]) of
+        [SQL] -> SQL;
+        Parts -> iolist_to_binary(checked(Parts))
+    end.
+
+-spec checked([binary()]) -> [binary()].
+checked([Last]) ->
+    [Last];
+checked([Before | Rest]) ->
+    [Before, blob_column(quoted_column(Before)) | checked(Rest)].
+
+-spec blob_column({ok, binary()} | error) -> binary().
+blob_column({ok, Quoted}) ->
+    <<"BLOB CHECK (typeof(", Quoted/binary, ") IN ('blob', 'null'))">>;
+blob_column(error) ->
+    ?BLOB_COLUMN.
+
+%% kura_migrator writes a column as `"name" Type`, so the text before the
+%% marker ends with the quoted name and a space.
+-spec quoted_column(binary()) -> {ok, binary()} | error.
+quoted_column(Before) ->
+    Size = byte_size(Before),
+    case Size >= 3 andalso binary:part(Before, Size - 2, 2) =:= ~"\" " of
+        true -> opening_quote(Before, Size - 3, Size - 2);
+        false -> error
+    end.
+
+%% Inside a quoted name a quote is doubled, so walking back from the closing
+%% quote, the opening one ends the first run of an odd number of quotes.
+-spec opening_quote(binary(), integer(), non_neg_integer()) -> {ok, binary()} | error.
+opening_quote(_SQL, Pos, _Close) when Pos < 0 ->
+    error;
+opening_quote(SQL, Pos, Close) ->
+    case binary:at(SQL, Pos) of
+        $" ->
+            Start = run_start(SQL, Pos),
+            case (Pos - Start) rem 2 of
+                0 -> without_placeholder(binary:part(SQL, Start, Close - Start + 1));
+                1 -> opening_quote(SQL, Start - 1, Close)
+            end;
+        _ ->
+            opening_quote(SQL, Pos - 1, Close)
+    end.
+
+-spec run_start(binary(), non_neg_integer()) -> non_neg_integer().
+run_start(SQL, Pos) when Pos > 0 ->
+    case binary:at(SQL, Pos - 1) of
+        $" -> run_start(SQL, Pos - 1);
+        _ -> Pos
+    end;
+run_start(_SQL, Pos) ->
+    Pos.
+
+-spec without_placeholder(binary()) -> {ok, binary()} | error.
+without_placeholder(Quoted) ->
+    case binary:match(Quoted, ~"?") of
+        nomatch -> {ok, Quoted};
+        _ -> error
+    end.
+
+-doc """
+The fields of a schema stored in BLOB columns, in field order, leaving out
+virtual fields. `kura_sqlite:check_blob_columns/2` checks these.
+""".
+-spec blob_columns(module()) -> [atom()].
+blob_columns(Schema) ->
+    Blobs = blob_fields(Schema),
+    [Field || Field <- kura_schema:non_virtual_fields(Schema), is_map_key(Field, Blobs)].
 
 %%----------------------------------------------------------------------
 %% Byte fields
@@ -305,7 +404,7 @@ is_schema(Mod) ->
 -spec blob_type(kura_types:kura_type()) -> boolean().
 blob_type(binary) -> true;
 blob_type({encrypted, _}) -> true;
-blob_type({custom, _} = Type) -> column_type(Type) =:= ~"BLOB";
+blob_type({custom, _} = Type) -> storage_type(Type) =:= ~"BLOB";
 blob_type(_Type) -> false.
 
 %% A query compiled once is reused with other values, so the cast is written

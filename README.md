@@ -86,6 +86,13 @@ to start on this backend via `kura_capabilities:require/2`.
   than a schema (including a many-to-many join table whose `join_through`
   is a binary), and values of a field whose name contains `?`. In raw SQL,
   pass `{blob, Bin}` to bind a BLOB.
+- **Byte columns refuse TEXT.** A byte column a kura migration creates,
+  with `create_table` or `add_column`, is declared
+  `BLOB CHECK (typeof(col) IN ('blob', 'null'))`, so a TEXT value written
+  by raw SQL is refused rather than stored next to a BLOB with the same
+  bytes. The check is left off a column whose name contains `?`. A text
+  `default` on such a column is a TEXT value too, and is refused when a
+  row takes it.
 - **Joins and CTEs by name.** A `from` or join target named by atom or
   binary rather than a schema module, or a CTE, has no field types, so a
   where-condition on one of its BLOB columns binds TEXT. SQLite orders
@@ -144,8 +151,12 @@ to start on this backend via `kura_capabilities:require/2`.
   before holds TEXT, which a query on the field no longer matches, and a
   UNIQUE index treats TEXT `'abc'` and BLOB `'abc'` as different values.
   So until a column is converted, an upsert whose conflict target is that
-  column misses the old row and inserts a second one. See below for how
-  to convert, and how to handle rows written before converting.
+  column misses the old row and inserts a second one, and a lookup finds
+  only the new one. See below for how to convert, how to handle rows
+  written before converting, and how to check that none are left.
+- **Migrations** declare new byte columns with
+  `CHECK (typeof(col) IN ('blob', 'null'))`. Columns created before keep
+  no check.
 
 ### Converting byte columns
 
@@ -177,6 +188,22 @@ WHERE typeof(old.col) = 'text' AND typeof(new.col) = 'blob';
 For each pair, keep one row and delete the other, first moving over
 anything that references the row you delete. The BLOB row is the newer
 one. Then run the conversion.
+
+After the upgrade, check that no byte column still holds TEXT, for
+example when the application starts, and refuse to serve until it does
+not:
+
+```erlang
+ok = kura_sqlite:check_blob_columns(my_repo, [my_user, my_api_key]).
+```
+
+It returns `{error, [{text_in_blob_column, Table, Column}]}` for each
+column that still holds a TEXT value, and
+`{error, [{check_failed, Table, Column, Reason}]}` for one it could not
+read. A column created before 0.6 has no CHECK, so raw SQL can still
+write TEXT to it; to add one, rebuild the table as SQLite's
+[ALTER TABLE](https://www.sqlite.org/lang_altertable.html#otheralter)
+page describes.
 
 ## License
 

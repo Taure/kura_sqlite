@@ -36,7 +36,7 @@ column_type_basics_test_() ->
         ?_assertEqual(~"TEXT", kura_dialect_sqlite:column_type(uuid)),
         ?_assertEqual(~"TEXT", kura_dialect_sqlite:column_type(jsonb)),
         ?_assertEqual(~"TEXT", kura_dialect_sqlite:column_type(utc_datetime)),
-        ?_assertEqual(~"BLOB", kura_dialect_sqlite:column_type(binary)),
+        ?_assertMatch(<<"BLOB", _/binary>>, kura_dialect_sqlite:column_type(binary)),
         ?_assertEqual(~"TEXT", kura_dialect_sqlite:column_type({enum, [a, b]})),
         ?_assertEqual(~"TEXT", kura_dialect_sqlite:column_type({array, integer}))
     ].
@@ -357,7 +357,45 @@ cte_and_union_cast_test() ->
 
 column_type_loads_an_unloaded_custom_type_test() ->
     unload(kura_sqlite_bytes_type),
-    ?assertEqual(~"BLOB", kura_dialect_sqlite:column_type({custom, kura_sqlite_bytes_type})).
+    ?assertEqual(
+        kura_dialect_sqlite:column_type(binary),
+        kura_dialect_sqlite:column_type({custom, kura_sqlite_bytes_type})
+    ).
+
+blob_checks_constrain_byte_columns_test_() ->
+    Blob = kura_dialect_sqlite:column_type(binary),
+    Check = fun(Column) ->
+        <<"BLOB CHECK (typeof(", Column/binary, ") IN ('blob', 'null'))">>
+    end,
+    Cases = [
+        {
+            <<"CREATE TABLE \"t\" (\"id\" INTEGER, \"data\" ", Blob/binary, " NOT NULL)">>,
+            <<"CREATE TABLE \"t\" (\"id\" INTEGER, \"data\" ", (Check(~"\"data\""))/binary,
+                " NOT NULL)">>
+        },
+        {
+            <<"CREATE TABLE \"t\" (\"a\" ", Blob/binary, ", \"b\" ", Blob/binary, ")">>,
+            <<"CREATE TABLE \"t\" (\"a\" ", (Check(~"\"a\""))/binary, ", \"b\" ",
+                (Check(~"\"b\""))/binary, ")">>
+        },
+        {
+            <<"ALTER TABLE \"t\" ADD COLUMN \"x\"\"y\" ", Blob/binary>>,
+            <<"ALTER TABLE \"t\" ADD COLUMN \"x\"\"y\" ", (Check(~"\"x\"\"y\""))/binary>>
+        },
+        {
+            <<"CREATE TABLE \"t\" (\"\"\"q\" ", Blob/binary, ")">>,
+            <<"CREATE TABLE \"t\" (\"\"\"q\" ", (Check(~"\"\"\"q\""))/binary, ")">>
+        },
+        {
+            <<"CREATE TABLE \"t\" (\"a?\" ", Blob/binary, ")">>,
+            <<"CREATE TABLE \"t\" (\"a?\" ", Blob/binary, ")">>
+        },
+        {<<"ALTER TABLE \"t\" ALTER COLUMN \"c\" TYPE ", Blob/binary>>, <<
+            "ALTER TABLE \"t\" ALTER COLUMN \"c\" TYPE ", Blob/binary
+        >>},
+        {~"CREATE TABLE \"t\" (\"data\" BLOB)", ~"CREATE TABLE \"t\" (\"data\" BLOB)"}
+    ],
+    [?_assertEqual(Out, kura_dialect_sqlite:blob_checks(In)) || {In, Out} <- Cases].
 
 unload(Mod) ->
     _ = code:purge(Mod),

@@ -7,6 +7,7 @@ text fields stay TEXT (Taure/kura#141).
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("stdlib/include/assert.hrl").
+-include_lib("kura/include/kura.hrl").
 
 -export([all/0, init_per_suite/1, end_per_suite/1, init_per_testcase/2, end_per_testcase/2]).
 -export([
@@ -20,7 +21,9 @@ text fields stay TEXT (Taure/kura#141).
     text_rows_converted_with_cast_match/1,
     first_query_on_an_unloaded_custom_type_casts/1,
     unique_text_and_blob_duplicate_is_found_and_resolved/1,
-    exclusion_on_a_joined_blob_column_matches/1
+    exclusion_on_a_joined_blob_column_matches/1,
+    migrated_byte_columns_refuse_text/1,
+    check_blob_columns_finds_text_rows/1
 ]).
 
 -define(REPO, kura_sqlite_blob_test_repo).
@@ -40,7 +43,9 @@ all() ->
         text_rows_converted_with_cast_match,
         first_query_on_an_unloaded_custom_type_casts,
         unique_text_and_blob_duplicate_is_found_and_resolved,
-        exclusion_on_a_joined_blob_column_matches
+        exclusion_on_a_joined_blob_column_matches,
+        migrated_byte_columns_refuse_text,
+        check_blob_columns_finds_text_rows
     ].
 
 init_per_suite(Config) ->
@@ -207,6 +212,61 @@ exclusion_on_a_joined_blob_column_matches(_Config) ->
     after
         #{} = kura_db:query(?REPO, ~"DROP TABLE owners", [])
     end.
+
+%% A UNIQUE index treats TEXT and BLOB as different values, so a column a
+%% migration creates refuses TEXT rather than let a BLOB row shadow one.
+migrated_byte_columns_refuse_text(_Config) ->
+    Create = kura_migrator:compile_operation(
+        ?REPO,
+        {create_table, ~"locker", [
+            #kura_column{name = id, type = id, primary_key = true, nullable = false},
+            #kura_column{name = name, type = string},
+            #kura_column{name = data, type = binary},
+            #kura_column{name = secret, type = {encrypted, string}},
+            #kura_column{name = digest, type = {custom, kura_sqlite_bytes_type}}
+        ]}
+    ),
+    Alter = kura_migrator:compile_operation(
+        ?REPO, {alter_table, ~"locker", [{add_column, #kura_column{name = extra, type = binary}}]}
+    ),
+    #{} = kura_db:query(?REPO, Create, []),
+    try
+        #{} = kura_db:query(?REPO, Alter, []),
+        Insert = fun(Column, Value) ->
+            kura_db:query(
+                ?REPO,
+                <<"INSERT INTO locker (", Column/binary, ") VALUES (?1)">>,
+                [Value]
+            )
+        end,
+        [
+            ?assertMatch({error, _}, Insert(Column, ~"text"))
+         || Column <- [~"data", ~"secret", ~"digest", ~"extra"]
+        ],
+        [
+            ?assertMatch(#{}, Insert(Column, Value))
+         || Column <- [~"data", ~"secret", ~"digest", ~"extra"], Value <- [{blob, ~"b"}, null]
+        ],
+        ?assertMatch(#{}, Insert(~"name", ~"text"))
+    after
+        #{} = kura_db:query(?REPO, ~"DROP TABLE locker", [])
+    end.
+
+check_blob_columns_finds_text_rows(_Config) ->
+    ?assertEqual(ok, kura_sqlite:check_blob_columns(?REPO, [?SCHEMA])),
+    {ok, _} = insert(#{name => ~"n", data => ?BYTES}),
+    ?assertEqual(ok, kura_sqlite:check_blob_columns(?REPO, [?SCHEMA])),
+    #{} = kura_db:query(?REPO, ~"INSERT INTO vault (name, data) VALUES ('n', ?1)", [~"text"]),
+    ?assertEqual(
+        {error, [{text_in_blob_column, ~"vault", data}]},
+        kura_sqlite:check_blob_columns(?REPO, [?SCHEMA])
+    ),
+    #{} = kura_db:query(?REPO, ?CONVERT, []),
+    ?assertEqual(ok, kura_sqlite:check_blob_columns(?REPO, [?SCHEMA, kura_sqlite_lazy_schema])),
+    ?assertMatch(
+        {error, [{check_failed, ~"owners", _, _}]},
+        kura_sqlite:check_blob_columns(?REPO, [kura_sqlite_owner_bytes_schema])
+    ).
 
 where(Condition) ->
     kura_query:where(kura_query:from(?SCHEMA), Condition).

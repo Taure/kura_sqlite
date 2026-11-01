@@ -21,6 +21,12 @@ a BLOB, and `undefined` or `null` as NULL. `kura_dialect_sqlite` passes
 the values of byte-typed schema fields as `{blob, Bin}`; raw SQL can do
 the same.
 
+## Byte columns
+
+A byte column that `kura_migrator` creates, in `CREATE TABLE` or
+`ALTER TABLE ... ADD COLUMN`, gets `CHECK (typeof(col) IN ('blob',
+'null'))`; see `kura_dialect_sqlite:blob_checks/1`.
+
 ## Errors
 
 A statement that fails returns `{error, Reason}`, `Reason` being the
@@ -321,6 +327,8 @@ run(Conn, SQL, {First, Second}, Params) when
         {_, true} -> dropped_alone(Conn, SQL, Params);
         {_, false} -> dropped(Conn, SQL, Params)
     end;
+run(Conn, SQL, {First, _}, Params) when First =:= ~"CREATE"; First =:= ~"ALTER" ->
+    prepared(Conn, kura_dialect_sqlite:blob_checks(SQL), Params, other);
 run(Conn, SQL, {First, _}, Params) ->
     prepared(Conn, SQL, Params, command_of(First)).
 
