@@ -165,6 +165,21 @@ to start on this backend via `kura_capabilities:require/2`.
 - **Migrations** declare new byte columns with
   `CHECK (typeof(col) IN ('blob', 'null'))`. Columns created before keep
   no check.
+- **NULL** reads as `null` in driver results, as kura_postgres returns it,
+  instead of `undefined`. Rows loaded through a schema still hold
+  `undefined`, and a NULL `{encrypted, _}` field now loads instead of
+  crashing. A raw `kura_db:query/3` sees `null`, and so does
+  `kura_repo_worker:aggregate/3`: a `sum`, `min`, `max` or `avg` over no
+  rows returns `{ok, null}` rather than `{ok, undefined}`.
+  `aggregate/4` returns its default for either.
+- **Row counts**: an `INSERT`, `UPDATE`, `DELETE` or `REPLACE` without
+  `RETURNING`, also after a `WITH`, reports the rows it changed, so
+  `update_all`, `delete_all` and `insert_all` return the real count
+  instead of `{ok, 0}`.
+- **Raw query results**: a raw `kura_db:query/3` write without
+  `RETURNING` now reports its real `num_rows` instead of 0, and a
+  `WITH ... SELECT` reports `command := select` instead of `other`.
+  Callers matching on the old values need updating.
 
 ### Converting byte columns
 

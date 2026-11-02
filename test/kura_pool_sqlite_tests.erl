@@ -979,10 +979,13 @@ checkout_without_a_timeout_waits_test() ->
 checkout_wait_longer_than_a_timer_can_run_waits_test() ->
     with_held(pool_for_longest_wait, fun(Name, Conn, Token) ->
         Waiters = [
-            waiter(Name, #{timeout => Wait})
-         || Wait <- [16#FFFFFFFF - 500, 16#FFFFFFFF - 499, 5000000000]
+            begin
+                Waiter = waiter(Name, #{timeout => Wait}),
+                ok = await_waiting(Name, Queued),
+                Waiter
+            end
+         || {Queued, Wait} <- lists:enumerate([16#FFFFFFFF - 500, 16#FFFFFFFF - 499, 5000000000])
         ],
-        ok = await_waiting(Name, 3),
         ok = kura_pool_sqlite:checkin(Name, Token),
         _ = [
             begin

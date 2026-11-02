@@ -10,7 +10,10 @@ smoke_test_() ->
             {"boolean round-trips as 0/1", fun boolean_roundtrip/0},
             {"jsonb stored as TEXT, decoded back to map", fun jsonb_roundtrip/0},
             {"encrypted column emits BLOB", fun encrypted_ddl_blob/0},
-            {"encrypted value round-trips through a BLOB column", fun encrypted_roundtrip/0}
+            {"encrypted value round-trips through a BLOB column", fun encrypted_roundtrip/0},
+            {"NULL encrypted value reads back as undefined", fun encrypted_null_reads_undefined/0},
+            {"bulk writes report the rows they changed", fun bulk_writes_report_rows_changed/0},
+            {"aggregate over no rows is null", fun aggregate_over_no_rows_is_null/0}
         ]
     end}.
 
@@ -18,7 +21,14 @@ smoke_test_() ->
 
 setup() ->
     {ok, _} = application:ensure_all_started(crypto),
-    application:set_env(kura, repos, #{?REPO => #{dialect => kura_dialect_sqlite}}),
+    application:set_env(kura, repos, #{
+        ?REPO => #{
+            dialect => kura_dialect_sqlite,
+            pool => kura_sqlite_smoke_pool,
+            pool_module => kura_pool_sqlite,
+            driver_module => kura_driver_sqlite
+        }
+    }),
     application:set_env(kura, dialect, kura_dialect_sqlite),
     application:set_env(kura, encryption, #{
         active => 1, keys => [{1, base64:encode(crypto:strong_rand_bytes(32))}]
@@ -120,7 +130,7 @@ encrypted_roundtrip() ->
     {ok, Conn, Tk} = kura_pool_sqlite:checkout(Name, #{}),
     try
         ok = esqlite3:exec(Conn, DDL),
-        #{num_rows := 0} = kura_driver_sqlite:query_on(
+        #{num_rows := 1} = kura_driver_sqlite:query_on(
             Conn, ~"INSERT INTO \"vault2\" (secret) VALUES (?1)", [Cipher], #{}
         ),
         #{rows := [#{secret := Stored}]} = kura_driver_sqlite:query_on(
@@ -131,3 +141,66 @@ encrypted_roundtrip() ->
     after
         kura_pool_sqlite:checkin(Name, Tk)
     end.
+
+encrypted_null_reads_undefined() ->
+    ok = vault_table(),
+    {ok, 2} = kura_repo_worker:insert_all(?REPO, kura_sqlite_vault_schema, [
+        #{secret => ~"kept", note => ~"a"},
+        #{secret => undefined, note => undefined}
+    ]),
+    Rows = kura_repo_worker:all(
+        ?REPO, kura_query:order_by(kura_query:from(kura_sqlite_vault_schema), [{id, asc}])
+    ),
+    ?assertMatch(
+        {ok, [
+            #{secret := ~"kept", note := ~"a"},
+            #{secret := undefined, note := undefined}
+        ]},
+        Rows
+    ).
+
+bulk_writes_report_rows_changed() ->
+    ok = vault_table(),
+    Entries = [#{note => N} || N <- [~"a", ~"b", ~"c"]],
+    ?assertEqual({ok, 3}, kura_repo_worker:insert_all(?REPO, kura_sqlite_vault_schema, Entries)),
+    Vault = kura_query:from(kura_sqlite_vault_schema),
+    ?assertEqual(
+        {ok, 2},
+        kura_repo_worker:update_all(
+            ?REPO, kura_query:where(Vault, {note, in, [~"a", ~"b"]}), #{note => ~"z"}
+        )
+    ),
+    ?assertEqual(
+        {ok, 0},
+        kura_repo_worker:update_all(?REPO, kura_query:where(Vault, {note, ~"none"}), #{
+            note => ~"y"
+        })
+    ),
+    ?assertEqual(
+        {ok, 2}, kura_repo_worker:delete_all(?REPO, kura_query:where(Vault, {note, ~"z"}))
+    ),
+    ?assertEqual({ok, 1}, kura_repo_worker:delete_all(?REPO, Vault)),
+    ?assertEqual({ok, 0}, kura_repo_worker:delete_all(?REPO, Vault)).
+
+vault_table() ->
+    DDL = kura_migrator:compile_operation(
+        ?REPO,
+        {create_table, ~"vault_rows", [
+            #kura_column{name = id, type = id, primary_key = true, nullable = false},
+            #kura_column{name = secret, type = {encrypted, string}},
+            #kura_column{name = note, type = string}
+        ]}
+    ),
+    #{} = kura_db:query(?REPO, ~"DROP TABLE IF EXISTS vault_rows", []),
+    #{} = kura_db:query(?REPO, DDL, []),
+    ok.
+
+aggregate_over_no_rows_is_null() ->
+    ok = vault_table(),
+    Vault = kura_query:from(kura_sqlite_vault_schema),
+    ?assertEqual({ok, null}, kura_repo_worker:aggregate(?REPO, Vault, {sum, id})),
+    ?assertEqual({ok, null}, kura_repo_worker:aggregate(?REPO, Vault, {max, id})),
+    ?assertEqual({ok, null}, kura_repo_worker:aggregate(?REPO, Vault, {min, id})),
+    ?assertEqual({ok, null}, kura_repo_worker:aggregate(?REPO, Vault, {avg, id})),
+    ?assertEqual({ok, 0}, kura_repo_worker:aggregate(?REPO, Vault, {sum, id}, 0)),
+    ?assertEqual({ok, 0}, kura_repo_worker:count(?REPO, Vault)).
