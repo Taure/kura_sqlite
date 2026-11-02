@@ -901,3 +901,205 @@ foreign_keys_turned_off_through_query_on_do_not_outlive_the_lease_test() ->
         ),
         ?assertMatch({error, _}, sql(Pool, ~"INSERT INTO child VALUES (42)"))
     end).
+
+null_is_null_in_every_column_type_test() ->
+    {Pool, Path} = nested_setup(memory, 1),
+    try
+        #{} = sql(
+            Pool,
+            ~"CREATE TABLE nulls (i INTEGER, r REAL, t TEXT, b BLOB, n NUMERIC, a ANY_AFFINITY)"
+        ),
+        #{} = sql(Pool, ~"INSERT INTO nulls VALUES (NULL, NULL, NULL, NULL, NULL, NULL)"),
+        ?assertEqual(
+            #{
+                rows => [#{i => null, r => null, t => null, b => null, n => null, a => null}],
+                num_rows => 1,
+                command => select
+            },
+            sql(Pool, ~"SELECT i, r, t, b, n, a FROM nulls")
+        ),
+        ?assertMatch(
+            #{rows := [#{i := null, t := ~"x"}]},
+            kura_driver_sqlite:query(
+                kura_pool_sqlite,
+                Pool,
+                ~"INSERT INTO nulls (i, t) VALUES (?1, ?2) RETURNING i, t",
+                [null, ~"x"],
+                #{}
+            )
+        ),
+        ?assertMatch(
+            #{rows := [#{i := null}]},
+            transaction(Pool, fun() -> sql(Pool, ~"SELECT i FROM nulls WHERE t = 'x'") end)
+        )
+    after
+        nested_teardown({Pool, Path})
+    end.
+
+write_without_returning_counts_the_rows_it_changed_test() ->
+    {Pool, Path} = nested_setup(memory, 1),
+    try
+        #{} = sql(Pool, ~"CREATE UNIQUE INDEX nested_id ON nested (id)"),
+        ?assertMatch(
+            #{rows := [], num_rows := 3, command := insert},
+            sql(Pool, ~"INSERT INTO nested VALUES (1), (2), (3)")
+        ),
+        ?assertMatch(
+            #{rows := [], num_rows := 1, command := insert},
+            sql(Pool, ~"INSERT INTO nested VALUES (3), (4) ON CONFLICT DO NOTHING")
+        ),
+        ?assertMatch(
+            #{rows := [], num_rows := 2, command := update},
+            sql(Pool, ~"UPDATE nested SET id = id + 10 WHERE id > 2")
+        ),
+        ?assertMatch(
+            #{rows := [], num_rows := 0, command := update},
+            sql(Pool, ~"UPDATE nested SET id = 0 WHERE id > 100")
+        ),
+        ?assertMatch(
+            #{rows := [], num_rows := 2, command := delete},
+            transaction(Pool, fun() -> sql(Pool, ~"DELETE FROM nested WHERE id < 10") end)
+        ),
+        ?assertMatch(
+            #{rows := [], num_rows := 0, command := delete},
+            sql(Pool, ~"DELETE FROM nested WHERE id < 10")
+        )
+    after
+        nested_teardown({Pool, Path})
+    end.
+
+write_with_returning_counts_the_rows_it_returned_test() ->
+    {Pool, Path} = nested_setup(memory, 1),
+    try
+        #{} = sql(Pool, ~"INSERT INTO nested VALUES (1), (2), (3)"),
+        ?assertMatch(
+            #{rows := [_, _], num_rows := 2, command := update},
+            sql(Pool, ~"UPDATE nested SET id = id + 10 WHERE id > 1 RETURNING id")
+        ),
+        ?assertMatch(
+            #{rows := [], num_rows := 0, command := delete},
+            sql(Pool, ~"DELETE FROM nested WHERE id > 100 RETURNING id")
+        )
+    after
+        nested_teardown({Pool, Path})
+    end.
+
+reads_and_other_statements_do_not_report_an_earlier_write_test() ->
+    {Pool, Path} = nested_setup(memory, 1),
+    try
+        #{num_rows := 3} = sql(Pool, ~"INSERT INTO nested VALUES (1), (2), (3)"),
+        ?assertMatch(
+            #{num_rows := 0, command := select}, sql(Pool, ~"SELECT id FROM nested WHERE id > 3")
+        ),
+        ?assertMatch(
+            #{num_rows := 0, command := other}, sql(Pool, ~"CREATE TABLE more (id INTEGER)")
+        )
+    after
+        nested_teardown({Pool, Path})
+    end.
+
+replace_is_counted_as_an_insert_test() ->
+    {Pool, Path} = nested_setup(memory, 1),
+    try
+        #{} = sql(Pool, ~"CREATE UNIQUE INDEX nested_id ON nested (id)"),
+        #{} = sql(Pool, ~"INSERT INTO nested VALUES (1)"),
+        ?assertMatch(
+            #{rows := [], num_rows := 2, command := insert},
+            sql(Pool, ~"REPLACE INTO nested VALUES (1), (2)")
+        ),
+        ?assertMatch(
+            #{rows := [], num_rows := 1, command := insert},
+            sql(Pool, ~"/* again */ replace into nested VALUES (2)")
+        ),
+        ?assertEqual([1, 2], ids(Pool))
+    after
+        nested_teardown({Pool, Path})
+    end.
+
+write_after_common_table_expressions_is_counted_test() ->
+    {Pool, Path} = nested_setup(memory, 1),
+    try
+        ?assertMatch(
+            #{rows := [], num_rows := 3, command := insert},
+            sql(
+                Pool,
+                ~"""
+                WITH a AS (SELECT 1 AS id), b (id) AS (SELECT 2 UNION ALL SELECT 3)
+                INSERT INTO nested SELECT id FROM a UNION ALL SELECT id FROM b
+                """
+            )
+        ),
+        ?assertMatch(
+            #{rows := [], num_rows := 2, command := update},
+            sql(
+                Pool,
+                ~"""
+                WITH RECURSIVE n (x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 2)
+                UPDATE nested SET id = id + 10 WHERE id IN (SELECT x FROM n)
+                """
+            )
+        ),
+        ?assertMatch(
+            #{rows := [], num_rows := 1, command := delete},
+            sql(Pool, ~"WITH big AS MATERIALIZED (SELECT 10) DELETE FROM nested WHERE id > 11")
+        ),
+        ?assertMatch(
+            #{rows := [_, _], num_rows := 2, command := select},
+            sql(Pool, ~"WITH s AS NOT MATERIALIZED (SELECT id FROM nested) SELECT id FROM s")
+        ),
+        ?assertMatch(
+            #{rows := [], num_rows := 2, command := insert},
+            sql(Pool, ~"WITH x AS (SELECT 7) REPLACE INTO nested VALUES (8), (9)")
+        )
+    after
+        nested_teardown({Pool, Path})
+    end.
+
+keyword_inside_common_table_expressions_is_not_the_command_test() ->
+    {Pool, Path} = nested_setup(memory, 1),
+    try
+        #{num_rows := 2} = sql(Pool, ~"INSERT INTO nested VALUES (1), (2)"),
+        ?assertMatch(
+            #{rows := [#{v := ~") delete ("}], num_rows := 1, command := select},
+            sql(
+                Pool,
+                ~"""
+                WITH "insert" AS (SELECT ') delete (' AS v), [update)] AS (SELECT 1 /* ) */)
+                -- ) delete
+                SELECT v FROM "insert", [update)]
+                """
+            )
+        ),
+        ?assertMatch(
+            #{rows := [#{one := 1}], num_rows := 1, command := select},
+            sql(Pool, ~"WITH replace (one) AS (SELECT 1) SELECT one FROM replace")
+        ),
+        ?assertMatch(
+            #{rows := [], num_rows := 1, command := delete},
+            sql(Pool, ~"WITH `it's` AS (SELECT 'it''s (') DELETE FROM nested WHERE id = 1")
+        )
+    after
+        nested_teardown({Pool, Path})
+    end.
+
+nesting_quotes_and_comments_inside_a_cte_body_are_skipped_test() ->
+    {Pool, Path} = nested_setup(memory, 1),
+    try
+        #{num_rows := 2} = sql(Pool, ~"INSERT INTO nested VALUES (1), (2)"),
+        ?assertMatch(
+            #{rows := [], num_rows := 1, command := delete},
+            sql(
+                Pool,
+                ~"""
+                WITH a AS (
+                    SELECT max(id) AS m, ') x' AS s, 1 AS ")", 1 AS `)`, 1 AS [)] -- ) select
+                    FROM nested
+                )
+                DELETE FROM nested WHERE id IN (SELECT m FROM a)
+                """
+            )
+        ),
+        ?assertEqual([1], ids(Pool))
+    after
+        nested_teardown({Pool, Path})
+    end.

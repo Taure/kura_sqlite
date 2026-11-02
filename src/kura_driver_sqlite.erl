@@ -9,10 +9,14 @@ in use.
 ## Result shape
 
 Returns `#{rows := Rows, num_rows := N, command := C}`, the shape the
-other kura drivers return. `Rows` are maps keyed by atom column names.
-`command` is one of
-`select | insert | update | delete | other` derived from the SQL
-prefix.
+other kura drivers return. `Rows` are maps keyed by atom column names,
+and a NULL column value is `null`, as kura expects of every driver.
+`command` is one of `select | insert | update | delete | other`, read
+from the statement's leading keyword, `REPLACE` counting as `insert`.
+After a leading `WITH` it is read from the keyword that follows the
+common table expressions. `num_rows` is the number of rows returned,
+except for an `INSERT`, `UPDATE` or `DELETE` without `RETURNING`, where
+it is the number of rows the statement changed, as Postgres reports it.
 
 ## Errors
 
@@ -314,6 +318,8 @@ run(Conn, SQL, {First, Second}, Params) when
         {_, true} -> dropped_alone(Conn, SQL, Params);
         {_, false} -> dropped(Conn, SQL, Params)
     end;
+run(Conn, SQL, {~"WITH", _}, Params) ->
+    prepared(Conn, SQL, Params, command_of(after_ctes(SQL)));
 run(Conn, SQL, {First, _}, Params) ->
     prepared(Conn, SQL, Params, command_of(First)).
 
@@ -350,7 +356,7 @@ dropped(Conn, SQL, Params) ->
 prepared(Conn, SQL, Params, Command) ->
     case esqlite3:prepare(Conn, SQL) of
         {ok, Stmt} ->
-            run_prepared(Stmt, Params, Command);
+            run_prepared(Conn, Stmt, Params, Command);
         {error, _} = Err ->
             Err
     end.
@@ -410,8 +416,9 @@ referenced(_Table, {error, _} = Error) ->
 %% A statement that stops short of `'$done'`, on an error or `'$busy'`,
 %% holds its connection's implicit transaction open until it is reset, and
 %% anything the next borrower writes in autocommit would stay uncommitted.
--spec run_prepared(esqlite3:esqlite3_stmt(), [term()], atom()) -> dynamic().
-run_prepared(Stmt, Params, Cmd) ->
+-spec run_prepared(esqlite3:esqlite3(), esqlite3:esqlite3_stmt(), [term()], command()) ->
+    dynamic().
+run_prepared(Conn, Stmt, Params, Cmd) ->
     case bind_params(Stmt, Params) of
         ok ->
             ColNames = esqlite3:column_names(Stmt),
@@ -419,13 +426,21 @@ run_prepared(Stmt, Params, Cmd) ->
                 {error, _} = Err ->
                     Err;
                 Rows when is_list(Rows) ->
-                    #{rows => Rows, num_rows => length(Rows), command => Cmd}
+                    #{rows => Rows, num_rows => num_rows(Conn, Cmd, ColNames, Rows), command => Cmd}
             after
                 _ = esqlite3:reset(Stmt)
             end;
         {error, _} = Err ->
             Err
     end.
+
+%% Without RETURNING a write returns no rows, so its count is the rows it
+%% changed, as Postgres reports it.
+-spec num_rows(esqlite3:esqlite3(), command(), [binary()], list()) -> non_neg_integer().
+num_rows(Conn, Cmd, [], []) when Cmd =:= insert; Cmd =:= update; Cmd =:= delete ->
+    esqlite3:changes(Conn);
+num_rows(_Conn, _Cmd, _ColNames, Rows) ->
+    length(Rows).
 
 -spec bind_params(esqlite3:esqlite3_stmt(), [term()]) -> ok | {error, term()}.
 bind_params(Stmt, []) ->
@@ -476,7 +491,12 @@ row_to_map([], _ColNames, Acc) ->
 row_to_map(_Row, [], Acc) ->
     Acc;
 row_to_map([Cell | RestRow], [Name | RestNames], Acc) ->
-    row_to_map(RestRow, RestNames, Acc#{name_to_atom(Name) => Cell}).
+    row_to_map(RestRow, RestNames, Acc#{name_to_atom(Name) => cell(Cell)}).
+
+%% kura reads a NULL column as `null`, which esqlite returns as `undefined`.
+-spec cell(term()) -> term().
+cell(undefined) -> null;
+cell(Cell) -> Cell.
 
 -spec name_to_atom(binary()) -> atom().
 name_to_atom(N) -> binary_to_atom(N, utf8).
@@ -484,9 +504,66 @@ name_to_atom(N) -> binary_to_atom(N, utf8).
 -spec command_of(binary()) -> command().
 command_of(~"SELECT") -> select;
 command_of(~"INSERT") -> insert;
+command_of(~"REPLACE") -> insert;
 command_of(~"UPDATE") -> update;
 command_of(~"DELETE") -> delete;
 command_of(_Keyword) -> other.
+
+%% SQLite allows only a SELECT inside a common table expression, so the
+%% statement's own keyword is the first word after a top-level group not
+%% followed by `,` (another CTE) or `AS` (the group was a column list).
+-spec after_ctes(binary()) -> binary().
+after_ctes(SQL) ->
+    case skipped(SQL) of
+        <<$(, Rest/binary>> -> after_group(group(Rest, 1));
+        <<>> -> ~"";
+        Rest -> after_ctes(token(Rest))
+    end.
+
+-spec after_group(binary()) -> binary().
+after_group(SQL) ->
+    case skipped(SQL) of
+        <<$,, Rest/binary>> ->
+            after_ctes(Rest);
+        Rest ->
+            case word(Rest, ~"") of
+                {~"AS", After} -> after_ctes(After);
+                {Word, _} -> Word
+            end
+    end.
+
+-spec group(binary(), non_neg_integer()) -> binary().
+group(SQL, 0) ->
+    SQL;
+group(<<>>, _Depth) ->
+    ~"";
+group(<<$(, Rest/binary>>, Depth) ->
+    group(Rest, Depth + 1);
+group(<<$), Rest/binary>>, Depth) ->
+    group(Rest, Depth - 1);
+group(<<"--", Rest/binary>>, Depth) ->
+    group(past(Rest, ~"\n"), Depth);
+group(<<"/*", Rest/binary>>, Depth) ->
+    group(past(Rest, ~"*/"), Depth);
+group(<<Quote, _/binary>> = SQL, Depth) when
+    Quote =:= $'; Quote =:= $"; Quote =:= $`; Quote =:= $[
+->
+    group(token(SQL), Depth);
+group(<<_, Rest/binary>>, Depth) ->
+    group(Rest, Depth).
+
+%% A doubled quote inside a quoted token reads as two adjacent tokens,
+%% which skips the same bytes.
+-spec token(binary()) -> binary().
+token(<<Quote, Rest/binary>>) when Quote =:= $'; Quote =:= $"; Quote =:= $` ->
+    past(Rest, <<Quote>>);
+token(<<$[, Rest/binary>>) ->
+    past(Rest, ~"]");
+token(SQL) ->
+    case word(SQL, ~"") of
+        {~"", <<_, Rest/binary>>} -> Rest;
+        {_Word, Rest} -> Rest
+    end.
 
 -spec leading_words(binary()) -> words().
 leading_words(SQL) ->
