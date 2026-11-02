@@ -76,9 +76,34 @@ to start on this backend via `kura_capabilities:require/2`.
   already holds the last connection and checks out again waits for the
   whole timeout.
 - **UTF-8 only.** `start_pool/2` refuses a database in another encoding
-  with `{error, {unsupported_encoding, Encoding}}`. Binaries are stored as
-  TEXT, which a UTF-16 database transcodes, so encrypted fields would not
-  read back.
+  with `{error, {unsupported_encoding, Encoding}}`.
+- **Byte fields** (`binary`, `{encrypted, _}`, and `{custom, Mod}` types
+  whose `sqlite_type/0` is `BLOB`) are stored as BLOB, so `typeof(col)` is
+  `'blob'` and the bytes do not depend on the database encoding. Queries
+  on them compare against `CAST(? AS BLOB)`, including conditions on a
+  byte column of a joined schema. Other binaries are stored as TEXT, and
+  so are these: values written to a table named by atom or binary rather
+  than a schema (including a many-to-many join table whose `join_through`
+  is a binary), and values of a field, other than an encrypted one, whose
+  name contains `?`. In raw SQL, pass `{blob, Bin}` to bind a BLOB.
+- **Encrypted fields** cannot be compared in a query. A where or having
+  condition on an `{encrypted, _}` field other than `is_nil` and
+  `is_not_nil` raises `{kura_sqlite, {encrypted_field_in_where, Field}}`,
+  since a value encrypted under a fresh nonce never equals the stored
+  ciphertext and the plaintext would go out with the query's parameters.
+- **Byte columns refuse TEXT.** A byte column a kura migration creates,
+  with `create_table` or `add_column`, is declared
+  `BLOB CHECK (typeof(col) IN ('blob', 'null'))`, so a TEXT value written
+  by raw SQL is refused rather than stored next to a BLOB with the same
+  bytes, and its `default` is written as a BLOB literal of the same bytes.
+  The check is left off a column whose name contains `?`.
+- **Joins and CTEs by name.** A `from` or join target named by atom or
+  binary rather than a schema module, or a CTE, has no field types, so a
+  where-condition on one of its BLOB columns binds TEXT. SQLite orders
+  every BLOB after every TEXT value, so on such a column the exclusion
+  operators `!=`, `not_in` and `NOT (=)`, and `>` and `>=`, match every
+  row, while `=`, `in`, `<` and `<=` match none. Join the schema module,
+  or write the condition as a fragment with `CAST(? AS BLOB)`.
 - **Database paths** must name a regular file the node can read, or a
   missing file in a directory the node can read and write, which SQLite
   then creates. A directory, a missing directory, a dangling symbolic link,
@@ -126,6 +151,20 @@ to start on this backend via `kura_capabilities:require/2`.
   `{error, busy}` instead of crashing the caller. esqlite is now `~> 0.10`.
 - **Foreign keys** are on for every pooled connection, and the pool opens
   only UTF-8 databases.
+- **Parameters** bind by position only. A `{Name, Value}` or
+  `{Type, Name, Value}` parameter, which esqlite took as a named bind when
+  it came first, and any other value the driver cannot bind, returns
+  `{error, {unsupported_param, Index}}` instead of binding or crashing.
+- **Byte fields** are written as BLOB instead of TEXT. A row written
+  before holds TEXT, which a query on the field no longer matches, and a
+  UNIQUE index treats TEXT `'abc'` and BLOB `'abc'` as different values.
+  So until a column is converted, an upsert whose conflict target is that
+  column misses the old row and inserts a second one, and a lookup finds
+  only the new one. See below for how to convert, how to handle rows
+  written before converting, and how to check that none are left.
+- **Migrations** declare new byte columns with
+  `CHECK (typeof(col) IN ('blob', 'null'))`. Columns created before keep
+  no check.
 - **NULL** reads as `null` in driver results, as kura_postgres returns it,
   instead of `undefined`. Rows loaded through a schema still hold
   `undefined`, and a NULL `{encrypted, _}` field now loads instead of
@@ -141,6 +180,53 @@ to start on this backend via `kura_capabilities:require/2`.
   `RETURNING` now reports its real `num_rows` instead of 0, and a
   `WITH ... SELECT` reports `command := select` instead of `other`.
   Callers matching on the old values need updating.
+
+### Converting byte columns
+
+Convert every `binary`, `{encrypted, _}` and BLOB custom column before
+the new version writes anything. The safest way is a kura migration
+that ships in the same deploy, so it runs before any other write:
+
+```erlang
+up() ->
+    [{execute, ~"UPDATE t SET col = CAST(col AS BLOB) WHERE typeof(col) = 'text'"}].
+
+down() ->
+    [].
+```
+
+On a UTF-8 database the cast keeps the bytes exactly as they are.
+
+If the new version has already written to a UNIQUE column, the column
+can hold the same bytes twice, once as TEXT and once as BLOB, and the
+conversion fails with `UNIQUE constraint failed`. To list the pairs:
+
+```sql
+SELECT old.rowid AS text_row, new.rowid AS blob_row
+FROM t AS old
+JOIN t AS new ON new.col = CAST(old.col AS BLOB)
+WHERE typeof(old.col) = 'text' AND typeof(new.col) = 'blob';
+```
+
+For each pair, keep one row and delete the other, first moving over
+anything that references the row you delete. The BLOB row is the newer
+one. Then run the conversion.
+
+After the upgrade, check that no byte column still holds TEXT, for
+example when the application starts, and refuse to serve until it does
+not:
+
+```erlang
+ok = kura_sqlite:check_blob_columns(my_repo, [my_user, my_api_key]).
+```
+
+It returns `{error, [{text_in_blob_column, Table, Column}]}` for each
+column that still holds a TEXT value, and
+`{error, [{check_failed, Table, Column, Reason}]}` for one it could not
+read. A column created by an earlier kura_sqlite has no CHECK, so raw
+SQL can still write TEXT to it; to add one, rebuild the table as SQLite's
+[ALTER TABLE](https://www.sqlite.org/lang_altertable.html#otheralter)
+page describes.
 
 ## License
 

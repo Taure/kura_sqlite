@@ -18,6 +18,28 @@ common table expressions. `num_rows` is the number of rows returned,
 except for an `INSERT`, `UPDATE` or `DELETE` without `RETURNING`, where
 it is the number of rows the statement changed, as Postgres reports it.
 
+## Parameters
+
+Parameters bind by position: `undefined` or `null` as NULL, a 64-bit
+integer as INTEGER, a float as REAL, a binary or iodata list as TEXT, any
+other atom as the TEXT of its name, and `{blob, Bin}` as a BLOB.
+`{text, T}`, `{int, I}` (32-bit), `{int64, I}` and `{float, F}` bind as
+esqlite binds them. `kura_dialect_sqlite` passes the values of byte-typed
+schema fields as `{blob, Bin}`; raw SQL can do the same. Any other
+parameter, including an integer out of range or a list that is not
+iodata, returns `{error, {unsupported_param, Index}}`, `Index` counting
+from 1.
+esqlite's named binding is not used, so no parameter can choose the
+placeholder it binds to.
+
+## Byte columns
+
+A byte column that `kura_migrator` creates, in `CREATE TABLE` or
+`ALTER TABLE ... ADD COLUMN`, gets `CHECK (typeof(col) IN ('blob',
+'null'))`; see `kura_dialect_sqlite:blob_checks/1`. A statement holding a
+byte column whose name cannot be read returns
+`{error, unrecognised_blob_column}`.
+
 ## Errors
 
 A statement that fails returns `{error, Reason}`, `Reason` being the
@@ -130,6 +152,9 @@ the workload. esqlite sets 2 seconds by default.
 -type words() :: {binary(), binary()}.
 -type command() :: select | insert | update | delete | other.
 -type result() :: #{rows := [#{atom() => term()}], _ => _} | {error, term()}.
+
+-define(IS_INT64(Int), (is_integer(Int) andalso Int >= -(1 bsl 63) andalso Int < 1 bsl 63)).
+-define(IS_INT32(Int), (is_integer(Int) andalso Int >= -(1 bsl 31) andalso Int < 1 bsl 31)).
 
 -define(NOTHING_DROPPED, [~"Init", ~"Transaction", ~"JournalMode", ~"Goto", ~"Halt"]).
 
@@ -318,6 +343,11 @@ run(Conn, SQL, {First, Second}, Params) when
         {_, true} -> dropped_alone(Conn, SQL, Params);
         {_, false} -> dropped(Conn, SQL, Params)
     end;
+run(Conn, SQL, {First, _}, Params) when First =:= ~"CREATE"; First =:= ~"ALTER" ->
+    case kura_dialect_sqlite:blob_checks(SQL) of
+        {ok, Checked} -> prepared(Conn, Checked, Params, other);
+        {error, _} = Error -> Error
+    end;
 run(Conn, SQL, {~"WITH", _}, Params) ->
     prepared(Conn, SQL, Params, command_of(after_ctes(SQL)));
 run(Conn, SQL, {First, _}, Params) ->
@@ -442,17 +472,56 @@ num_rows(Conn, Cmd, [], []) when Cmd =:= insert; Cmd =:= update; Cmd =:= delete 
 num_rows(_Conn, _Cmd, _ColNames, Rows) ->
     length(Rows).
 
--spec bind_params(esqlite3:esqlite3_stmt(), [term()]) -> ok | {error, term()}.
-bind_params(Stmt, []) ->
-    case esqlite3:bind(Stmt, []) of
-        ok -> ok;
-        {error, _} = E -> E
-    end;
+%% Bound by position here rather than with esqlite3:bind/2, which binds by
+%% name when the first parameter is a 3-tuple or a {Name, Value} pair.
+%% Parameters are the caller's values, untyped; a list goes to esqlite to be
+%% read as iodata, as esqlite3:bind/2 passed it.
+-spec bind_params(esqlite3:esqlite3_stmt(), [dynamic()]) -> ok | {error, term()}.
 bind_params(Stmt, Params) ->
-    case esqlite3:bind(Stmt, Params) of
-        ok -> ok;
-        {error, _} = E -> E
+    bind_params(Stmt, 1, Params).
+
+-spec bind_params(esqlite3:esqlite3_stmt(), pos_integer(), [dynamic()]) -> ok | {error, term()}.
+bind_params(_Stmt, _Index, []) ->
+    ok;
+bind_params(Stmt, Index, [Param | Rest]) ->
+    case bind_param(Stmt, Index, Param) of
+        ok -> bind_params(Stmt, Index + 1, Rest);
+        {error, _} = Error -> Error
     end.
+
+%% esqlite raises badarg for a value its bind cannot take, such as a list
+%% that is not iodata.
+-spec bind_param(esqlite3:esqlite3_stmt(), pos_integer(), dynamic()) -> ok | {error, term()}.
+bind_param(Stmt, Index, Param) ->
+    try
+        bound(Stmt, Index, Param)
+    catch
+        error:badarg -> {error, {unsupported_param, Index}}
+    end.
+
+-spec bound(esqlite3:esqlite3_stmt(), pos_integer(), dynamic()) -> ok | {error, term()}.
+bound(Stmt, Index, Null) when Null =:= null; Null =:= undefined ->
+    esqlite3:bind_null(Stmt, Index);
+bound(Stmt, Index, Int) when ?IS_INT64(Int) ->
+    esqlite3:bind_int64(Stmt, Index, Int);
+bound(Stmt, Index, Float) when is_float(Float) ->
+    esqlite3:bind_double(Stmt, Index, Float);
+bound(Stmt, Index, Text) when is_binary(Text); is_list(Text) ->
+    esqlite3:bind_text(Stmt, Index, Text);
+bound(Stmt, Index, Atom) when is_atom(Atom) ->
+    esqlite3:bind_text(Stmt, Index, atom_to_binary(Atom, utf8));
+bound(Stmt, Index, {blob, Bytes}) when is_binary(Bytes); is_list(Bytes) ->
+    esqlite3:bind_blob(Stmt, Index, Bytes);
+bound(Stmt, Index, {text, Text}) when is_binary(Text); is_list(Text) ->
+    esqlite3:bind_text(Stmt, Index, Text);
+bound(Stmt, Index, {int, Int}) when ?IS_INT32(Int) ->
+    esqlite3:bind_int(Stmt, Index, Int);
+bound(Stmt, Index, {int64, Int}) when ?IS_INT64(Int) ->
+    esqlite3:bind_int64(Stmt, Index, Int);
+bound(Stmt, Index, {float, Float}) when is_float(Float) ->
+    esqlite3:bind_double(Stmt, Index, Float);
+bound(_Stmt, Index, _Param) ->
+    {error, {unsupported_param, Index}}.
 
 %% The process dictionary is untyped; what is stored is the connection put
 %% there by the outermost transaction.

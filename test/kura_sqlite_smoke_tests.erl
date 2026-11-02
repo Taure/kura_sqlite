@@ -99,7 +99,10 @@ jsonb_roundtrip() ->
     ?assertEqual({ok, Expected}, kura_types:cast(jsonb, ~"{\"a\":1}")).
 
 encrypted_ddl_blob() ->
-    ?assertEqual(~"BLOB", kura_dialect_sqlite:column_type({encrypted, string})),
+    ?assertEqual(
+        kura_dialect_sqlite:column_type(binary),
+        kura_dialect_sqlite:column_type({encrypted, string})
+    ),
     SQL = kura_migrator:compile_operation(
         ?REPO,
         {create_table, ~"vault", [
