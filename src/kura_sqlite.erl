@@ -12,8 +12,8 @@ Checks for a database used through `kura_sqlite`.
     | {check_failed, Table :: binary(), Column :: atom(), Reason :: term()}.
 
 -doc """
-Look for TEXT values in the byte columns (`binary`, `{encrypted, _}`, and
-BLOB custom types) of `Schemas`' tables.
+Look for TEXT values in the byte columns (`binary`, every encrypted type,
+and BLOB custom types) of `Schemas`' tables.
 
 Byte fields are written as BLOB. A row an earlier kura_sqlite wrote
 holds TEXT, which a query on the field does not match, and a UNIQUE index

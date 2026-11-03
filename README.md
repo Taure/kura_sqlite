@@ -77,7 +77,8 @@ to start on this backend via `kura_capabilities:require/2`.
   whole timeout.
 - **UTF-8 only.** `start_pool/2` refuses a database in another encoding
   with `{error, {unsupported_encoding, Encoding}}`.
-- **Byte fields** (`binary`, `{encrypted, _}`, and `{custom, Mod}` types
+- **Byte fields** (`binary`, `{encrypted, Inner}` and
+  `{encrypted, Inner, Opts}`, and `{custom, Mod}` types
   whose `sqlite_type/0` is `BLOB`) are stored as BLOB, so `typeof(col)` is
   `'blob'` and the bytes do not depend on the database encoding. Queries
   on them compare against `CAST(? AS BLOB)`, including conditions on a
@@ -87,10 +88,28 @@ to start on this backend via `kura_capabilities:require/2`.
   is a binary), and values of a field, other than an encrypted one, whose
   name contains `?`. In raw SQL, pass `{blob, Bin}` to bind a BLOB.
 - **Encrypted fields** cannot be compared in a query. A where or having
-  condition on an `{encrypted, _}` field other than `is_nil` and
-  `is_not_nil` raises `{kura_sqlite, {encrypted_field_in_where, Field}}`,
-  since a value encrypted under a fresh nonce never equals the stored
-  ciphertext and the plaintext would go out with the query's parameters.
+  condition on an encrypted field other than `is_nil`, `is_not_nil` and a
+  deterministic lookup raises
+  `{kura_sqlite, {encrypted_field_in_where, Field}}`, since a value
+  encrypted under a fresh nonce never equals the stored ciphertext and the
+  plaintext would go out with the query's parameters. An encrypted type
+  kura reports `unsupported` raises
+  `{kura_crypto, unsupported_encrypted_type}` when a migration declares
+  it, as on Postgres.
+- **Arrays of encrypted values** are not supported on SQLite. A migration
+  declaring one, and a write of a list to one, raise
+  `{kura_sqlite, {unsupported_type, {array, Inner}}}`, and a where or
+  having condition on one other than `is_nil` and `is_not_nil` raises
+  `{kura_sqlite, {encrypted_field_in_where, Field}}`.
+- **Deterministic lookups**: the `encrypted_in` and `encrypted_not_in`
+  conditions kura builds for a deterministic field
+  (`{encrypted, Inner, #{mode => deterministic}}`) compile to `IN` and
+  `NOT IN` over `CAST(? AS BLOB)`, one per ciphertext. A lookup on any
+  other field raises `{kura_sqlite, {unsupported_blob_condition, Field, Op}}`:
+  a randomized encrypted field, an `unsupported` encrypted type, an array
+  of an encrypted type, a `binary`, TEXT or other non-encrypted field, a
+  field of a table named by atom or binary, and a field whose name
+  contains `?`.
 - **Byte columns refuse TEXT.** A byte column a kura migration creates,
   with `create_table` or `add_column`, is declared
   `BLOB CHECK (typeof(col) IN ('blob', 'null'))`, so a TEXT value written
@@ -186,7 +205,7 @@ to start on this backend via `kura_capabilities:require/2`.
 
 ### Converting byte columns
 
-Convert every `binary`, `{encrypted, _}` and BLOB custom column before
+Convert every `binary`, encrypted and BLOB custom column before
 the new version writes anything. The safest way is a kura migration
 that ships in the same deploy, so it runs before any other write:
 

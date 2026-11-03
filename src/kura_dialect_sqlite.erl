@@ -19,7 +19,7 @@ phase 2 skeleton and will be addressed by capability flags in phase 3.
 
 ## Byte fields
 
-A schema field stored in a BLOB column (`binary`, `{encrypted, _}`, or a
+A schema field stored in a BLOB column (`binary`, an encrypted type, or a
 `{custom, Mod}` whose `sqlite_type/0` is `BLOB`) is written with the BLOB
 storage class, so its bytes do not depend on the database encoding:
 
@@ -63,11 +63,33 @@ A byte column `kura_migrator` creates is declared
 `BLOB CHECK (typeof(col) IN ('blob', 'null'))`, so it refuses a TEXT value
 (see `blob_checks/1`).
 
-A condition on an `{encrypted, _}` field other than `is_nil` or
-`is_not_nil` raises `{kura_sqlite, {encrypted_field_in_where, Field}}`,
-in a where or a having, on the `from` schema or a joined one. A value
-encrypted under a fresh nonce never equals the stored ciphertext, and the
-plaintext would travel with the query's parameters.
+A field is encrypted when `kura_types:encryption/1` says so, which
+covers `{encrypted, Inner}` and `{encrypted, Inner, Opts}`. An encrypted
+type that kura reports `unsupported` raises
+`{kura_crypto, unsupported_encrypted_type}` in `column_type/1`, as kura's
+PG dialect does, so a migration declaring one fails. A type with no
+SQLite storage raises `{kura_sqlite, {unsupported_type, Type}}`, and so
+does an array of an encrypted type: in `column_type/1`, and when a list is
+written to such a field by `insert`, `update`, `delete`, `insert_all` or
+the `SET` of `update_all`. A condition on an encrypted field, an array
+of an encrypted type among them, other than `is_nil`, `is_not_nil` or a
+deterministic lookup raises
+`{kura_sqlite, {encrypted_field_in_where, Field}}`, in a where or a
+having, on the `from` schema or a joined one. A value encrypted under a
+fresh nonce never equals the stored ciphertext, and the plaintext would
+travel with the query's parameters.
+
+A deterministic lookup, `{Field, encrypted_in, Frames}` or
+`{Field, encrypted_not_in, Frames}`, which `kura_query:where/2` and
+`having/2` build for a deterministic field, compiles to
+`"Field" IN (CAST(? AS BLOB), ...)` or `NOT IN (...)`, one cast per frame.
+A lookup on any other field raises
+`{kura_sqlite, {unsupported_blob_condition, Field, Op}}`: a randomized
+encrypted field, an encrypted type kura reports `unsupported`, an array of
+an encrypted type, a `binary` or other non-encrypted field, a field of a
+table named by atom or binary, and a field whose name contains `?`. On a
+field that is not deterministic the frames would be plaintext, and
+`encrypted_not_in` would match every row.
 
 A condition on a byte field with an operator the rewrite cannot cast
 raises `{kura_sqlite, {unsupported_blob_condition, Field, Op}}`. `like`,
@@ -124,10 +146,16 @@ reach SQLite.
 -define(BLOB_COLUMN, <<?BLOB_MARKER>>).
 %% kura's ?KURA_IS_UNARY_OP, which the pinned kura does not define yet.
 -define(IS_UNARY_OP(Op), (Op =:= is_nil orelse Op =:= is_not_nil)).
+%% kura's ?KURA_IS_LOOKUP_OP, which the pinned kura does not define yet.
+-define(IS_LOOKUP_OP(Op), (Op =:= encrypted_in orelse Op =:= encrypted_not_in)).
 -define(IS_COMPARISON(Op),
     (Op =:= '=' orelse Op =:= '!=' orelse Op =:= '<' orelse Op =:= '>' orelse Op =:= '<=' orelse
         Op =:= '>=')
 ).
+
+-type schema_fields() :: {
+    Types :: #{atom() => kura_types:kura_type()}, Blobs :: #{atom() => kura_types:kura_type()}
+}.
 
 %%----------------------------------------------------------------------
 %% kura_dialect callbacks
@@ -244,17 +272,31 @@ storage_type(jsonb) ->
     ~"TEXT";
 storage_type({enum, _}) ->
     ~"TEXT";
-storage_type({array, _}) ->
+storage_type({array, _} = Type) ->
+    ok = supported_array(Type),
     ~"TEXT";
 storage_type({embed, _, _}) ->
     ~"TEXT";
-storage_type({encrypted, _}) ->
-    ~"BLOB";
 storage_type({custom, Mod}) ->
     _ = code:ensure_loaded(Mod),
     case erlang:function_exported(Mod, sqlite_type, 0) of
         true -> Mod:sqlite_type();
         false -> Mod:pg_type()
+    end;
+storage_type(Type) ->
+    case kura_types:encryption(Type) of
+        {ok, _Spec} -> ~"BLOB";
+        unsupported -> erlang:error({kura_crypto, unsupported_encrypted_type});
+        none -> erlang:error({kura_sqlite, {unsupported_type, Type}})
+    end.
+
+%% kura_driver_sqlite binds a list as one TEXT value, which would corrupt
+%% ciphertexts, so an array of an encrypted type is refused.
+-spec supported_array({array, kura_types:kura_type()}) -> ok.
+supported_array({array, Inner} = Type) ->
+    case kura_types:encryption(Inner) of
+        none -> ok;
+        _ -> erlang:error({kura_sqlite, {unsupported_type, Type}})
     end.
 
 %% A default is whatever the schema declares.
@@ -505,54 +547,65 @@ refuse_distance(_Expr) -> ok.
 
 -spec blob_values(term(), map()) -> map().
 blob_values(Table, Values) ->
-    Blobs = blob_fields(Table),
-    case map_size(Blobs) of
+    {Types, _Blobs} = Fields = schema_fields(Table),
+    case map_size(Types) of
         0 -> Values;
-        _ -> maps:map(fun(Field, Value) -> blob_value(Field, Value, Blobs) end, Values)
+        _ -> maps:map(fun(Field, Value) -> blob_value(Field, Value, Fields) end, Values)
     end.
 
 -spec blob_keys(term(), [{atom(), term()}]) -> [{atom(), term()}].
 blob_keys(Table, KeyClauses) ->
-    Blobs = blob_fields(Table),
-    [{Field, blob_value(Field, Value, Blobs)} || {Field, Value} <- KeyClauses].
+    Fields = schema_fields(Table),
+    [{Field, blob_value(Field, Value, Fields)} || {Field, Value} <- KeyClauses].
 
--spec blob_value(atom(), term(), #{atom() => kura_types:kura_type()}) -> term().
-blob_value(Field, Value, Blobs) when is_binary(Value), is_map_key(Field, Blobs) ->
+-spec blob_value(atom(), term(), schema_fields()) -> term().
+blob_value(Field, Value, {_Types, Blobs}) when is_binary(Value), is_map_key(Field, Blobs) ->
     {blob, Value};
-blob_value(_Field, Value, _Blobs) ->
+blob_value(Field, Value, {Types, _Blobs}) when is_list(Value) ->
+    ok =
+        case Types of
+            #{Field := {array, _} = Type} -> supported_array(Type);
+            #{} -> ok
+        end,
+    Value;
+blob_value(_Field, Value, _Fields) ->
     Value.
 
-%% Kept in persistent_term per module with the field types they came from,
-%% and recomputed when kura's field types differ, as they do after
+-spec blob_fields(term()) -> #{atom() => kura_types:kura_type()}.
+blob_fields(Table) ->
+    {_Types, Blobs} = schema_fields(Table),
+    Blobs.
+
+%% A schema's field types and its byte fields. Kept in persistent_term per
+%% module, and recomputed when kura's field types differ, as they do after
 %% kura_schema:forget/1. A module that is not a schema is not cached, since
 %% it may be loaded later.
--spec blob_fields(term()) -> #{atom() => kura_types:kura_type()}.
-blob_fields(Mod) when is_atom(Mod), Mod =/= undefined ->
+-spec schema_fields(term()) -> schema_fields().
+schema_fields(Mod) when is_atom(Mod), Mod =/= undefined ->
     Key = {?MODULE, blob_fields, Mod},
     case cached(Key) of
         {Types, Blobs} when is_map(Types), is_map(Blobs) ->
             case kura_schema:field_types(Mod) of
-                Types -> Blobs;
-                Changed -> cache_blob_fields(Key, Changed)
+                Types -> {Types, Blobs};
+                Changed -> cache_schema_fields(Key, Changed)
             end;
         _ ->
             case is_schema(Mod) of
-                true -> cache_blob_fields(Key, kura_schema:field_types(Mod));
-                false -> #{}
+                true -> cache_schema_fields(Key, kura_schema:field_types(Mod));
+                false -> {#{}, #{}}
             end
     end;
-blob_fields(_Table) ->
-    #{}.
+schema_fields(_Table) ->
+    {#{}, #{}}.
 
--spec cache_blob_fields(term(), #{atom() => kura_types:kura_type()}) ->
-    #{atom() => kura_types:kura_type()}.
-cache_blob_fields(Key, Types) ->
-    Blobs = schema_blob_fields(Types),
-    persistent_term:put(Key, {Types, Blobs}),
-    Blobs.
+-spec cache_schema_fields(term(), #{atom() => kura_types:kura_type()}) -> schema_fields().
+cache_schema_fields(Key, Types) ->
+    Fields = {Types, schema_blob_fields(Types)},
+    persistent_term:put(Key, Fields),
+    Fields.
 
 %% persistent_term is untyped; what is stored under the key is the pair
-%% blob_fields/1 put there.
+%% schema_fields/1 put there.
 -spec cached(term()) -> dynamic().
 cached(Key) ->
     persistent_term:get(Key, undefined).
@@ -564,12 +617,8 @@ cached(Key) ->
     #{atom() => kura_types:kura_type()}.
 schema_blob_fields(Types) ->
     maps:filter(
-        fun
-            (_Field, {encrypted, _}) ->
-                true;
-            (Field, Type) ->
-                blob_type(Type) andalso
-                    binary:match(atom_to_binary(Field, utf8), ~"?") =:= nomatch
+        fun(Field, Type) ->
+            encrypted_type(Type) orelse (blob_type(Type) andalso placeholder_free(Field))
         end,
         Types
     ).
@@ -580,6 +629,14 @@ is_schema(Mod) ->
         erlang:function_exported(Mod, table, 0) andalso
         erlang:function_exported(Mod, fields, 0).
 
+-spec placeholder_free(atom()) -> boolean().
+placeholder_free(Field) ->
+    binary:match(atom_to_binary(Field, utf8), ~"?") =:= nomatch.
+
+-spec encrypted_type(kura_types:kura_type()) -> boolean().
+encrypted_type({array, _}) -> false;
+encrypted_type(Type) -> kura_types:encryption(Type) =/= none.
+
 -spec blob_type(kura_types:kura_type()) -> boolean().
 blob_type(binary) -> true;
 blob_type({custom, _} = Type) -> storage_type(Type) =:= ~"BLOB";
@@ -589,22 +646,44 @@ blob_type(_Type) -> false.
 %% into the SQL rather than into the parameters.
 -spec blob_query(#kura_query{}) -> #kura_query{}.
 blob_query(#kura_query{from = From, joins = Joins, wheres = Wheres, havings = Havings} = Query) ->
-    Blobs = joined_blob_fields([From | [Table || {_Type, Table, _On, _As} <- Joins]]),
+    Fields = joined_fields([From | [Table || {_Type, Table, _On, _As} <- Joins]]),
     Query#kura_query{
-        wheres = blob_conditions(Wheres, Blobs),
-        havings = blob_conditions(Havings, Blobs),
+        wheres = blob_conditions(Wheres, Fields),
+        havings = blob_conditions(Havings, Fields),
         ctes = blob_named(Query#kura_query.ctes),
         combinations = blob_named(Query#kura_query.combinations)
     }.
 
-%% A where-field is not qualified by its table, so the byte fields of every
+%% A where-field is not qualified by its table, so the fields of every
 %% joined schema are rewritten too. A name in two of the tables is an
-%% ambiguous column to SQLite.
--spec joined_blob_fields([term()]) -> #{atom() => kura_types:kura_type()}.
-joined_blob_fields([]) ->
-    #{};
-joined_blob_fields([Table | Rest]) ->
-    maps:merge(blob_fields(Table), joined_blob_fields(Rest)).
+%% ambiguous column to SQLite; its most restrictive type is kept, so a
+%% plain or deterministic field never hides a randomized one.
+-spec joined_fields([term()]) -> schema_fields().
+joined_fields([]) ->
+    {#{}, #{}};
+joined_fields([Table | Rest]) ->
+    {Types, Blobs} = schema_fields(Table),
+    {RestTypes, RestBlobs} = joined_fields(Rest),
+    Merged = maps:merge_with(
+        fun(_Field, Type, Other) -> joined_type(Type, Other) end, Types, RestTypes
+    ),
+    {Merged, maps:merge(Blobs, RestBlobs)}.
+
+-spec joined_type(kura_types:kura_type(), kura_types:kura_type()) -> kura_types:kura_type().
+joined_type(Type, Other) ->
+    case restriction(Type) >= restriction(Other) of
+        true -> Type;
+        false -> Other
+    end.
+
+-spec restriction(kura_types:kura_type()) -> 0..2.
+restriction(Type) ->
+    Encryption = kura_types:encryption(Type),
+    case {Encryption, deterministic(Encryption)} of
+        {none, _} -> 0;
+        {_, true} -> 1;
+        {_, false} -> 2
+    end.
 
 -spec blob_named([{Name, #kura_query{}}]) -> [{Name, #kura_query{}}].
 blob_named(Queries) ->
@@ -614,26 +693,48 @@ blob_named(Queries) ->
 blob_subquery(#kura_query{} = Query) -> blob_query(Query);
 blob_subquery(Other) -> Other.
 
--spec blob_conditions([term()], #{atom() => kura_types:kura_type()}) -> [term()].
-blob_conditions(Conditions, Blobs) ->
-    [blob_condition(Condition, Blobs) || Condition <- Conditions].
+-spec blob_conditions([term()], schema_fields()) -> [term()].
+blob_conditions(Conditions, Fields) ->
+    [blob_condition(Condition, Fields) || Condition <- Conditions].
 
--spec blob_condition(term(), #{atom() => kura_types:kura_type()}) -> term().
-blob_condition({Op, Conditions}, Blobs) when
+-spec blob_condition(term(), schema_fields()) -> term().
+blob_condition({Op, Conditions}, Fields) when
     (Op =:= 'and' orelse Op =:= 'or'), is_list(Conditions)
 ->
-    {Op, blob_conditions(Conditions, Blobs)};
-blob_condition({fragment, _SQL, _Params} = Condition, _Blobs) ->
+    {Op, blob_conditions(Conditions, Fields)};
+blob_condition({fragment, _SQL, _Params} = Condition, _Fields) ->
     Condition;
-blob_condition({'not', Condition}, Blobs) ->
-    {'not', blob_condition(Condition, Blobs)};
-blob_condition({Exists, {subquery, Sub}}, _Blobs) when Exists =:= exists; Exists =:= not_exists ->
+blob_condition({'not', Condition}, Fields) ->
+    {'not', blob_condition(Condition, Fields)};
+blob_condition({Exists, {subquery, Sub}}, _Fields) when Exists =:= exists; Exists =:= not_exists ->
     {Exists, {subquery, blob_subquery(Sub)}};
-blob_condition(Condition, Blobs) ->
-    case [Field || Field <- compared_fields(Condition), is_encrypted(Field, Blobs)] of
+blob_condition({Field, Op, Frames}, {Types, Blobs}) when
+    is_atom(Field), ?IS_LOOKUP_OP(Op), is_list(Frames)
+->
+    case deterministic_field(Field, Types) of
+        true -> cast_condition({Field, lookup_in(Op), Frames}, Blobs);
+        false -> error({kura_sqlite, {unsupported_blob_condition, Field, Op}})
+    end;
+blob_condition(Condition, {Types, Blobs}) ->
+    case [Field || Field <- compared_fields(Condition), is_encrypted(Field, Types)] of
         [Field | _] -> error({kura_sqlite, {encrypted_field_in_where, Field}});
         [] -> cast_condition(Condition, Blobs)
     end.
+
+%% Only a deterministic field is looked up: on any other field the frames
+%% would be plaintext, and NOT IN would match every row.
+-spec deterministic_field(atom(), #{atom() => kura_types:kura_type()}) -> boolean().
+deterministic_field(Field, Types) ->
+    case Types of
+        #{Field := Type} ->
+            placeholder_free(Field) andalso deterministic(kura_types:encryption(Type));
+        #{} ->
+            false
+    end.
+
+-spec deterministic(kura_types:encryption()) -> boolean().
+deterministic({ok, Spec}) -> maps:get(mode, Spec, randomized) =:= deterministic;
+deterministic(_Encryption) -> false.
 
 -spec compared_fields(term()) -> [atom()].
 compared_fields({Field, Unary}) when is_atom(Field), ?IS_UNARY_OP(Unary) ->
@@ -648,9 +749,9 @@ compared_fields(_Condition) ->
     [].
 
 -spec is_encrypted(atom(), #{atom() => kura_types:kura_type()}) -> boolean().
-is_encrypted(Field, Blobs) ->
-    case Blobs of
-        #{Field := {encrypted, _}} -> true;
+is_encrypted(Field, Types) ->
+    case Types of
+        #{Field := Type} -> kura_types:encryption(Type) =/= none;
         #{} -> false
     end.
 
@@ -713,6 +814,10 @@ row_fragment(Fields, Values, Blobs) ->
 -spec placeholder(atom(), #{atom() => kura_types:kura_type()}) -> binary().
 placeholder(Field, Blobs) when is_map_key(Field, Blobs) -> ?CAST;
 placeholder(_Field, _Blobs) -> ~"?".
+
+-spec lookup_in(encrypted_in | encrypted_not_in) -> in | not_in.
+lookup_in(encrypted_in) -> in;
+lookup_in(encrypted_not_in) -> not_in.
 
 -spec in_sql(in | not_in) -> binary().
 in_sql(in) -> ~" IN (";
