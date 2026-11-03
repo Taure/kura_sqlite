@@ -165,18 +165,6 @@ the workload. esqlite sets 2 seconds by default.
 
 -define(IS_INT64(Int), (is_integer(Int) andalso Int >= -(1 bsl 63) andalso Int < 1 bsl 63)).
 -define(IS_INT32(Int), (is_integer(Int) andalso Int >= -(1 bsl 31) andalso Int < 1 bsl 31)).
--define(IS_DATE(D),
-    (is_tuple(D) andalso tuple_size(D) =:= 3 andalso is_integer(element(1, D)) andalso
-        element(1, D) >= 0 andalso
-        element(1, D) =< 9999 andalso is_integer(element(2, D)) andalso element(2, D) >= 1 andalso
-        element(2, D) =< 12 andalso is_integer(element(3, D)) andalso element(3, D) >= 1 andalso
-        element(3, D) =< 31)
-).
--define(IS_TIME(H, Mi, S),
-    (is_integer(H) andalso H >= 0 andalso H =< 24 andalso is_integer(Mi) andalso Mi >= 0 andalso
-        Mi =< 59 andalso is_integer(S) andalso S >= 0 andalso S =< 60)
-).
-
 -define(NOTHING_DROPPED, [~"Init", ~"Transaction", ~"JournalMode", ~"Goto", ~"Halt"]).
 
 -define(REFERENCING,
@@ -558,12 +546,6 @@ bound(Stmt, Index, Text) when is_binary(Text); is_list(Text) ->
     esqlite3:bind_text(Stmt, Index, Text);
 bound(Stmt, Index, Bool) when is_boolean(Bool) ->
     esqlite3:bind_int64(Stmt, Index, boolean_int(Bool));
-bound(Stmt, Index, {{_, _, _} = Date, {H, Mi, S}} = DateTime) when
-    ?IS_DATE(Date), ?IS_TIME(H, Mi, S)
-->
-    esqlite3:bind_text(Stmt, Index, datetime_text(DateTime));
-bound(Stmt, Index, Date) when ?IS_DATE(Date), element(1, Date) > 24 ->
-    esqlite3:bind_text(Stmt, Index, date_text(Date));
 bound(Stmt, Index, Atom) when is_atom(Atom) ->
     esqlite3:bind_text(Stmt, Index, atom_to_binary(Atom, utf8));
 bound(Stmt, Index, {blob, Bytes}) when is_binary(Bytes); is_list(Bytes) ->
@@ -576,6 +558,11 @@ bound(Stmt, Index, {int64, Int}) when ?IS_INT64(Int) ->
     esqlite3:bind_int64(Stmt, Index, Int);
 bound(Stmt, Index, {float, Float}) when is_float(Float) ->
     esqlite3:bind_double(Stmt, Index, Float);
+bound(Stmt, Index, Tuple) when is_tuple(Tuple) ->
+    case date_param(Tuple) of
+        {ok, Text} -> esqlite3:bind_text(Stmt, Index, Text);
+        error -> {error, {unsupported_param, Index}}
+    end;
 bound(_Stmt, Index, _Param) ->
     {error, {unsupported_param, Index}}.
 
@@ -583,13 +570,44 @@ bound(_Stmt, Index, _Param) ->
 boolean_int(true) -> 1;
 boolean_int(false) -> 0.
 
+%% A date tuple is told from a {H, M, S} time by its year, so years up to 24
+%% do not bind as dates. A datetime goes through gregorian seconds, so
+%% 24:00:00 and a leap second are stored as the instant they name, the way
+%% kura's cast reads them.
+-spec date_param(tuple()) -> {ok, binary()} | error.
+date_param({{Y, Mo, D} = Date, {H, Mi, S}}) when
+    is_integer(Y), is_integer(Mo), is_integer(D), is_integer(H), is_integer(Mi), is_integer(S)
+->
+    case Y >= 0 andalso calendar:valid_date(Date) andalso valid_time(H, Mi, S) of
+        true ->
+            Seconds = calendar:date_to_gregorian_days(Date) * 86400 + H * 3600 + Mi * 60 + S,
+            datetime_text(calendar:gregorian_seconds_to_datetime(Seconds));
+        false ->
+            error
+    end;
+date_param({Y, Mo, D} = Date) when is_integer(Y), is_integer(Mo), is_integer(D) ->
+    case Y > 24 andalso Y =< 9999 andalso calendar:valid_date(Date) of
+        true -> {ok, date_text(Date)};
+        false -> error
+    end;
+date_param(_) ->
+    error.
+
+-spec valid_time(integer(), integer(), integer()) -> boolean().
+valid_time(24, 0, 0) ->
+    true;
+valid_time(H, Mi, S) ->
+    H >= 0 andalso H =< 23 andalso Mi >= 0 andalso Mi =< 59 andalso S >= 0 andalso S =< 60.
+
 -spec date_text(calendar:date()) -> binary().
 date_text({Y, M, D}) ->
     iolist_to_binary(io_lib:format("~4..0B-~2..0B-~2..0B", [Y, M, D])).
 
--spec datetime_text(calendar:datetime()) -> binary().
-datetime_text({Date, {H, Mi, S}}) ->
-    iolist_to_binary([date_text(Date), io_lib:format(" ~2..0B:~2..0B:~2..0B", [H, Mi, S])]).
+-spec datetime_text(calendar:datetime()) -> {ok, binary()} | error.
+datetime_text({{Y, _, _} = Date, {H, Mi, S}}) when Y =< 9999 ->
+    {ok, iolist_to_binary([date_text(Date), io_lib:format(" ~2..0B:~2..0B:~2..0B", [H, Mi, S])])};
+datetime_text(_) ->
+    error.
 
 %% The process dictionary is untyped; what is stored is the connection put
 %% there by the outermost transaction.
