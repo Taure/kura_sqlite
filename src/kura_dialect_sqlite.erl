@@ -499,7 +499,7 @@ blob_query(#kura_query{wheres = Wheres, havings = Havings} = Query) ->
     }.
 
 %% After a join kura qualifies a bare field of the `from` schema with the
-%% `from` table (kura_query_compiler:qualified_columns/1), so such a field
+%% `from` table (kura_dialect:qualified_columns/1), so such a field
 %% is a byte field only if the `from` schema says so, and its cast is
 %% qualified the same way. Any other where-field is not qualified, so the
 %% byte fields of every joined schema are rewritten too; a name in two of
@@ -508,7 +508,7 @@ blob_query(#kura_query{wheres = Wheres, havings = Havings} = Query) ->
     {#{atom() => kura_types:kura_type()}, #{atom() => binary()}}.
 query_blob_fields(#kura_query{from = From, joins = Joins} = Query) ->
     All = joined_blob_fields([From | [Table || {_Type, Table, _On, _As} <- Joins]]),
-    case kura_query_compiler:qualified_columns(Query) of
+    case kura_dialect:qualified_columns(Query) of
         undefined ->
             {All, #{}};
         {Table, FromFields} ->
