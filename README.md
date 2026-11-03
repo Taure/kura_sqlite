@@ -97,6 +97,9 @@ to start on this backend via `kura_capabilities:require/2`.
   by raw SQL is refused rather than stored next to a BLOB with the same
   bytes, and its `default` is written as a BLOB literal of the same bytes.
   The check is left off a column whose name contains `?`.
+- **Vector distance** is unsupported. A query with `kura_query:distance/3`
+  in its select, order, where or having raises
+  `{unsupported, vector_distance}`, before any SQL reaches SQLite.
 - **Joins and CTEs by name.** A `from` or join target named by atom or
   binary rather than a schema module, or a CTE, has no field types, so a
   where-condition on one of its BLOB columns binds TEXT. SQLite orders

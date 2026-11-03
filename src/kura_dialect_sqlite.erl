@@ -74,6 +74,16 @@ raises `{kura_sqlite, {unsupported_blob_condition, Field, Op}}`. `like`,
 `ilike`, `is_nil`, `is_not_nil` and an empty `in` or `not_in` list are
 passed through unchanged.
 
+## Vector distance
+
+SQLite has no vector distance operators. A query holding a
+`kura_query:distance/3` node, in a select expression, an `order_by` or a
+distance threshold of a where or a having, in the query or in any of its
+CTEs, combinations or condition subqueries, raises
+`{unsupported, vector_distance}` before any SQL is emitted, as the
+`kura_dialect` contract requires. pgvector's `<->`, `<=>` and `<#>` never
+reach SQLite.
+
 ## Notes
 
 - Callbacks delegate to `kura_dialect_pg` and then apply
@@ -125,11 +135,13 @@ passed through unchanged.
 
 -spec to_sql(#kura_query{}) -> {iodata(), [term()]}.
 to_sql(Query) ->
+    ok = refuse_distances(Query),
     {SQL, Params} = kura_dialect_pg:to_sql(blob_query(Query)),
     {swap_placeholders(SQL), Params}.
 
 -spec to_sql_from(#kura_query{}, pos_integer()) -> {iodata(), [term()], pos_integer()}.
 to_sql_from(Query, StartCounter) ->
+    ok = refuse_distances(Query),
     {SQL, Params, NextCounter} = kura_dialect_pg:to_sql_from(blob_query(Query), StartCounter),
     {swap_placeholders(SQL), Params, NextCounter}.
 
@@ -162,11 +174,13 @@ delete(SchemaOrTable, KeyClauses) ->
 
 -spec update_all(#kura_query{}, map()) -> {iodata(), [term()]}.
 update_all(#kura_query{from = From} = Query, SetMap) ->
+    ok = refuse_distances(Query),
     {SQL, Params} = kura_dialect_pg:update_all(blob_query(Query), blob_values(From, SetMap)),
     {swap_placeholders(SQL), Params}.
 
 -spec delete_all(#kura_query{}) -> {iodata(), [term()]}.
 delete_all(Query) ->
+    ok = refuse_distances(Query),
     {SQL, Params} = kura_dialect_pg:delete_all(blob_query(Query)),
     {swap_placeholders(SQL), Params}.
 
@@ -397,6 +411,93 @@ virtual fields. `kura_sqlite:check_blob_columns/2` checks these.
 blob_columns(Schema) ->
     Blobs = blob_fields(Schema),
     [Field || Field <- kura_schema:non_virtual_fields(Schema), is_map_key(Field, Blobs)].
+
+%%----------------------------------------------------------------------
+%% Vector distance
+%%----------------------------------------------------------------------
+
+%% kura_dialect_pg would emit pgvector's operators, which SQLite does not
+%% have. Every position it compiles a distance in is checked: a select
+%% expression, an order_by and the left side of a condition, in the query
+%% and in its CTEs, combinations and condition subqueries.
+-spec refuse_distances(term()) -> ok.
+refuse_distances(#kura_query{
+    select = Select,
+    wheres = Wheres,
+    havings = Havings,
+    order_bys = Orders,
+    ctes = Ctes,
+    combinations = Combinations
+}) ->
+    ok = refuse_select_distances(Select),
+    ok = refuse_condition_distances(Wheres),
+    ok = refuse_condition_distances(Havings),
+    ok = refuse_order_distances(Orders),
+    ok = refuse_named_distances(Ctes),
+    refuse_named_distances(Combinations);
+refuse_distances(_Query) ->
+    ok.
+
+-spec refuse_select_distances(term()) -> ok.
+refuse_select_distances({exprs, Exprs}) ->
+    refuse_expr_distances(Exprs);
+refuse_select_distances(_Select) ->
+    ok.
+
+-spec refuse_expr_distances(term()) -> ok.
+refuse_expr_distances([{_Alias, Expr} | Rest]) ->
+    ok = refuse_distance(Expr),
+    refuse_expr_distances(Rest);
+refuse_expr_distances([_ | Rest]) ->
+    refuse_expr_distances(Rest);
+refuse_expr_distances(_Exprs) ->
+    ok.
+
+-spec refuse_order_distances(term()) -> ok.
+refuse_order_distances([{Expr, _Dir} | Rest]) ->
+    ok = refuse_distance(Expr),
+    refuse_order_distances(Rest);
+refuse_order_distances([_ | Rest]) ->
+    refuse_order_distances(Rest);
+refuse_order_distances(_Orders) ->
+    ok.
+
+-spec refuse_condition_distances(term()) -> ok.
+refuse_condition_distances([Condition | Rest]) ->
+    ok = refuse_condition_distance(Condition),
+    refuse_condition_distances(Rest);
+refuse_condition_distances(_Conditions) ->
+    ok.
+
+-spec refuse_condition_distance(term()) -> ok.
+refuse_condition_distance({Op, Conditions}) when Op =:= 'and'; Op =:= 'or' ->
+    refuse_condition_distances(Conditions);
+refuse_condition_distance({'not', Condition}) ->
+    refuse_condition_distance(Condition);
+refuse_condition_distance({Exists, {subquery, Sub}}) when
+    Exists =:= exists; Exists =:= not_exists
+->
+    refuse_distances(Sub);
+refuse_condition_distance({Field, in, {subquery, Sub}}) ->
+    ok = refuse_distance(Field),
+    refuse_distances(Sub);
+refuse_condition_distance({Field, _Op, _Value}) ->
+    refuse_distance(Field);
+refuse_condition_distance({Field, _Value}) ->
+    refuse_distance(Field);
+refuse_condition_distance(_Condition) ->
+    ok.
+
+-spec refuse_named_distances(term()) -> ok.
+refuse_named_distances([{_Name, Query} | Rest]) ->
+    ok = refuse_distances(Query),
+    refuse_named_distances(Rest);
+refuse_named_distances(_Queries) ->
+    ok.
+
+-spec refuse_distance(term()) -> ok.
+refuse_distance({distance, _Field, _Metric, _Vector}) -> error({unsupported, vector_distance});
+refuse_distance(_Expr) -> ok.
 
 %%----------------------------------------------------------------------
 %% Byte fields
