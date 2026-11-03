@@ -1094,7 +1094,13 @@ params_bind_by_position_test_() ->
         {[{blob, ~"b"}, ~"t"], {~"blob", ~"b"}, {~"text", ~"t"}},
         {[1, 2.5], {~"integer", 1}, {~"real", 2.5}},
         {["chars", [~"io", "list"]], {~"text", ~"chars"}, {~"text", ~"iolist"}},
-        {[true, false], {~"text", ~"true"}, {~"text", ~"false"}},
+        {[true, false], {~"integer", 1}, {~"integer", 0}},
+        {[atom, {2024, 1, 2}], {~"text", ~"atom"}, {~"text", ~"2024-01-02"}},
+        {
+            [{{2024, 1, 2}, {3, 4, 5}}, {{999, 12, 31}, {24, 0, 0}}],
+            {~"text", ~"2024-01-02 03:04:05"},
+            {~"text", ~"0999-12-31 24:00:00"}
+        },
         {[{text, ~"t"}, {int64, 7}], {~"text", ~"t"}, {~"integer", 7}},
         {[{int, 3}, {float, 1.5}], {~"integer", 3}, {~"real", 1.5}}
     ],
@@ -1130,6 +1136,24 @@ unrecognised_blob_column_is_refused_test() ->
             kura_driver_sqlite:query_on(Conn, <<"CREATE TABLE t (c ", Blob/binary, ")">>, [], #{})
         end)
     ).
+
+%% A {H, M, S} time has the shape of a date, so a three-integer tuple that
+%% could be one is refused rather than bound as a date.
+params_that_may_be_a_time_or_are_out_of_range_are_refused_test_() ->
+    [
+        ?_assertEqual({error, {unsupported_param, 1}}, bound([Param, 1]))
+     || Param <- [
+            {12, 5, 6},
+            {24, 1, 1},
+            {2024, 13, 1},
+            {2024, 1, 0},
+            {10000, 1, 1},
+            {2024, 1, 2.0},
+            {{2024, 1, 2}, {25, 0, 0}},
+            {{2024, 1, 2}, {1, 2, 3.5}},
+            {{2024, 1, 2}, {1, 2, 3, 4}}
+        ]
+    ].
 
 params_esqlite_cannot_bind_are_refused_test_() ->
     [

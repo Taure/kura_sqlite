@@ -136,9 +136,17 @@ the workload. esqlite sets 2 seconds by default.
 
 ## Caveats (phase 2 skeleton)
 
-- Type encoding: pass-through. SQLite has type affinity, so booleans
-  arrive as 0/1 rather than `true`/`false`. Phase 3 normalizes via
-  the kura type system.
+- Type encoding: a parameter is bound by its Erlang shape. `true` and
+  `false` bind as the integers 1 and 0, the way a boolean column stores
+  them, so a filter on a boolean matches whether it is given `true` or
+  `~"1"`. A `{{Y, M, D}, {H, Mi, S}}` datetime binds as the text
+  `YYYY-MM-DD HH:MM:SS`, the form SQLite's `datetime()` and
+  `CURRENT_TIMESTAMP` produce, and a `{Y, M, D}` date whose year is above
+  24 binds as `YYYY-MM-DD`. A three-integer tuple whose first element is
+  24 or less could be a `{H, M, S}` time, so it is refused as
+  `{error, {unsupported_param, N}}`; pass a time as text. Other atoms bind
+  as their name. Results are not normalized: a boolean reads back as 0/1
+  and a date as its text.
 - `query/5` always opens a fresh checkout when not in a transaction;
   there is no per-query optimization yet.
 """.
@@ -157,6 +165,17 @@ the workload. esqlite sets 2 seconds by default.
 
 -define(IS_INT64(Int), (is_integer(Int) andalso Int >= -(1 bsl 63) andalso Int < 1 bsl 63)).
 -define(IS_INT32(Int), (is_integer(Int) andalso Int >= -(1 bsl 31) andalso Int < 1 bsl 31)).
+-define(IS_DATE(D),
+    (is_tuple(D) andalso tuple_size(D) =:= 3 andalso is_integer(element(1, D)) andalso
+        element(1, D) >= 0 andalso
+        element(1, D) =< 9999 andalso is_integer(element(2, D)) andalso element(2, D) >= 1 andalso
+        element(2, D) =< 12 andalso is_integer(element(3, D)) andalso element(3, D) >= 1 andalso
+        element(3, D) =< 31)
+).
+-define(IS_TIME(H, Mi, S),
+    (is_integer(H) andalso H >= 0 andalso H =< 24 andalso is_integer(Mi) andalso Mi >= 0 andalso
+        Mi =< 59 andalso is_integer(S) andalso S >= 0 andalso S =< 60)
+).
 
 -define(NOTHING_DROPPED, [~"Init", ~"Transaction", ~"JournalMode", ~"Goto", ~"Halt"]).
 
@@ -537,6 +556,14 @@ bound(Stmt, Index, Float) when is_float(Float) ->
     esqlite3:bind_double(Stmt, Index, Float);
 bound(Stmt, Index, Text) when is_binary(Text); is_list(Text) ->
     esqlite3:bind_text(Stmt, Index, Text);
+bound(Stmt, Index, Bool) when is_boolean(Bool) ->
+    esqlite3:bind_int64(Stmt, Index, boolean_int(Bool));
+bound(Stmt, Index, {{_, _, _} = Date, {H, Mi, S}} = DateTime) when
+    ?IS_DATE(Date), ?IS_TIME(H, Mi, S)
+->
+    esqlite3:bind_text(Stmt, Index, datetime_text(DateTime));
+bound(Stmt, Index, Date) when ?IS_DATE(Date), element(1, Date) > 24 ->
+    esqlite3:bind_text(Stmt, Index, date_text(Date));
 bound(Stmt, Index, Atom) when is_atom(Atom) ->
     esqlite3:bind_text(Stmt, Index, atom_to_binary(Atom, utf8));
 bound(Stmt, Index, {blob, Bytes}) when is_binary(Bytes); is_list(Bytes) ->
@@ -551,6 +578,18 @@ bound(Stmt, Index, {float, Float}) when is_float(Float) ->
     esqlite3:bind_double(Stmt, Index, Float);
 bound(_Stmt, Index, _Param) ->
     {error, {unsupported_param, Index}}.
+
+-spec boolean_int(boolean()) -> 0 | 1.
+boolean_int(true) -> 1;
+boolean_int(false) -> 0.
+
+-spec date_text(calendar:date()) -> binary().
+date_text({Y, M, D}) ->
+    iolist_to_binary(io_lib:format("~4..0B-~2..0B-~2..0B", [Y, M, D])).
+
+-spec datetime_text(calendar:datetime()) -> binary().
+datetime_text({Date, {H, Mi, S}}) ->
+    iolist_to_binary([date_text(Date), io_lib:format(" ~2..0B:~2..0B:~2..0B", [H, Mi, S])]).
 
 %% The process dictionary is untyped; what is stored is the connection put
 %% there by the outermost transaction.
