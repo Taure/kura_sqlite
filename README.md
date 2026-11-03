@@ -96,7 +96,10 @@ to start on this backend via `kura_capabilities:require/2`.
   kura reports `unsupported` raises
   `{kura_crypto, unsupported_encrypted_type}` when a migration declares
   it, as on Postgres.
-- **Arrays of encrypted values** are not supported on SQLite.
+- **Arrays of encrypted values** are not supported on SQLite. A migration
+  declaring one, and a write of a list to one, raise
+  `{kura_sqlite, {unsupported_type, {array, Inner}}}`, and a where or
+  having on one raises `{kura_sqlite, {encrypted_field_in_where, Field}}`.
 - **Deterministic lookups**: the `encrypted_in` and `encrypted_not_in`
   conditions kura builds for a deterministic field
   (`{encrypted, Inner, #{mode => deterministic}}`) compile to `IN` and

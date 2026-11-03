@@ -68,8 +68,10 @@ covers `{encrypted, Inner}` and `{encrypted, Inner, Opts}`. An encrypted
 type that kura reports `unsupported` raises
 `{kura_crypto, unsupported_encrypted_type}` in `column_type/1`, as kura's
 PG dialect does, so a migration declaring one fails. A type with no
-SQLite storage raises `{kura_sqlite, {unsupported_type, Type}}`. Arrays
-of an encrypted type are not supported on SQLite. A condition on an encrypted
+SQLite storage raises `{kura_sqlite, {unsupported_type, Type}}`, and so
+does an array of an encrypted type: in `column_type/1`, and when a list is
+written to such a field by `insert`, `update`, `delete`, `insert_all` or
+the `SET` of `update_all`. A condition on an encrypted
 field other than `is_nil`, `is_not_nil` or a deterministic lookup raises
 `{kura_sqlite, {encrypted_field_in_where, Field}}`, in a where or a
 having, on the `from` schema or a joined one. A value encrypted under a
@@ -268,7 +270,8 @@ storage_type(jsonb) ->
     ~"TEXT";
 storage_type({enum, _}) ->
     ~"TEXT";
-storage_type({array, _}) ->
+storage_type({array, _} = Type) ->
+    ok = supported_array(Type),
     ~"TEXT";
 storage_type({embed, _, _}) ->
     ~"TEXT";
@@ -283,6 +286,15 @@ storage_type(Type) ->
         {ok, _Spec} -> ~"BLOB";
         unsupported -> erlang:error({kura_crypto, unsupported_encrypted_type});
         none -> erlang:error({kura_sqlite, {unsupported_type, Type}})
+    end.
+
+%% kura_driver_sqlite binds a list as one TEXT value, which would corrupt
+%% ciphertexts, so an array of an encrypted type is refused.
+-spec supported_array({array, kura_types:kura_type()}) -> ok.
+supported_array({array, Inner} = Type) ->
+    case kura_types:encryption(Inner) of
+        none -> ok;
+        _ -> erlang:error({kura_sqlite, {unsupported_type, Type}})
     end.
 
 %% A default is whatever the schema declares.
@@ -533,8 +545,8 @@ refuse_distance(_Expr) -> ok.
 
 -spec blob_values(term(), map()) -> map().
 blob_values(Table, Values) ->
-    {_Types, Blobs} = Fields = schema_fields(Table),
-    case map_size(Blobs) of
+    {Types, _Blobs} = Fields = schema_fields(Table),
+    case map_size(Types) of
         0 -> Values;
         _ -> maps:map(fun(Field, Value) -> blob_value(Field, Value, Fields) end, Values)
     end.
@@ -547,6 +559,13 @@ blob_keys(Table, KeyClauses) ->
 -spec blob_value(atom(), term(), fields()) -> term().
 blob_value(Field, Value, {_Types, Blobs}) when is_binary(Value), is_map_key(Field, Blobs) ->
     {blob, Value};
+blob_value(Field, Value, {Types, _Blobs}) when is_list(Value) ->
+    ok =
+        case Types of
+            #{Field := {array, _} = Type} -> supported_array(Type);
+            #{} -> ok
+        end,
+    Value;
 blob_value(_Field, Value, _Fields) ->
     Value.
 
@@ -710,7 +729,7 @@ compared_fields(_Condition) ->
 -spec is_encrypted(atom(), #{atom() => kura_types:kura_type()}) -> boolean().
 is_encrypted(Field, Types) ->
     case Types of
-        #{Field := Type} -> encrypted_type(Type);
+        #{Field := Type} -> kura_types:encryption(Type) =/= none;
         #{} -> false
     end.
 

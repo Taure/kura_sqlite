@@ -652,6 +652,16 @@ encrypted_forms_are_blob_columns_test_() ->
         [
             options_column(Type)
          || Type <- [?DETERMINISTIC, ?LOOKUP_SCHEMA:encrypted(binary, #{})]
+        ] ++
+        [
+            ?_assertError(
+                {kura_sqlite, {unsupported_type, Type}}, kura_dialect_sqlite:column_type(Type)
+            )
+         || Type <- [
+                {array, {encrypted, string}},
+                {array, {array, {encrypted, string}}},
+                {array, ?DETERMINISTIC}
+            ]
         ].
 
 %% kura#219 reads {encrypted, Inner, Opts}; an earlier kura reports it
@@ -756,6 +766,7 @@ three_tuple_schema_tests() ->
     Q = kura_query:from(?LOOKUP_SCHEMA),
     Values = #{name => ~"n", token => ~"t", 'code?' => ~"c", tags => null},
     Fields = [name, token, 'code?', tags],
+    Tags = {kura_sqlite, {unsupported_type, {array, {encrypted, string}}}},
     [
         ?_assertEqual(
             [~"n", {blob, ~"t"}, {blob, ~"c"}, null],
@@ -781,6 +792,16 @@ three_tuple_schema_tests() ->
             [{blob, ~"t"}], element(2, kura_dialect_sqlite:update_all(Q, #{token => ~"t"}))
         ),
         ?_assertEqual([token, 'code?'], kura_dialect_sqlite:blob_columns(?LOOKUP_SCHEMA)),
+        ?_assertError(Tags, kura_dialect_sqlite:insert(?LOOKUP_SCHEMA, [tags], #{tags => [~"x"]})),
+        ?_assertError(
+            Tags, kura_dialect_sqlite:insert_all(?LOOKUP_SCHEMA, [tags], [#{tags => [~"x"]}])
+        ),
+        ?_assertError(Tags, kura_dialect_sqlite:update_all(Q, #{tags => [~"x"]})),
+        ?_assertError(Tags, kura_dialect_sqlite:delete(?LOOKUP_SCHEMA, [{tags, [~"x"]}])),
+        ?_assertEqual(
+            [[~"x"]],
+            element(2, kura_dialect_sqlite:insert(?LOOKUP_SCHEMA, [name], #{name => [~"x"]}))
+        ),
         ?_assertError(
             {kura_sqlite, {encrypted_field_in_where, token}}, unchecked_where(Q, {token, ~"t"})
         ),
@@ -793,10 +814,17 @@ three_tuple_schema_tests() ->
             unchecked_where(Q, {'code?', encrypted_in, [~"f1"]})
         ),
         ?_assertError(
+            {kura_sqlite, {encrypted_field_in_where, tags}}, unchecked_where(Q, {tags, [~"x"]})
+        ),
+        ?_assertError(
+            {kura_sqlite, {encrypted_field_in_where, tags}},
+            unchecked_where(Q, {tags, encrypted_in, ~"x"})
+        ),
+        ?_assertError(
             {kura_sqlite, {unsupported_blob_condition, tags, encrypted_in}},
             unchecked_where(Q, {tags, encrypted_in, [~"x"]})
         ),
-        ?_assertEqual({<<"\"tags\" = ?1">>, [[~"x"]]}, unchecked_where(Q, {tags, [~"x"]}))
+        ?_assertEqual({<<"\"tags\" IS NULL">>, []}, unchecked_where(Q, {tags, is_nil}))
     ].
 
 %% Only kura#219 has a deterministic field. On an earlier kura `token` is
