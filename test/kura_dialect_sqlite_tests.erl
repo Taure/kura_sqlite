@@ -587,6 +587,29 @@ where_on_joined_encrypted_field_raises_test() ->
         unchecked_where_sql(Joined, {secret, ~"pii"})
     ).
 
+%% Under a join a field of the from schema names the from table's column,
+%% so whether it is encrypted is the from schema's answer, whatever a joined
+%% schema declares under the same name.
+where_on_encrypted_from_field_with_a_plain_joined_namesake_raises_test() ->
+    Joined = kura_query:join(
+        kura_query:from(kura_sqlite_vault_schema), inner, kura_sqlite_plain_secret_schema, {id, id}
+    ),
+    ?assertError(
+        {kura_sqlite, {encrypted_field_in_where, secret}},
+        unchecked_where_sql(Joined, {secret, ~"pii"})
+    ).
+
+where_on_plain_from_field_with_an_encrypted_joined_namesake_test() ->
+    Joined = kura_query:join(
+        kura_query:from(kura_sqlite_plain_secret_schema), inner, kura_sqlite_vault_schema, {id, id}
+    ),
+    {SQL, Params} = unchecked_where_sql(Joined, {secret, ~"plain"}),
+    [_, Where] = binary:split(iolist_to_binary(SQL), ~" WHERE "),
+    ?assertEqual({<<"\"notes\".\"secret\" = ?1">>, [~"plain"]}, {Where, Params}),
+    ?assertError(
+        {kura, {encrypted_field_in_where, secret}}, where_sql(Joined, {secret, ~"plain"})
+    ).
+
 where_on_encrypted_field_named_with_a_placeholder_raises_test() ->
     Q = kura_query:from(kura_sqlite_question_schema),
     ?assertError(
