@@ -64,8 +64,12 @@ A byte column `kura_migrator` creates is declared
 (see `blob_checks/1`).
 
 A field is encrypted when `kura_types:encryption/1` says so, which
-covers `{encrypted, Inner}` and `{encrypted, Inner, Opts}`; an array of an
-encrypted type is an array, stored as TEXT. A condition on an encrypted
+covers `{encrypted, Inner}` and `{encrypted, Inner, Opts}`. An encrypted
+type that kura reports `unsupported` raises
+`{kura_crypto, unsupported_encrypted_type}` in `column_type/1`, as kura's
+PG dialect does, so a migration declaring one fails. A type with no
+SQLite storage raises `{kura_sqlite, {unsupported_type, Type}}`. Arrays
+of an encrypted type are not supported on SQLite. A condition on an encrypted
 field other than `is_nil`, `is_not_nil` or a deterministic lookup raises
 `{kura_sqlite, {encrypted_field_in_where, Field}}`, in a where or a
 having, on the `from` schema or a joined one. A value encrypted under a
@@ -271,7 +275,8 @@ storage_type({custom, Mod}) ->
 storage_type(Type) ->
     case kura_types:encryption(Type) of
         {ok, _Spec} -> ~"BLOB";
-        unsupported -> ~"BLOB"
+        unsupported -> erlang:error({kura_crypto, unsupported_encrypted_type});
+        none -> erlang:error({kura_sqlite, {unsupported_type, Type}})
     end.
 
 %% A default is whatever the schema declares.
@@ -597,7 +602,8 @@ is_schema(Mod) ->
 placeholder_free(Field) ->
     binary:match(atom_to_binary(Field, utf8), ~"?") =:= nomatch.
 
-%% An array of an encrypted type is stored as an array, in TEXT.
+%% An array of an encrypted type is not supported on SQLite and is not a
+%% byte field.
 -spec encrypted_type(kura_types:kura_type()) -> boolean().
 encrypted_type({array, _}) -> false;
 encrypted_type(Type) -> kura_types:encryption(Type) =/= none.

@@ -640,17 +640,36 @@ encrypted_forms_are_blob_columns_test_() ->
     Blob = kura_dialect_sqlite:column_type(binary),
     [
         ?_assertEqual(Blob, kura_dialect_sqlite:column_type({encrypted, string})),
-        ?_assertEqual(Blob, kura_dialect_sqlite:column_type(?DETERMINISTIC)),
-        ?_assertEqual(Blob, kura_dialect_sqlite:column_type(?LOOKUP_SCHEMA:encrypted(binary, #{}))),
-        ?_assertEqual(
-            Blob, kura_dialect_sqlite:column_type(?LOOKUP_SCHEMA:encrypted(string, not_options))
-        ),
         ?_assertEqual(~"TEXT", kura_dialect_sqlite:column_type({array, {encrypted, string}})),
-        ?_assertError({case_clause, none}, kura_dialect_sqlite:column_type(vector))
-    ].
+        ?_assertError(
+            {kura_crypto, unsupported_encrypted_type},
+            kura_dialect_sqlite:column_type(?LOOKUP_SCHEMA:encrypted(string, not_options))
+        ),
+        ?_assertError(
+            {kura_sqlite, {unsupported_type, vector}}, kura_dialect_sqlite:column_type(vector)
+        )
+    ] ++
+        [
+            options_column(Type)
+         || Type <- [?DETERMINISTIC, ?LOOKUP_SCHEMA:encrypted(binary, #{})]
+        ].
 
-encrypted_form_column_refuses_text_test() ->
-    Column = kura_dialect_sqlite:column_type(?DETERMINISTIC),
+%% kura#219 reads {encrypted, Inner, Opts}; an earlier kura reports it
+%% unsupported, and kura_types:to_pg_type/1 raises on it.
+options_column(Type) ->
+    case kura_types:encryption(Type) of
+        {ok, _} ->
+            ?_assertEqual(
+                kura_dialect_sqlite:column_type(binary), kura_dialect_sqlite:column_type(Type)
+            );
+        unsupported ->
+            ?_assertError(
+                {kura_crypto, unsupported_encrypted_type}, kura_dialect_sqlite:column_type(Type)
+            )
+    end.
+
+encrypted_column_refuses_text_test() ->
+    Column = kura_dialect_sqlite:column_type({encrypted, string}),
     ?assertEqual(
         {ok, ~"CREATE TABLE \"t\" (\"token\" BLOB CHECK (typeof(\"token\") IN ('blob', 'null')))"},
         kura_dialect_sqlite:blob_checks(<<"CREATE TABLE \"t\" (\"token\" ", Column/binary, ")">>)

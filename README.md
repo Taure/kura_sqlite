@@ -92,13 +92,18 @@ to start on this backend via `kura_capabilities:require/2`.
   deterministic lookup raises
   `{kura_sqlite, {encrypted_field_in_where, Field}}`, since a value
   encrypted under a fresh nonce never equals the stored ciphertext and the
-  plaintext would go out with the query's parameters. An array of an
-  encrypted type is stored as TEXT, like any array.
+  plaintext would go out with the query's parameters. An encrypted type
+  kura reports `unsupported` raises
+  `{kura_crypto, unsupported_encrypted_type}` when a migration declares
+  it, as on Postgres.
+- **Arrays of encrypted values** are not supported on SQLite.
 - **Deterministic lookups**: the `encrypted_in` and `encrypted_not_in`
   conditions kura builds for a deterministic field compile to `IN` and
-  `NOT IN` over `CAST(? AS BLOB)`, one per ciphertext. A lookup on a field
-  whose name contains `?` raises
-  `{kura_sqlite, {unsupported_blob_condition, Field, Op}}`.
+  `NOT IN` over `CAST(? AS BLOB)`, one per ciphertext. A lookup raises
+  `{kura_sqlite, {unsupported_blob_condition, Field, Op}}` rather than
+  bind the ciphertexts as TEXT when its field is not a byte field of the
+  `from` schema or a joined one (a TEXT field, or any field of a table
+  named by atom or binary), or when the field's name contains `?`.
 - **Byte columns refuse TEXT.** A byte column a kura migration creates,
   with `create_table` or `add_column`, is declared
   `BLOB CHECK (typeof(col) IN ('blob', 'null'))`, so a TEXT value written
