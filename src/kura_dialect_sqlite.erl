@@ -664,11 +664,13 @@ joined_fields([]) ->
 joined_fields([Table | Rest]) ->
     {Types, Blobs} = schema_fields(Table),
     {RestTypes, RestBlobs} = joined_fields(Rest),
-    {maps:merge_with(fun joined_type/3, Types, RestTypes), maps:merge(Blobs, RestBlobs)}.
+    Merged = maps:merge_with(
+        fun(_Field, Type, Other) -> joined_type(Type, Other) end, Types, RestTypes
+    ),
+    {Merged, maps:merge(Blobs, RestBlobs)}.
 
--spec joined_type(atom(), kura_types:kura_type(), kura_types:kura_type()) ->
-    kura_types:kura_type().
-joined_type(_Field, Type, Other) ->
+-spec joined_type(kura_types:kura_type(), kura_types:kura_type()) -> kura_types:kura_type().
+joined_type(Type, Other) ->
     case restriction(Type) >= restriction(Other) of
         true -> Type;
         false -> Other
