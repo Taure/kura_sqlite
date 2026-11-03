@@ -69,7 +69,7 @@ documentation.
 
 The pool opens only UTF-8 databases. SQLite stores a bound binary as TEXT,
 and in a UTF-16 database TEXT is transcoded, so a binary that is not valid
-text, ciphertext from an `{encrypted, _}` field among them, would not come
+text, ciphertext from an encrypted field among them, would not come
 back as it was written. `start_pool/2` on a database in another encoding
 returns `{error, {unsupported_encoding, Encoding}}`, `Encoding` being, for
 example, `~"UTF-16le"`. The encoding is checked when the pool starts and

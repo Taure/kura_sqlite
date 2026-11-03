@@ -630,6 +630,224 @@ cached_blob_fields(Key) ->
     end.
 
 %%----------------------------------------------------------------------
+%% Every encrypted form, and deterministic lookups (Taure/kura#219)
+%%----------------------------------------------------------------------
+
+-define(LOOKUP_SCHEMA, kura_sqlite_lookup_schema).
+-define(DETERMINISTIC, ?LOOKUP_SCHEMA:encrypted(string, #{mode => deterministic})).
+
+encrypted_forms_are_blob_columns_test_() ->
+    Blob = kura_dialect_sqlite:column_type(binary),
+    [
+        ?_assertEqual(Blob, kura_dialect_sqlite:column_type({encrypted, string})),
+        ?_assertEqual(Blob, kura_dialect_sqlite:column_type(?DETERMINISTIC)),
+        ?_assertEqual(Blob, kura_dialect_sqlite:column_type(?LOOKUP_SCHEMA:encrypted(binary, #{}))),
+        ?_assertEqual(
+            Blob, kura_dialect_sqlite:column_type(?LOOKUP_SCHEMA:encrypted(string, not_options))
+        ),
+        ?_assertEqual(~"TEXT", kura_dialect_sqlite:column_type({array, {encrypted, string}})),
+        ?_assertError({case_clause, none}, kura_dialect_sqlite:column_type(vector))
+    ].
+
+encrypted_form_column_refuses_text_test() ->
+    Column = kura_dialect_sqlite:column_type(?DETERMINISTIC),
+    ?assertEqual(
+        {ok, ~"CREATE TABLE \"t\" (\"token\" BLOB CHECK (typeof(\"token\") IN ('blob', 'null')))"},
+        kura_dialect_sqlite:blob_checks(<<"CREATE TABLE \"t\" (\"token\" ", Column/binary, ")">>)
+    ).
+
+where_lookup_on_byte_field_casts_every_frame_test_() ->
+    Cases = [
+        {
+            {secret, encrypted_in, [~"f1", ~"f2"]},
+            <<"\"secret\" IN (CAST(?1 AS BLOB), CAST(?2 AS BLOB))">>,
+            [~"f1", ~"f2"]
+        },
+        {{secret, encrypted_in, [~"f1"]}, <<"\"secret\" IN (CAST(?1 AS BLOB))">>, [~"f1"]},
+        {
+            {secret, encrypted_not_in, [~"f1", ~"f2"]},
+            <<"\"secret\" NOT IN (CAST(?1 AS BLOB), CAST(?2 AS BLOB))">>,
+            [~"f1", ~"f2"]
+        },
+        {{data, encrypted_in, [~"f1"]}, <<"\"data\" IN (CAST(?1 AS BLOB))">>, [~"f1"]},
+        {{secret, encrypted_in, []}, <<"\"secret\" IN ()">>, []},
+        {
+            {'not', {secret, encrypted_in, [~"f1"]}},
+            <<"NOT (\"secret\" IN (CAST(?1 AS BLOB)))">>,
+            [~"f1"]
+        },
+        {
+            {'and', [{name, ~"n"}, {'or', [{secret, encrypted_not_in, [~"f1"]}]}]},
+            <<"(\"name\" = ?1 AND (\"secret\" NOT IN (CAST(?2 AS BLOB))))">>,
+            [~"n", ~"f1"]
+        }
+    ],
+    [
+        ?_assertEqual({Where, Params}, unchecked_where(kura_query:from(?BLOB_SCHEMA), Condition))
+     || {Condition, Where, Params} <- Cases
+    ].
+
+where_lookup_on_joined_byte_field_casts_test() ->
+    Joined = kura_query:join(
+        kura_query:from(kura_sqlite_owner_schema), inner, ?BLOB_SCHEMA, {owner_id, id}
+    ),
+    ?assertEqual(
+        {<<"\"secret\" NOT IN (CAST(?1 AS BLOB))">>, [~"f1"]},
+        unchecked_where(Joined, {secret, encrypted_not_in, [~"f1"]})
+    ).
+
+having_lookup_on_byte_field_casts_test() ->
+    Q = (kura_query:from(?BLOB_SCHEMA))#kura_query{
+        group_bys = [secret], havings = [{secret, encrypted_in, [~"f1"]}]
+    },
+    {SQL, Params} = kura_dialect_sqlite:to_sql(Q),
+    [_, Having] = binary:split(iolist_to_binary(SQL), ~" HAVING "),
+    ?assertEqual({<<"\"secret\" IN (CAST(?1 AS BLOB))">>, [~"f1"]}, {Having, Params}).
+
+where_lookup_that_cannot_be_cast_raises_test_() ->
+    Q = kura_query:from(?BLOB_SCHEMA),
+    [
+        ?_assertError(
+            {kura_sqlite, {unsupported_blob_condition, name, encrypted_in}},
+            unchecked_where(Q, {name, encrypted_in, [~"f1"]})
+        ),
+        ?_assertError(
+            {kura_sqlite, {unsupported_blob_condition, secret, encrypted_not_in}},
+            unchecked_where(kura_query:from(vault), {secret, encrypted_not_in, [~"f1"]})
+        ),
+        ?_assertError(
+            {kura_sqlite, {unsupported_blob_condition, 'secret?', encrypted_in}},
+            unchecked_where(
+                kura_query:from(kura_sqlite_question_schema), {'secret?', encrypted_in, [~"f1"]}
+            )
+        ),
+        ?_assertError(
+            {kura_sqlite, {encrypted_field_in_where, secret}},
+            unchecked_where(Q, {secret, encrypted_in, ~"f1"})
+        )
+    ].
+
+where_lookup_matches_stored_frames_test() ->
+    {ok, _} = application:ensure_all_started(esqlite),
+    {ok, Conn} = esqlite3:open(":memory:"),
+    try
+        ok = esqlite3:exec(
+            Conn,
+            ~"CREATE TABLE vault (id INTEGER PRIMARY KEY, name TEXT, data BLOB, secret BLOB, digest BLOB, tag TEXT)"
+        ),
+        Frames = [<<0, 255, 254, 128, $a, 192>>, <<1, 2, 3>>, <<"plain">>],
+        _ = [
+            kura_driver_sqlite:query_on(Conn, SQL, Params, #{})
+         || Frame <- Frames,
+            {SQL, Params} <- [
+                kura_dialect_sqlite:insert(?BLOB_SCHEMA, [secret], #{secret => Frame})
+            ]
+        ],
+        Ids = fun(Condition) ->
+            Q = kura_query:select(kura_query:from(?BLOB_SCHEMA), [id]),
+            {SQL, Params} = unchecked_where_sql(kura_query:order_by(Q, [{id, asc}]), Condition),
+            #{rows := Rows} = kura_driver_sqlite:query_on(Conn, SQL, Params, #{}),
+            [Id || #{id := Id} <- Rows]
+        end,
+        ?assertEqual(
+            [1, 3], Ids({secret, encrypted_in, [<<0, 255, 254, 128, $a, 192>>, ~"plain"]})
+        ),
+        ?assertEqual(
+            [2], Ids({secret, encrypted_not_in, [<<0, 255, 254, 128, $a, 192>>, ~"plain"]})
+        )
+    after
+        esqlite3:close(Conn)
+    end.
+
+%% A kura without {encrypted, Inner, Opts} refuses the schema when it is
+%% first read, so its field types are put in kura's cache, as kura#219
+%% reads them.
+three_tuple_schema_test_() ->
+    {setup, fun read_lookup_schema/0, fun forget_lookup_schema/1, fun(_) ->
+        three_tuple_schema_tests()
+    end}.
+
+read_lookup_schema() ->
+    Key = {kura_schema, field_types, ?LOOKUP_SCHEMA},
+    try kura_schema:field_types(?LOOKUP_SCHEMA) of
+        #{} -> read
+    catch
+        error:{kura, {unsupported_encrypted_type, ?LOOKUP_SCHEMA, _}} ->
+            persistent_term:put(
+                Key,
+                #{
+                    Field => Type
+                 || #kura_field{name = Field, type = Type} <- ?LOOKUP_SCHEMA:fields()
+                }
+            ),
+            {seeded, Key}
+    end.
+
+forget_lookup_schema(Read) ->
+    _ = persistent_term:erase({kura_dialect_sqlite, blob_fields, ?LOOKUP_SCHEMA}),
+    case Read of
+        {seeded, Key} -> _ = persistent_term:erase(Key);
+        read -> ok
+    end,
+    ok.
+
+three_tuple_schema_tests() ->
+    Q = kura_query:from(?LOOKUP_SCHEMA),
+    Values = #{name => ~"n", token => ~"t", 'code?' => ~"c", tags => [~"x"]},
+    Fields = [name, token, 'code?', tags],
+    [
+        ?_assertEqual(
+            [~"n", {blob, ~"t"}, {blob, ~"c"}, [~"x"]],
+            element(2, kura_dialect_sqlite:insert(?LOOKUP_SCHEMA, Fields, Values))
+        ),
+        ?_assertEqual(
+            [~"n", {blob, ~"t"}, {blob, ~"c"}, [~"x"]],
+            element(2, kura_dialect_sqlite:insert_all(?LOOKUP_SCHEMA, Fields, [Values]))
+        ),
+        ?_assertEqual(
+            [{blob, ~"t"}, {blob, ~"k"}],
+            element(
+                2,
+                kura_dialect_sqlite:update(?LOOKUP_SCHEMA, [token], #{token => ~"t"}, [
+                    {token, ~"k"}
+                ])
+            )
+        ),
+        ?_assertEqual(
+            [{blob, ~"k"}], element(2, kura_dialect_sqlite:delete(?LOOKUP_SCHEMA, [{token, ~"k"}]))
+        ),
+        ?_assertEqual(
+            [{blob, ~"t"}], element(2, kura_dialect_sqlite:update_all(Q, #{token => ~"t"}))
+        ),
+        ?_assertEqual([token, 'code?'], kura_dialect_sqlite:blob_columns(?LOOKUP_SCHEMA)),
+        ?_assertEqual(
+            {<<"\"token\" IN (CAST(?1 AS BLOB), CAST(?2 AS BLOB))">>, [~"f1", ~"f2"]},
+            unchecked_where(Q, {token, encrypted_in, [~"f1", ~"f2"]})
+        ),
+        ?_assertEqual(
+            {<<"\"token\" NOT IN (CAST(?1 AS BLOB))">>, [~"f1"]},
+            unchecked_where(Q, {token, encrypted_not_in, [~"f1"]})
+        ),
+        ?_assertError(
+            {kura_sqlite, {encrypted_field_in_where, token}}, unchecked_where(Q, {token, ~"t"})
+        ),
+        ?_assertError(
+            {kura_sqlite, {encrypted_field_in_where, 'code?'}},
+            unchecked_where(Q, {'code?', '=', ~"c"})
+        ),
+        ?_assertError(
+            {kura_sqlite, {unsupported_blob_condition, 'code?', encrypted_in}},
+            unchecked_where(Q, {'code?', encrypted_in, [~"f1"]})
+        ),
+        ?_assertEqual({<<"\"tags\" = ?1">>, [[~"x"]]}, unchecked_where(Q, {tags, [~"x"]}))
+    ].
+
+unchecked_where(Query, Condition) ->
+    {SQL, Params} = unchecked_where_sql(Query, Condition),
+    [_, Where] = binary:split(iolist_to_binary(SQL), ~" WHERE "),
+    {Where, Params}.
+
+%%----------------------------------------------------------------------
 %% Vector distance
 %%----------------------------------------------------------------------
 
