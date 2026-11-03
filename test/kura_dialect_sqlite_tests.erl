@@ -219,12 +219,44 @@ where_on_joined_byte_field_casts_placeholder_test_() ->
         {{data, '!=', ~"d"}, <<"\"data\" != CAST(?1 AS BLOB)">>},
         {{data, not_in, [~"d"]}, <<"\"data\" NOT IN (CAST(?1 AS BLOB))">>},
         {{'not', {data, ~"d"}}, <<"NOT (\"data\" = CAST(?1 AS BLOB))">>},
-        {{label, ~"d"}, <<"\"label\" = ?1">>}
+        {{label, ~"d"}, <<"\"owners\".\"label\" = ?1">>}
     ],
     [
         ?_assertEqual({Where, [~"d"]}, where_sql(Joined, Condition))
      || {Condition, Where} <- Cases
     ].
+
+where_on_from_byte_field_under_join_casts_qualified_column_test_() ->
+    Joined = kura_query:join(
+        kura_query:from(kura_sqlite_owner_bytes_schema), inner, ?BLOB_SCHEMA, {owner_id, id}
+    ),
+    Cases = [
+        {{key, ~"k"}, <<"\"owners\".\"key\" = CAST(?1 AS BLOB)">>},
+        {{key, in, [~"k"]}, <<"\"owners\".\"key\" IN (CAST(?1 AS BLOB))">>},
+        {
+            {key, between, {~"k", ~"k"}},
+            <<"\"owners\".\"key\" BETWEEN CAST(?1 AS BLOB) AND CAST(?2 AS BLOB)">>
+        },
+        {
+            {[owner_id, key], in, [{1, ~"k"}]},
+            <<"(\"owners\".\"owner_id\", \"owners\".\"key\") IN ((?1, CAST(?2 AS BLOB)))">>
+        }
+    ],
+    [
+        ?_assertMatch({Where, _}, where_sql(Joined, Condition))
+     || {Condition, Where} <- Cases
+    ].
+
+where_on_from_text_field_that_a_join_stores_as_bytes_is_not_cast_test() ->
+    Joined = kura_query:join(
+        kura_query:from(kura_sqlite_owner_schema),
+        inner,
+        kura_sqlite_label_bytes_schema,
+        {owner_id, id}
+    ),
+    ?assertEqual(
+        {<<"\"owners\".\"label\" = ?1">>, [~"d"]}, where_sql(Joined, {label, ~"d"})
+    ).
 
 where_on_byte_field_of_a_table_joined_by_name_is_untouched_test() ->
     Joined = kura_query:join(
