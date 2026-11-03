@@ -183,6 +183,56 @@ nested_tests() ->
             {"a nested raise whose savepoint is gone rolls back the whole transaction", fun() ->
                 failed_rollback_to_abandons_the_transaction(Pool)
             end}
+        end,
+        fun(Pool) ->
+            {"a statement after a caught end raises the same, not a rollback", fun() ->
+                statement_after_caught_end_raises_ended(Pool)
+            end}
+        end,
+        fun(Pool) ->
+            {"a nested transaction after a caught end raises the same", fun() ->
+                nested_after_caught_end_raises_ended(Pool)
+            end}
+        end,
+        fun(Pool) ->
+            {"the commit after a caught end raises the same", fun() ->
+                commit_after_caught_end_raises_ended(Pool)
+            end}
+        end,
+        fun(Pool) ->
+            {"the next transaction after a caught end runs", fun() ->
+                transaction_after_caught_end_runs(Pool)
+            end}
+        end,
+        fun(Pool) ->
+            {"a transaction that ended leaves no note in the process", fun() ->
+                transaction_leaves_no_note(Pool)
+            end}
+        end,
+        fun(Pool) ->
+            {"query_on/4: a COMMIT inside a transaction it started raises", fun() ->
+                query_on_commit_inside_raises(Pool)
+            end}
+        end,
+        fun(Pool) ->
+            {"query_on/4: a statement after SQLite rolls back raises a rollback", fun() ->
+                query_on_after_sqlite_rollback_raises(Pool)
+            end}
+        end,
+        fun(Pool) ->
+            {"query_on/4: starts forgets an earlier end on the connection", fun() ->
+                query_on_starts_forgets_the_end(Pool)
+            end}
+        end,
+        fun(Pool) ->
+            {"query_on/4: a transaction after an end it noted runs", fun() ->
+                query_on_end_then_transaction_runs(Pool)
+            end}
+        end,
+        fun(Pool) ->
+            {"query_on/4: without the option a COMMIT runs as before", fun() ->
+                query_on_without_option_commits(Pool)
+            end}
         end
     ].
 
@@ -332,6 +382,123 @@ failed_rollback_to_abandons_the_transaction({Pool, _}) ->
         end)
     ),
     ?assertEqual([], ids(Pool)).
+
+-define(ENDED, {kura_driver_sqlite, transaction_ended_by_statement}).
+
+statement_after_caught_end_raises_ended({Pool, _}) ->
+    ?assertError(
+        ?ENDED,
+        transaction(Pool, fun() ->
+            ok = insert(Pool, 1),
+            ?assertError(?ENDED, sql(Pool, ~"COMMIT")),
+            insert(Pool, 2)
+        end)
+    ),
+    ?assertEqual([1], ids(Pool)).
+
+nested_after_caught_end_raises_ended({Pool, _}) ->
+    ?assertError(
+        ?ENDED,
+        transaction(Pool, fun() ->
+            ?assertError(?ENDED, sql(Pool, ~"COMMIT")),
+            transaction(Pool, fun() -> insert(Pool, 2) end)
+        end)
+    ),
+    ?assertEqual([], ids(Pool)).
+
+commit_after_caught_end_raises_ended({Pool, _}) ->
+    ?assertError(
+        ?ENDED,
+        transaction(Pool, fun() ->
+            ok = insert(Pool, 1),
+            ?assertError(?ENDED, sql(Pool, ~"COMMIT")),
+            done
+        end)
+    ),
+    ?assertEqual([1], ids(Pool)).
+
+%% Every transaction lands on one connection when the pool has one.
+transaction_after_caught_end_runs({Pool, _}) ->
+    ?assertError(
+        ?ENDED,
+        transaction(Pool, fun() ->
+            ?assertError(?ENDED, sql(Pool, ~"COMMIT")),
+            done
+        end)
+    ),
+    ?assertEqual(ok, transaction(Pool, fun() -> insert(Pool, 1) end)),
+    ?assertEqual([1], ids(Pool)).
+
+%% The note would keep the connection's handle alive in this process.
+transaction_leaves_no_note({Pool, _}) ->
+    ?assertError(
+        ?ENDED,
+        transaction(Pool, fun() ->
+            ?assertError(?ENDED, sql(Pool, ~"COMMIT")),
+            done
+        end)
+    ),
+    ?assertEqual([], [Key || {{kura_driver_sqlite, ended, _} = Key, _} <- get()]).
+
+query_on_commit_inside_raises({Pool, _}) ->
+    on_checked_out(Pool, fun(Conn) ->
+        #{} = on(Conn, ~"BEGIN", [], starts),
+        #{command := insert} = on(Conn, ~"INSERT INTO nested VALUES (?1)", [1], inside),
+        ?assertError(?ENDED, on(Conn, ~"COMMIT", [], inside)),
+        ?assertError(?ENDED, on(Conn, ~"INSERT INTO nested VALUES (?1)", [2], inside))
+    end),
+    ?assertEqual([1], ids(Pool)).
+
+query_on_after_sqlite_rollback_raises({Pool, _}) ->
+    ok = rollback_on_conflict_table(Pool),
+    on_checked_out(Pool, fun(Conn) ->
+        #{} = on(Conn, ~"BEGIN", [], starts),
+        #{} = on(Conn, ~"INSERT INTO rollback_on_conflict VALUES (1)", [], inside),
+        {error, _} = on(Conn, ~"INSERT INTO rollback_on_conflict VALUES (1)", [], inside),
+        ?assertError(
+            transaction_rolled_back, on(Conn, ~"INSERT INTO nested VALUES (?1)", [1], inside)
+        )
+    end),
+    ?assertEqual([], ids(Pool)).
+
+query_on_starts_forgets_the_end({Pool, _}) ->
+    on_checked_out(Pool, fun(Conn) ->
+        #{} = on(Conn, ~"BEGIN", [], starts),
+        ?assertError(?ENDED, on(Conn, ~"COMMIT", [], inside)),
+        #{} = on(Conn, ~"BEGIN", [], starts),
+        #{command := insert} = on(Conn, ~"INSERT INTO nested VALUES (?1)", [1], inside),
+        #{} = on(Conn, ~"ROLLBACK", [], none)
+    end),
+    ?assertEqual([], ids(Pool)).
+
+%% Every checkout lands on one connection when the pool has one.
+query_on_end_then_transaction_runs({Pool, _}) ->
+    on_checked_out(Pool, fun(Conn) ->
+        #{} = on(Conn, ~"BEGIN", [], starts),
+        ?assertError(?ENDED, on(Conn, ~"COMMIT", [], inside))
+    end),
+    ?assertEqual(ok, transaction(Pool, fun() -> insert(Pool, 1) end)),
+    ?assertEqual([1], ids(Pool)).
+
+query_on_without_option_commits({Pool, _}) ->
+    on_checked_out(Pool, fun(Conn) ->
+        #{} = kura_driver_sqlite:query_on(Conn, ~"BEGIN", [], #{}),
+        #{} = kura_driver_sqlite:query_on(Conn, ~"INSERT INTO nested VALUES (1)", [], #{}),
+        #{} = kura_driver_sqlite:query_on(Conn, ~"COMMIT", [], #{}),
+        #{} = kura_driver_sqlite:query_on(Conn, ~"INSERT INTO nested VALUES (2)", [], #{})
+    end),
+    ?assertEqual([1, 2], ids(Pool)).
+
+on_checked_out(Pool, Fun) ->
+    {ok, Conn, Token} = kura_pool_sqlite:checkout(Pool, #{}),
+    try
+        Fun(Conn)
+    after
+        ok = kura_pool_sqlite:checkin(Pool, Token)
+    end.
+
+on(Conn, SQL, Params, Transaction) ->
+    kura_driver_sqlite:query_on(Conn, SQL, Params, #{transaction => Transaction}).
 
 %% The nested call's savepoint is named from the next monotonic integer.
 release_own_savepoint(_Pool, From, To) when From > To ->

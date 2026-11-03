@@ -112,7 +112,9 @@ fun's own result:
 - `{kura_driver_sqlite, transaction_ended_by_statement}` when a
   statement run inside the transaction, such as a raw `COMMIT`, `END`
   or `ROLLBACK`, ended it. Whatever that statement committed stays
-  committed; nothing after it runs.
+  committed; nothing after it runs. A function that catches it and
+  carries on gets the same error from its next statement, its nested
+  transactions and the commit.
 - `{kura_driver_sqlite, {no_connection, Reason}}` when no connection
   can be checked out.
 - `transaction_rolled_back` when SQLite has rolled the whole
@@ -192,10 +194,29 @@ query(PoolMod, Pool, SQL, Params, _Opts) ->
             ended(Conn, run(Conn, SQLBin, Words, Params))
     end.
 
+-doc """
+Run a statement on a connection the caller checked out.
+
+With `transaction => inside`, the connection is expected to be inside a
+transaction begun with `transaction => starts`: a statement that ends it
+raises `{kura_driver_sqlite, transaction_ended_by_statement}`, as does
+one run after that, and one run after SQLite rolled the transaction
+back itself raises `transaction_rolled_back`. Neither runs.
+""".
 -spec query_on(esqlite3:esqlite3(), iodata(), [term()], map()) -> dynamic().
-query_on(Conn, SQL, Params, _Opts) ->
+query_on(Conn, SQL, Params, Opts) ->
     SQLBin = iolist_to_binary(SQL),
-    run(Conn, SQLBin, leading_words(SQLBin), Params).
+    Words = leading_words(SQLBin),
+    case maps:get(transaction, Opts, none) of
+        starts ->
+            _ = erlang:erase({?MODULE, ended, Conn}),
+            run(Conn, SQLBin, Words, Params);
+        inside ->
+            ok = still_open(Conn),
+            ended(Conn, run(Conn, SQLBin, Words, Params));
+        _None ->
+            run(Conn, SQLBin, Words, Params)
+    end.
 
 -spec transaction(module(), atom(), fun(() -> term()), map()) -> term().
 transaction(PoolMod, Pool, Fun, _Opts) ->
@@ -223,6 +244,8 @@ transaction(PoolMod, Pool, Fun, _Opts) ->
 outermost(Pool, Conn, Fun) ->
     case esqlite3:exec(Conn, ~"BEGIN") of
         ok ->
+            %% A sandboxed statement in this process may have noted an end.
+            _ = erlang:erase({?MODULE, ended, Conn}),
             _ = erlang:put({kura_sqlite_tx_conn, Pool}, Conn),
             try Fun() of
                 Result -> committed(Conn, Result)
@@ -231,6 +254,7 @@ outermost(Pool, Conn, Fun) ->
                     _ = esqlite3:exec(Conn, ~"ROLLBACK"),
                     erlang:raise(Class, Reason, Stack)
             after
+                _ = erlang:erase({?MODULE, ended, Conn}),
                 erlang:erase({kura_sqlite_tx_conn, Pool})
             end;
         {error, Reason} ->
@@ -306,17 +330,22 @@ ended(_Conn, {error, _} = Error) ->
     Error;
 ended(Conn, Result) ->
     case esqlite3:get_autocommit(Conn) of
-        false -> Result;
-        true -> error({kura_driver_sqlite, transaction_ended_by_statement})
+        false ->
+            Result;
+        true ->
+            _ = erlang:put({?MODULE, ended, Conn}, true),
+            error({kura_driver_sqlite, transaction_ended_by_statement})
     end.
 
-%% A connection back in autocommit inside a transaction means SQLite rolled
-%% the transaction back itself, and anything run now would commit on its own.
+%% A connection back in autocommit inside a transaction was ended by a
+%% statement, which `ended/2` noted, or rolled back by SQLite itself. Anything
+%% run now would commit on its own.
 -spec still_open(esqlite3:esqlite3()) -> ok.
 still_open(Conn) ->
-    case esqlite3:get_autocommit(Conn) of
-        false -> ok;
-        true -> error(transaction_rolled_back)
+    case {erlang:get({?MODULE, ended, Conn}), esqlite3:get_autocommit(Conn)} of
+        {true, _} -> error({kura_driver_sqlite, transaction_ended_by_statement});
+        {_, false} -> ok;
+        {_, true} -> error(transaction_rolled_back)
     end.
 
 %% A statement other than DML can leave state on the connection that the
