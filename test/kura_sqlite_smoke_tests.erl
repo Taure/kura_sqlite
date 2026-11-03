@@ -17,7 +17,9 @@ smoke_test_() ->
             {"boolean and date values are stored as SQLite stores them",
                 fun boolean_and_date_storage/0},
             {"a boolean filter matches by 1/0 or true/false", fun boolean_filters/0},
-            {"a date or datetime filter matches the stored text", fun date_filters/0}
+            {"a date or datetime filter matches the stored text", fun date_filters/0},
+            {"the 1.1 boolean repair turns stored 'true'/'false' into 1/0",
+                fun boolean_text_repair/0}
         ]
     end}.
 
@@ -271,3 +273,30 @@ date_filters() ->
         {{at, '>=', {{2024, 1, 2}, {1, 0, 1}}}, [2]}
     ],
     [?assertEqual({C, Ids}, {C, flag_ids(C)}) || {C, Ids} <- Cases].
+
+%% kura_sqlite 1.1 bound true and false as the text 'true' and 'false', which
+%% an INTEGER column keeps as TEXT. The README's upgrade note gives this repair.
+boolean_text_repair() ->
+    ok = flag_table(),
+    {ok, _} = kura_repo_worker:query(
+        ?REPO, ~"INSERT INTO flags (id, active) VALUES (3, 'true'), (4, 'false')", []
+    ),
+    ?assertEqual([1], flag_ids({active, true})),
+    {ok, _} = kura_repo_worker:query(
+        ?REPO,
+        ~"UPDATE \"flags\" SET \"active\" = (\"active\" = 'true') WHERE typeof(\"active\") = 'text'",
+        []
+    ),
+    ?assertMatch(
+        {ok, [
+            #{id := 1, active := 1, t := ~"integer"},
+            #{id := 2, active := 0, t := ~"integer"},
+            #{id := 3, active := 1, t := ~"integer"},
+            #{id := 4, active := 0, t := ~"integer"}
+        ]},
+        kura_repo_worker:query(
+            ?REPO, ~"SELECT id, active, typeof(active) AS t FROM flags ORDER BY id", []
+        )
+    ),
+    ?assertEqual([1, 3], flag_ids({active, true})),
+    ?assertEqual([2, 4], flag_ids({active, false})).
