@@ -158,6 +158,11 @@ reach SQLite.
 -type schema_fields() :: {
     Types :: #{atom() => kura_types:kura_type()}, Blobs :: #{atom() => kura_types:kura_type()}
 }.
+-type where_fields() :: {
+    Types :: #{atom() => kura_types:kura_type()},
+    Blobs :: #{atom() => kura_types:kura_type()},
+    FromTypes :: #{atom() => kura_types:kura_type()}
+}.
 
 %%----------------------------------------------------------------------
 %% kura_dialect callbacks
@@ -663,19 +668,21 @@ blob_query(#kura_query{wheres = Wheres, havings = Havings} = Query) ->
 %% the byte fields of every joined schema are rewritten too. The types
 %% checked for encryption are merged over every table, keeping the most
 %% restrictive, so a plain or deterministic field never hides a randomized
-%% one.
--spec query_blob_fields(#kura_query{}) -> {schema_fields(), #{atom() => binary()}}.
+%% one. A lookup on a qualified field must also be deterministic in the
+%% `from` schema itself, since that is the column it is compared with.
+-spec query_blob_fields(#kura_query{}) -> {where_fields(), #{atom() => binary()}}.
 query_blob_fields(#kura_query{from = From, joins = Joins} = Query) ->
     {Types, AllBlobs} = joined_fields([From | [Table || {_Type, Table, _On, _As} <- Joins]]),
     case kura_dialect:qualified_columns(Query) of
         undefined ->
-            {{Types, AllBlobs}, #{}};
+            {{Types, AllBlobs, Types}, #{}};
         {Table, FromFields} ->
             Qualified = maps:keys(FromFields),
             Blobs = maps:merge(
                 maps:without(Qualified, AllBlobs), maps:with(Qualified, blob_fields(From))
             ),
-            {{Types, Blobs}, maps:from_keys(Qualified, quote(Table))}
+            FromTypes = maps:merge(Types, FromFields),
+            {{Types, Blobs, FromTypes}, maps:from_keys(Qualified, quote(Table))}
     end.
 
 -spec joined_fields([term()]) -> schema_fields().
@@ -713,11 +720,11 @@ blob_named(Queries) ->
 blob_subquery(#kura_query{} = Query) -> blob_query(Query);
 blob_subquery(Other) -> Other.
 
--spec blob_conditions([term()], schema_fields(), #{atom() => binary()}) -> [term()].
+-spec blob_conditions([term()], where_fields(), #{atom() => binary()}) -> [term()].
 blob_conditions(Conditions, Fields, Quals) ->
     [blob_condition(Condition, Fields, Quals) || Condition <- Conditions].
 
--spec blob_condition(term(), schema_fields(), #{atom() => binary()}) -> term().
+-spec blob_condition(term(), where_fields(), #{atom() => binary()}) -> term().
 blob_condition({Op, Conditions}, Fields, Quals) when
     (Op =:= 'and' orelse Op =:= 'or'), is_list(Conditions)
 ->
@@ -730,14 +737,17 @@ blob_condition({Exists, {subquery, Sub}}, _Fields, _Quals) when
     Exists =:= exists; Exists =:= not_exists
 ->
     {Exists, {subquery, blob_subquery(Sub)}};
-blob_condition({Field, Op, Frames}, {Types, Blobs}, Quals) when
+blob_condition({Field, Op, Frames}, {Types, Blobs, FromTypes}, Quals) when
     is_atom(Field), ?IS_LOOKUP_OP(Op), is_list(Frames)
 ->
-    case deterministic_field(Field, Types) andalso is_map_key(Field, Blobs) of
+    case
+        deterministic_field(Field, Types) andalso deterministic_field(Field, FromTypes) andalso
+            is_map_key(Field, Blobs)
+    of
         true -> cast_condition({Field, lookup_in(Op), Frames}, Blobs, Quals);
         false -> error({kura_sqlite, {unsupported_blob_condition, Field, Op}})
     end;
-blob_condition(Condition, {Types, Blobs}, Quals) ->
+blob_condition(Condition, {Types, Blobs, _FromTypes}, Quals) ->
     case [Field || Field <- compared_fields(Condition), is_encrypted(Field, Types)] of
         [Field | _] -> error({kura_sqlite, {encrypted_field_in_where, Field}});
         [] -> cast_condition(Condition, Blobs, Quals)

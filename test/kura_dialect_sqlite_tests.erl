@@ -989,7 +989,29 @@ lookup_tests() ->
             ]
          || PlainJoin <- plain_secret_joins()
         ]) ++
+        [
+            ?_assertError(
+                {kura_sqlite, {unsupported_blob_condition, token, Op}},
+                unchecked_where(plain_bytes_join(), {token, Op, [~"f1"]})
+            )
+         || Op <- [encrypted_in, encrypted_not_in]
+        ] ++
+        [
+            ?_assertError(
+                {kura, {encrypted_field_in_where, token}}, where_sql(plain_bytes_join(), Cond)
+            )
+         || Cond <- [{token, ~"t"}, {token, '!=', ~"t"}]
+        ] ++
         [?_test(lookup_matches_stored_frames())].
+
+%% `token` is a plain byte column of the from schema and a deterministic
+%% field of the joined lookup schema. Under the join it names the from
+%% table's column, so a lookup's frames must not be compared with it: `=`
+%% would match nothing and `!=` every row.
+plain_bytes_join() ->
+    kura_query:join(
+        kura_query:from(kura_sqlite_plain_bytes_schema), inner, ?LOOKUP_SCHEMA, {owner_id, id}
+    ).
 
 %% kura_sqlite_plain_secret_schema has a plain `secret` and a randomized
 %% `token`, the lookup schema a deterministic `secret` and `token`. Under a
