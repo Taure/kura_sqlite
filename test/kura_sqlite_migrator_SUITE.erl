@@ -12,6 +12,7 @@ that asobi-CT covers for Postgres but no app exercises for SQLite.
 -export([
     migrate_creates_table/1,
     migrate_records_version_in_schema_migrations/1,
+    rollback_of_a_referenced_table_is_refused/1,
     rollback_drops_table/1
 ]).
 
@@ -23,6 +24,7 @@ all() ->
     [
         migrate_creates_table,
         migrate_records_version_in_schema_migrations,
+        rollback_of_a_referenced_table_is_refused,
         rollback_drops_table
     ].
 
@@ -73,6 +75,29 @@ migrate_records_version_in_schema_migrations(_Config) ->
         ?REPO, ~"SELECT version FROM schema_migrations ORDER BY version", []
     ),
     ?assertMatch(#{rows := [#{version := ?VERSION}]}, Result).
+
+rollback_of_a_referenced_table_is_refused(_Config) ->
+    #{} = kura_db:query(
+        ?REPO,
+        ~"CREATE TABLE gadgets (widget_id INTEGER REFERENCES widgets (id) ON DELETE CASCADE)",
+        []
+    ),
+    #{} = kura_db:query(?REPO, ~"INSERT INTO widgets (id, name) VALUES (1, 'w')", []),
+    #{} = kura_db:query(?REPO, ~"INSERT INTO gadgets VALUES (1)", []),
+    ?assertEqual(
+        {error, {migration_failed, ?VERSION, {referenced_by, ~"widgets", [~"gadgets"]}}},
+        kura_migrator:rollback(?REPO)
+    ),
+    ?assertMatch(
+        #{rows := [#{widget_id := 1}]}, kura_db:query(?REPO, ~"SELECT widget_id FROM gadgets", [])
+    ),
+    ?assertMatch(
+        #{rows := [#{version := ?VERSION}]},
+        kura_db:query(?REPO, ~"SELECT version FROM schema_migrations", [])
+    ),
+    #{} = kura_db:query(?REPO, ~"DROP TABLE gadgets", []),
+    #{} = kura_db:query(?REPO, ~"DELETE FROM widgets", []),
+    ok.
 
 rollback_drops_table(_Config) ->
     {ok, [?VERSION]} = kura_migrator:rollback(?REPO),

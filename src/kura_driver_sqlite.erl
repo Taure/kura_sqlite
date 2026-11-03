@@ -9,10 +9,73 @@ in use.
 ## Result shape
 
 Returns `#{rows := Rows, num_rows := N, command := C}`, the shape the
-other kura drivers return. `Rows` are maps keyed by atom column names.
-`command` is one of
-`select | insert | update | delete | other` derived from the SQL
-prefix.
+other kura drivers return. `Rows` are maps keyed by atom column names,
+and a NULL column value is `null`, as kura expects of every driver.
+`command` is one of `select | insert | update | delete | other`, read
+from the statement's leading keyword, `REPLACE` counting as `insert`.
+After a leading `WITH` it is read from the keyword that follows the
+common table expressions. `num_rows` is the number of rows returned,
+except for an `INSERT`, `UPDATE` or `DELETE` without `RETURNING`, where
+it is the number of rows the statement changed, as Postgres reports it.
+
+## Parameters
+
+Parameters bind by position: `undefined` or `null` as NULL, a 64-bit
+integer as INTEGER, a float as REAL, a binary or iodata list as TEXT, any
+other atom as the TEXT of its name, and `{blob, Bin}` as a BLOB.
+`{text, T}`, `{int, I}` (32-bit), `{int64, I}` and `{float, F}` bind as
+esqlite binds them. `kura_dialect_sqlite` passes the values of byte-typed
+schema fields as `{blob, Bin}`; raw SQL can do the same. Any other
+parameter, including an integer out of range or a list that is not
+iodata, returns `{error, {unsupported_param, Index}}`, `Index` counting
+from 1.
+esqlite's named binding is not used, so no parameter can choose the
+placeholder it binds to.
+
+## Byte columns
+
+A byte column that `kura_migrator` creates, in `CREATE TABLE` or
+`ALTER TABLE ... ADD COLUMN`, gets `CHECK (typeof(col) IN ('blob',
+'null'))`; see `kura_dialect_sqlite:blob_checks/1`. A statement holding a
+byte column whose name cannot be read returns
+`{error, unrecognised_blob_column}`.
+
+## Errors
+
+A statement that fails returns `{error, Reason}`, `Reason` being the
+SQLite result code for most failures. A statement that waits out the
+connection's busy timeout returns `{error, busy}`.
+
+## Dropping a referenced table
+
+With foreign keys on, SQLite empties a table before it drops it, and that
+runs the `ON DELETE` rules of the tables that reference it: `CASCADE`
+deletes their rows and `SET NULL` clears their references. Postgres
+refuses such a drop. So does this driver: a `DROP TABLE` on a table that
+another table references returns
+`{error, {referenced_by, Table, Referencing}}`, `Referencing` listing the
+tables in that schema that reference it, and drops nothing. A table that
+references only itself can be dropped. A `DROP TABLE` the driver cannot
+check, because SQLite compiled it to a program it does not recognise,
+returns `{error, unrecognised_drop_table}`. A statement whose leading
+keyword the driver cannot read is checked as a `DROP TABLE`.
+
+With foreign keys off on the connection the drop deletes no rows and is
+not checked, which is what SQLite's table-rebuild procedure for schema
+changes relies on. `PRAGMA foreign_keys` has no effect inside a
+transaction, though, and `kura_migrator` runs every migration in one, so
+a migration cannot turn foreign keys off and a rebuild of a referenced
+table inside a migration is refused. Run such a rebuild outside a
+transaction: lease a connection with `kura_pool:with_conn/3`, run
+`PRAGMA foreign_keys = OFF` on it through `query_on/4` before `BEGIN`,
+do the rebuild, check `PRAGMA foreign_key_check`, commit, and turn foreign
+keys back on. kura has no way yet to mark a migration as not
+transactional.
+
+Outside a transaction the check and the drop run in one
+`BEGIN IMMEDIATE` transaction, so no other connection can add a
+reference between them. A `DROP TABLE` that waits out the busy timeout
+for that transaction returns `{error, busy}`.
 
 ## Transactions
 
@@ -80,15 +143,34 @@ the workload. esqlite sets 2 seconds by default.
 
 -behaviour(kura_driver).
 
--eqwalizer({nowarn_function, query/5}).
--eqwalizer({nowarn_function, transaction/4}).
--eqwalizer({nowarn_function, collect_rows/3}).
-
 -export([
     query/5,
     query_on/4,
     transaction/4
 ]).
+
+-type words() :: {binary(), binary()}.
+-type command() :: select | insert | update | delete | other.
+-type result() :: #{rows := [#{atom() => term()}], _ => _} | {error, term()}.
+
+-define(IS_INT64(Int), (is_integer(Int) andalso Int >= -(1 bsl 63) andalso Int < 1 bsl 63)).
+-define(IS_INT32(Int), (is_integer(Int) andalso Int >= -(1 bsl 31) andalso Int < 1 bsl 31)).
+
+-define(NOTHING_DROPPED, [~"Init", ~"Transaction", ~"JournalMode", ~"Goto", ~"Halt"]).
+
+-define(REFERENCING,
+    ~"""
+    SELECT DISTINCT t.name
+    FROM pragma_database_list AS d
+    JOIN pragma_table_list AS t ON t.schema = d.name,
+        pragma_foreign_key_list(t.name, t.schema) AS f
+    WHERE d.seq = ?2
+        AND t.type = 'table'
+        AND f."table" = ?1 COLLATE NOCASE
+        AND t.name <> ?1 COLLATE NOCASE
+    ORDER BY t.name
+    """
+).
 
 %%----------------------------------------------------------------------
 %% kura_driver callbacks
@@ -97,25 +179,27 @@ the workload. esqlite sets 2 seconds by default.
 -spec query(module(), atom(), iodata(), [term()], map()) -> dynamic().
 query(PoolMod, Pool, SQL, Params, _Opts) ->
     SQLBin = iolist_to_binary(SQL),
-    case erlang:get({kura_sqlite_tx_conn, Pool}) of
+    Words = leading_words(SQLBin),
+    case tx_conn(Pool) of
         undefined ->
             kura_pool:with_conn(PoolMod, Pool, fun(Conn) ->
-                ok = touched(PoolMod, Pool, Conn, SQLBin),
-                run(Conn, SQLBin, Params)
+                ok = touched(PoolMod, Pool, Conn, Words),
+                run(Conn, SQLBin, Words, Params)
             end);
         Conn ->
             ok = still_open(Conn),
-            ok = touched(PoolMod, Pool, Conn, SQLBin),
-            ended(Conn, run(Conn, SQLBin, Params))
+            ok = touched(PoolMod, Pool, Conn, Words),
+            ended(Conn, run(Conn, SQLBin, Words, Params))
     end.
 
 -spec query_on(esqlite3:esqlite3(), iodata(), [term()], map()) -> dynamic().
 query_on(Conn, SQL, Params, _Opts) ->
-    run(Conn, SQL, Params).
+    SQLBin = iolist_to_binary(SQL),
+    run(Conn, SQLBin, leading_words(SQLBin), Params).
 
 -spec transaction(module(), atom(), fun(() -> term()), map()) -> term().
 transaction(PoolMod, Pool, Fun, _Opts) ->
-    case erlang:get({kura_sqlite_tx_conn, Pool}) of
+    case tx_conn(Pool) of
         undefined ->
             case PoolMod:checkout(Pool, #{}) of
                 {ok, Conn, Token} ->
@@ -237,38 +321,142 @@ still_open(Conn) ->
 
 %% A statement other than DML can leave state on the connection that the
 %% next borrower would inherit, so the pool checks it on return.
--spec touched(module(), atom(), esqlite3:esqlite3(), binary()) -> ok.
-touched(kura_pool_sqlite, Pool, Conn, SQL) ->
-    case command_of(SQL) =/= other orelse keyword(SQL) =:= ~"WITH" of
+-spec touched(module(), atom(), esqlite3:esqlite3(), words()) -> ok.
+touched(kura_pool_sqlite, Pool, Conn, {First, _}) ->
+    case command_of(First) =/= other orelse First =:= ~"WITH" of
         true -> ok;
         false -> kura_pool_sqlite:dirty(Pool, Conn)
     end;
-touched(_PoolMod, _Pool, _Conn, _SQL) ->
+touched(_PoolMod, _Pool, _Conn, _Words) ->
     ok.
 
--spec run(esqlite3:esqlite3(), iodata(), [term()]) -> dynamic().
-run(Conn, SQL, Params) ->
-    SQLBin = iolist_to_binary(SQL),
-    case esqlite3:prepare(Conn, SQLBin) of
+%% A statement whose leading keywords cannot be read could be a DROP TABLE
+%% the reader does not recognise, so it is checked as one.
+-spec run(esqlite3:esqlite3(), binary(), words(), [term()]) -> dynamic().
+run(Conn, SQL, {First, Second}, Params) when
+    {First, Second} =:= {~"DROP", ~"TABLE"};
+    {First, Second} =:= {~"DROP", ~""};
+    First =:= ~""
+->
+    case {skipped(SQL), esqlite3:get_autocommit(Conn)} of
+        {~"", _} -> prepared(Conn, SQL, Params, other);
+        {_, true} -> dropped_alone(Conn, SQL, Params);
+        {_, false} -> dropped(Conn, SQL, Params)
+    end;
+run(Conn, SQL, {First, _}, Params) when First =:= ~"CREATE"; First =:= ~"ALTER" ->
+    case kura_dialect_sqlite:blob_checks(SQL) of
+        {ok, Checked} -> prepared(Conn, Checked, Params, other);
+        {error, _} = Error -> Error
+    end;
+run(Conn, SQL, {~"WITH", _}, Params) ->
+    prepared(Conn, SQL, Params, command_of(after_ctes(SQL)));
+run(Conn, SQL, {First, _}, Params) ->
+    prepared(Conn, SQL, Params, command_of(First)).
+
+%% Outside a transaction the check and the drop share one, so no other
+%% connection can add a reference between them.
+-spec dropped_alone(esqlite3:esqlite3(), binary(), [term()]) -> dynamic().
+dropped_alone(Conn, SQL, Params) ->
+    case prepared(Conn, ~"BEGIN IMMEDIATE", [], other) of
+        #{} -> committed_drop(Conn, dropped(Conn, SQL, Params));
+        {error, _} = Error -> Error
+    end.
+
+-spec committed_drop(esqlite3:esqlite3(), dynamic()) -> dynamic().
+committed_drop(Conn, {error, _} = Error) ->
+    _ = esqlite3:exec(Conn, ~"ROLLBACK"),
+    Error;
+committed_drop(Conn, Dropped) ->
+    case prepared(Conn, ~"COMMIT", [], other) of
+        #{} ->
+            Dropped;
+        {error, _} = Error ->
+            _ = esqlite3:exec(Conn, ~"ROLLBACK"),
+            Error
+    end.
+
+-spec dropped(esqlite3:esqlite3(), binary(), [term()]) -> dynamic().
+dropped(Conn, SQL, Params) ->
+    case dependents(Conn, SQL) of
+        ok -> prepared(Conn, SQL, Params, other);
+        {error, _} = Refused -> Refused
+    end.
+
+-spec prepared(esqlite3:esqlite3(), binary(), [term()], command()) -> dynamic().
+prepared(Conn, SQL, Params, Command) ->
+    case esqlite3:prepare(Conn, SQL) of
         {ok, Stmt} ->
-            run_prepared(Stmt, Params, command_of(SQLBin));
+            run_prepared(Conn, Stmt, Params, Command);
         {error, _} = Err ->
             Err
     end.
 
+%% With foreign keys on, SQLite empties a table before it drops it, and that
+%% runs the ON DELETE rules of every table referencing it. SQLite's own
+%% parser names the table: `EXPLAIN` compiles the statement without running
+%% it, and its DropTable instruction carries the schema and table.
+%% EXPLAIN output is not a stable interface, so a program in any other shape
+%% is refused rather than let through unchecked. With foreign keys off the
+%% drop deletes no rows and nothing is checked.
+-spec dependents(esqlite3:esqlite3(), binary()) -> ok | {error, term()}.
+dependents(Conn, SQL) ->
+    case prepared(Conn, ~"PRAGMA foreign_keys", [], other) of
+        #{rows := [#{foreign_keys := 0}]} ->
+            ok;
+        #{rows := [#{foreign_keys := 1}]} ->
+            dropping(
+                Conn, prepared(Conn, iolist_to_binary([~"EXPLAIN ", skipped(SQL)]), [], other)
+            );
+        {error, _} = Error ->
+            Error;
+        #{} ->
+            {error, unrecognised_drop_table}
+    end.
+
+-spec dropping(esqlite3:esqlite3(), result()) -> ok | {error, term()}.
+dropping(Conn, #{rows := Program}) ->
+    case [{Schema, Table} || #{opcode := ~"DropTable", p1 := Schema, p4 := Table} <- Program] of
+        [{Schema, Table}] when is_integer(Schema), is_binary(Table) ->
+            referenced(Table, prepared(Conn, ?REFERENCING, [Table, Schema], select));
+        [] ->
+            nothing_dropped([maps:get(opcode, Row, undefined) || Row <- Program]);
+        _ ->
+            {error, unrecognised_drop_table}
+    end;
+dropping(_Conn, {error, _} = Error) ->
+    Error.
+
+%% `DROP TABLE IF EXISTS` on a missing table compiles to a program that
+%% only opens and ends a transaction.
+-spec nothing_dropped([term()]) -> ok | {error, unrecognised_drop_table}.
+nothing_dropped(Ops) ->
+    case [Op || Op <- Ops, not lists:member(Op, ?NOTHING_DROPPED)] of
+        [] -> ok;
+        _ -> {error, unrecognised_drop_table}
+    end.
+
+-spec referenced(binary(), result()) -> ok | {error, term()}.
+referenced(_Table, #{rows := []}) ->
+    ok;
+referenced(Table, #{rows := Rows}) ->
+    {error, {referenced_by, Table, [Name || #{name := Name} <- Rows, is_binary(Name)]}};
+referenced(_Table, {error, _} = Error) ->
+    Error.
+
 %% A statement that stops short of `'$done'`, on an error or `'$busy'`,
 %% holds its connection's implicit transaction open until it is reset, and
 %% anything the next borrower writes in autocommit would stay uncommitted.
--spec run_prepared(esqlite3:esqlite3_stmt(), [term()], atom()) -> dynamic().
-run_prepared(Stmt, Params, Cmd) ->
+-spec run_prepared(esqlite3:esqlite3(), esqlite3:esqlite3_stmt(), [term()], command()) ->
+    dynamic().
+run_prepared(Conn, Stmt, Params, Cmd) ->
     case bind_params(Stmt, Params) of
         ok ->
             ColNames = esqlite3:column_names(Stmt),
-            try collect_rows(Stmt, ColNames, []) of
+            try collect_rows(Stmt, ColNames) of
                 {error, _} = Err ->
                     Err;
                 Rows when is_list(Rows) ->
-                    #{rows => Rows, num_rows => length(Rows), command => Cmd}
+                    #{rows => Rows, num_rows => num_rows(Conn, Cmd, ColNames, Rows), command => Cmd}
             after
                 _ = esqlite3:reset(Stmt)
             end;
@@ -276,67 +464,206 @@ run_prepared(Stmt, Params, Cmd) ->
             Err
     end.
 
--spec bind_params(esqlite3:esqlite3_stmt(), [term()]) -> ok | {error, term()}.
-bind_params(Stmt, []) ->
-    case esqlite3:bind(Stmt, []) of
-        ok -> ok;
-        {error, _} = E -> E
-    end;
+%% Without RETURNING a write returns no rows, so its count is the rows it
+%% changed, as Postgres reports it.
+-spec num_rows(esqlite3:esqlite3(), command(), [binary()], list()) -> non_neg_integer().
+num_rows(Conn, Cmd, [], []) when Cmd =:= insert; Cmd =:= update; Cmd =:= delete ->
+    esqlite3:changes(Conn);
+num_rows(_Conn, _Cmd, _ColNames, Rows) ->
+    length(Rows).
+
+%% Bound by position here rather than with esqlite3:bind/2, which binds by
+%% name when the first parameter is a 3-tuple or a {Name, Value} pair.
+%% Parameters are the caller's values, untyped; a list goes to esqlite to be
+%% read as iodata, as esqlite3:bind/2 passed it.
+-spec bind_params(esqlite3:esqlite3_stmt(), [dynamic()]) -> ok | {error, term()}.
 bind_params(Stmt, Params) ->
-    case esqlite3:bind(Stmt, Params) of
-        ok -> ok;
-        {error, _} = E -> E
+    bind_params(Stmt, 1, Params).
+
+-spec bind_params(esqlite3:esqlite3_stmt(), pos_integer(), [dynamic()]) -> ok | {error, term()}.
+bind_params(_Stmt, _Index, []) ->
+    ok;
+bind_params(Stmt, Index, [Param | Rest]) ->
+    case bind_param(Stmt, Index, Param) of
+        ok -> bind_params(Stmt, Index + 1, Rest);
+        {error, _} = Error -> Error
     end.
 
--spec collect_rows(esqlite3:esqlite3_stmt(), [binary()], [map()]) -> [map()] | {error, term()}.
-collect_rows(Stmt, ColNames, Acc) ->
+%% esqlite raises badarg for a value its bind cannot take, such as a list
+%% that is not iodata.
+-spec bind_param(esqlite3:esqlite3_stmt(), pos_integer(), dynamic()) -> ok | {error, term()}.
+bind_param(Stmt, Index, Param) ->
+    try
+        bound(Stmt, Index, Param)
+    catch
+        error:badarg -> {error, {unsupported_param, Index}}
+    end.
+
+-spec bound(esqlite3:esqlite3_stmt(), pos_integer(), dynamic()) -> ok | {error, term()}.
+bound(Stmt, Index, Null) when Null =:= null; Null =:= undefined ->
+    esqlite3:bind_null(Stmt, Index);
+bound(Stmt, Index, Int) when ?IS_INT64(Int) ->
+    esqlite3:bind_int64(Stmt, Index, Int);
+bound(Stmt, Index, Float) when is_float(Float) ->
+    esqlite3:bind_double(Stmt, Index, Float);
+bound(Stmt, Index, Text) when is_binary(Text); is_list(Text) ->
+    esqlite3:bind_text(Stmt, Index, Text);
+bound(Stmt, Index, Atom) when is_atom(Atom) ->
+    esqlite3:bind_text(Stmt, Index, atom_to_binary(Atom, utf8));
+bound(Stmt, Index, {blob, Bytes}) when is_binary(Bytes); is_list(Bytes) ->
+    esqlite3:bind_blob(Stmt, Index, Bytes);
+bound(Stmt, Index, {text, Text}) when is_binary(Text); is_list(Text) ->
+    esqlite3:bind_text(Stmt, Index, Text);
+bound(Stmt, Index, {int, Int}) when ?IS_INT32(Int) ->
+    esqlite3:bind_int(Stmt, Index, Int);
+bound(Stmt, Index, {int64, Int}) when ?IS_INT64(Int) ->
+    esqlite3:bind_int64(Stmt, Index, Int);
+bound(Stmt, Index, {float, Float}) when is_float(Float) ->
+    esqlite3:bind_double(Stmt, Index, Float);
+bound(_Stmt, Index, _Param) ->
+    {error, {unsupported_param, Index}}.
+
+%% The process dictionary is untyped; what is stored is the connection put
+%% there by the outermost transaction.
+-spec tx_conn(atom()) -> dynamic().
+tx_conn(Pool) ->
+    erlang:get({kura_sqlite_tx_conn, Pool}).
+
+-spec collect_rows(esqlite3:esqlite3_stmt(), [binary()]) ->
+    [#{atom() => term()}] | {error, term()}.
+collect_rows(Stmt, ColNames) ->
     case esqlite3:step(Stmt) of
-        '$done' ->
-            lists:reverse(Acc);
+        %% A '$busy' clause would be unreachable to dialyzer: esqlite3_nif's
+        %% step/1 spec leaves it out.
+        Finished when is_atom(Finished) ->
+            maps:get(
+                Finished,
+                #{'$done' => [], '$busy' => {error, busy}},
+                {error, {unexpected_step, Finished}}
+            );
         {error, _} = Err ->
             Err;
         Row when is_list(Row) ->
-            Map = row_to_map(Row, ColNames),
-            collect_rows(Stmt, ColNames, [Map | Acc])
+            case collect_rows(Stmt, ColNames) of
+                {error, _} = Err -> Err;
+                Rows -> [row_to_map(Row, ColNames) | Rows]
+            end
     end.
 
--spec row_to_map([term()], [binary()]) -> map().
+-spec row_to_map([term()], [binary()]) -> #{atom() => term()}.
 row_to_map(Row, ColNames) ->
     row_to_map(Row, ColNames, #{}).
 
--spec row_to_map([term()], [binary()], map()) -> map().
+-spec row_to_map([term()], [binary()], #{atom() => term()}) -> #{atom() => term()}.
 row_to_map([], _ColNames, Acc) ->
     Acc;
 row_to_map(_Row, [], Acc) ->
     Acc;
 row_to_map([Cell | RestRow], [Name | RestNames], Acc) ->
-    row_to_map(RestRow, RestNames, Acc#{name_to_atom(Name) => Cell}).
+    row_to_map(RestRow, RestNames, Acc#{name_to_atom(Name) => cell(Cell)}).
+
+%% kura reads a NULL column as `null`, which esqlite returns as `undefined`.
+-spec cell(term()) -> term().
+cell(undefined) -> null;
+cell(Cell) -> Cell.
 
 -spec name_to_atom(binary()) -> atom().
 name_to_atom(N) -> binary_to_atom(N, utf8).
 
--spec command_of(binary()) -> select | insert | update | delete | other.
-command_of(SQL) ->
-    case keyword(SQL) of
-        ~"SELECT" -> select;
-        ~"INSERT" -> insert;
-        ~"UPDATE" -> update;
-        ~"DELETE" -> delete;
-        _ -> other
+-spec command_of(binary()) -> command().
+command_of(~"SELECT") -> select;
+command_of(~"INSERT") -> insert;
+command_of(~"REPLACE") -> insert;
+command_of(~"UPDATE") -> update;
+command_of(~"DELETE") -> delete;
+command_of(_Keyword) -> other.
+
+%% SQLite allows only a SELECT inside a common table expression, so the
+%% statement's own keyword is the first word after a top-level group not
+%% followed by `,` (another CTE) or `AS` (the group was a column list).
+-spec after_ctes(binary()) -> binary().
+after_ctes(SQL) ->
+    case skipped(SQL) of
+        <<$(, Rest/binary>> -> after_group(group(Rest, 1));
+        <<>> -> ~"";
+        Rest -> after_ctes(token(Rest))
     end.
 
--spec keyword(binary()) -> binary().
-keyword(<<First, Rest/binary>>) when
-    First =:= $\s; First =:= $\t; First =:= $\n; First =:= $\r
-->
-    keyword(Rest);
-keyword(SQL) ->
-    upper_word(SQL).
+-spec after_group(binary()) -> binary().
+after_group(SQL) ->
+    case skipped(SQL) of
+        <<$,, Rest/binary>> ->
+            after_ctes(Rest);
+        Rest ->
+            case word(Rest, ~"") of
+                {~"AS", After} -> after_ctes(After);
+                {Word, _} -> Word
+            end
+    end.
 
--spec upper_word(binary()) -> binary().
-upper_word(<<Letter, Rest/binary>>) when Letter >= $a, Letter =< $z ->
-    <<(Letter - $a + $A), (upper_word(Rest))/binary>>;
-upper_word(<<Letter, Rest/binary>>) when Letter >= $A, Letter =< $Z ->
-    <<Letter, (upper_word(Rest))/binary>>;
-upper_word(_) ->
-    ~"".
+-spec group(binary(), non_neg_integer()) -> binary().
+group(SQL, 0) ->
+    SQL;
+group(<<>>, _Depth) ->
+    ~"";
+group(<<$(, Rest/binary>>, Depth) ->
+    group(Rest, Depth + 1);
+group(<<$), Rest/binary>>, Depth) ->
+    group(Rest, Depth - 1);
+group(<<"--", Rest/binary>>, Depth) ->
+    group(past(Rest, ~"\n"), Depth);
+group(<<"/*", Rest/binary>>, Depth) ->
+    group(past(Rest, ~"*/"), Depth);
+group(<<Quote, _/binary>> = SQL, Depth) when
+    Quote =:= $'; Quote =:= $"; Quote =:= $`; Quote =:= $[
+->
+    group(token(SQL), Depth);
+group(<<_, Rest/binary>>, Depth) ->
+    group(Rest, Depth).
+
+%% A doubled quote inside a quoted token reads as two adjacent tokens,
+%% which skips the same bytes.
+-spec token(binary()) -> binary().
+token(<<Quote, Rest/binary>>) when Quote =:= $'; Quote =:= $"; Quote =:= $` ->
+    past(Rest, <<Quote>>);
+token(<<$[, Rest/binary>>) ->
+    past(Rest, ~"]");
+token(SQL) ->
+    case word(SQL, ~"") of
+        {~"", <<_, Rest/binary>>} -> Rest;
+        {_Word, Rest} -> Rest
+    end.
+
+-spec leading_words(binary()) -> words().
+leading_words(SQL) ->
+    {First, Rest} = word(skipped(SQL), ~""),
+    {Second, _} = word(skipped(Rest), ~""),
+    {First, Second}.
+
+%% SQLite's own whitespace: space and 0x09 to 0x0D.
+-spec skipped(binary()) -> binary().
+skipped(<<Space, Rest/binary>>) when Space =:= $\s; Space >= $\t, Space =< $\r ->
+    skipped(Rest);
+skipped(<<$;, Rest/binary>>) ->
+    skipped(Rest);
+skipped(<<"--", Rest/binary>>) ->
+    skipped(past(Rest, ~"\n"));
+skipped(<<"/*", Rest/binary>>) ->
+    skipped(past(Rest, ~"*/"));
+skipped(SQL) ->
+    SQL.
+
+-spec past(binary(), binary()) -> binary().
+past(SQL, End) ->
+    case binary:split(SQL, End) of
+        [_Comment, Rest] -> Rest;
+        [_Unterminated] -> ~""
+    end.
+
+-spec word(binary(), binary()) -> {binary(), binary()}.
+word(<<Letter, Rest/binary>>, Acc) when Letter >= $a, Letter =< $z ->
+    word(Rest, <<Acc/binary, (Letter - $a + $A)>>);
+word(<<Letter, Rest/binary>>, Acc) when Letter >= $A, Letter =< $Z ->
+    word(Rest, <<Acc/binary, Letter>>);
+word(Rest, Acc) ->
+    {Acc, Rest}.

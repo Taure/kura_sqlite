@@ -1,5 +1,6 @@
 -module(kura_pool_sqlite_tests).
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("kernel/include/file.hrl").
 
 -export([log/2]).
 
@@ -37,7 +38,9 @@ drains_pool_then_returns_no_conns_test() ->
     try
         {ok, _, _} = kura_pool_sqlite:checkout(Name, #{}),
         {ok, _, _} = kura_pool_sqlite:checkout(Name, #{}),
-        ?assertEqual({error, no_conns}, kura_pool_sqlite:checkout(Name, #{}))
+        {Elapsed, Result} = timer:tc(kura_pool_sqlite, checkout, [Name, #{timeout => 0}]),
+        ?assertEqual({error, no_conns}, Result),
+        ?assert(Elapsed < 400000)
     after
         kura_pool_sqlite:stop_pool(Name)
     end.
@@ -95,7 +98,7 @@ killed_borrower_releases_the_write_lock_test() ->
     try
         #{} = sql(Name, ~"CREATE TABLE t (id INTEGER)"),
         Borrower = hold_in_transaction(Name, ~"INSERT INTO t VALUES (1)"),
-        ?assertError({case_clause, '$busy'}, sql(Name, ~"INSERT INTO t VALUES (2)")),
+        ?assertEqual({error, busy}, sql(Name, ~"INSERT INTO t VALUES (2)")),
         ok = kill(Borrower),
         {_, First} = checkout_within(Name, 1000),
         {_, Second} = checkout_within(Name, 1000),
@@ -173,7 +176,7 @@ stale_token_does_not_free_another_lease_test() ->
         ok = kura_pool_sqlite:checkin(Name, Stale),
         {ok, Conn, Current} = kura_pool_sqlite:checkout(Name, #{}),
         ?assertEqual(ok, kura_pool_sqlite:checkin(Name, Stale)),
-        ?assertEqual({error, no_conns}, kura_pool_sqlite:checkout(Name, #{})),
+        ?assertEqual({error, no_conns}, kura_pool_sqlite:checkout(Name, #{timeout => 0})),
         ?assertEqual(
             {error, not_checked_out}, kura_pool_sqlite:give_away(Stale, self(), gift)
         ),
@@ -196,7 +199,7 @@ crashed_pool_is_restarted_test() ->
         ?assertNotEqual(Before, whereis(Name)),
         {ok, _Fresh, Current} = kura_pool_sqlite:checkout(Name, #{}),
         ?assertEqual(ok, kura_pool_sqlite:checkin(Name, Token)),
-        ?assertEqual({error, no_conns}, kura_pool_sqlite:checkout(Name, #{})),
+        ?assertEqual({error, no_conns}, kura_pool_sqlite:checkout(Name, #{timeout => 0})),
         ok = kura_pool_sqlite:checkin(Name, Current)
     after
         kura_pool_sqlite:stop_pool(Name)
@@ -235,13 +238,71 @@ pool_outlives_the_process_that_started_it_test() ->
 
 failed_start_returns_an_error_to_the_caller_test() ->
     ?assertMatch(
-        {result, {error, _}},
+        {result, {error, 14}},
         in_fresh(fun() ->
             kura_pool_sqlite:start_pool(pool_for_failed_start, #{
                 database => ~"/nonexistent_dir/x.db", pool_size => 1
             })
         end)
     ).
+
+start_on_a_utf16_database_is_refused_test() ->
+    Path = db_path(pool_for_utf16),
+    _ = file:delete(Path),
+    {ok, Setup} = esqlite3:open(binary_to_list(Path)),
+    ok = esqlite3:exec(Setup, ~"PRAGMA encoding = 'UTF-16'; CREATE TABLE t (id INTEGER)"),
+    ok = esqlite3:close(Setup),
+    try
+        ?assertMatch(
+            {result, {error, {unsupported_encoding, ~"UTF-16le"}}},
+            in_fresh(fun() ->
+                kura_pool_sqlite:start_pool(pool_for_utf16, #{database => Path, pool_size => 1})
+            end)
+        )
+    after
+        file:delete(Path)
+    end.
+
+start_on_a_file_that_is_not_a_database_returns_the_sqlite_error_test() ->
+    Path = db_path(pool_for_not_a_database),
+    ok = file:write_file(Path, binary:copy(~"not a database", 512)),
+    try
+        {result, {error, Reason}} = in_fresh(fun() ->
+            kura_pool_sqlite:start_pool(pool_for_not_a_database, #{database => Path})
+        end),
+        ?assertEqual(26, Reason)
+    after
+        file:delete(Path)
+    end.
+
+database_switched_to_another_encoding_stops_the_pool_test() ->
+    Name = pool_for_shared_encoding,
+    Path = db_path(Name),
+    _ = file:delete(Path),
+    {ok, _} = kura_pool_sqlite:start_pool(Name, #{database => Path, pool_size => 2}),
+    try
+        {Switcher, SwitcherToken} = checkout_within(Name, 1000),
+        {Reader, ReaderToken} = checkout_within(Name, 1000),
+        ok = esqlite3:exec(Switcher, ~"PRAGMA encoding = 'UTF-16le'; CREATE TABLE t (id INTEGER)"),
+        ok = kura_pool_sqlite:dirty(Name, Switcher),
+        [[0]] = esqlite3:q(Reader, ~"SELECT count(*) FROM t"),
+        ok = kura_pool_sqlite:checkin(Name, SwitcherToken),
+        ok = kura_pool_sqlite:checkin(Name, ReaderToken),
+        ?assertEqual({error, no_conns}, kura_pool_sqlite:checkout(Name, #{}))
+    after
+        kura_pool_sqlite:stop_pool(Name),
+        file:delete(Path)
+    end.
+
+lease_that_switches_the_encoding_is_not_inherited_test() ->
+    Name = pool_for_encoding_switch,
+    {ok, _} = kura_pool_sqlite:start_pool(Name, #{pool_size => 1}),
+    try
+        #{} = sql(Name, ~"PRAGMA encoding = 'UTF-16'"),
+        ?assertMatch(#{rows := [#{encoding := ~"UTF-8"}]}, sql(Name, ~"PRAGMA encoding"))
+    after
+        kura_pool_sqlite:stop_pool(Name)
+    end.
 
 second_start_of_a_name_returns_already_started_test() ->
     Name = pool_for_second_start,
@@ -335,7 +396,7 @@ pool_answers_while_a_returned_connection_waits_for_its_statement_test() ->
         ok = wait_in_nif(Borrower, {esqlite3_nif, step, 1}),
         ok = kill(Borrower),
         {_Other, Token} = checkout_within(Name, 100),
-        ?assertEqual({error, no_conns}, kura_pool_sqlite:checkout(Name, #{})),
+        ?assertEqual({error, no_conns}, kura_pool_sqlite:checkout(Name, #{timeout => 0})),
         ok = kura_pool_sqlite:checkin(Name, Token)
     after
         kura_pool_sqlite:stop_pool(Name)
@@ -451,8 +512,14 @@ status_does_not_list_leases_test() ->
     {ok, _} = kura_pool_sqlite:start_pool(Name, #{database => ~":memory:", pool_size => 1}),
     try
         {ok, _Conn, {Name, _, Lease}} = kura_pool_sqlite:checkout(Name, #{}),
+        Waiter = waiter(Name, #{}),
+        ok = await_waiting(Name, 1),
+        [Waiting] = waiting_leases(Name),
         Status = lists:flatten(io_lib:format("~p", [sys:get_status(Name)])),
-        ?assertEqual(nomatch, string:find(Status, ref_to_list(Lease)))
+        ?assertEqual(nomatch, string:find(Status, ref_to_list(Lease))),
+        ?assertEqual(nomatch, string:find(Status, ref_to_list(Waiting))),
+        ?assertNotEqual(nomatch, string:find(Status, "waiting => 1")),
+        ok = kill(Waiter)
     after
         kura_pool_sqlite:stop_pool(Name)
     end.
@@ -487,6 +554,54 @@ writable_schema_is_not_inherited_test() ->
         #{} = sql(Name, ~"PRAGMA writable_schema = ON"),
         ?assertMatch(#{rows := [#{writable_schema := 0}]}, sql(Name, ~"PRAGMA writable_schema"))
     end).
+
+every_connection_enforces_foreign_keys_test() ->
+    Name = pool_for_foreign_keys,
+    {ok, _} = kura_pool_sqlite:start_pool(Name, #{pool_size => 3}),
+    try
+        Leases = [checkout_within(Name, 1000) || _ <- lists:seq(1, 3)],
+        ?assertEqual(
+            [[[1]], [[1]], [[1]]],
+            [esqlite3:q(Conn, ~"PRAGMA foreign_keys") || {Conn, _} <- Leases]
+        ),
+        [ok = kura_pool_sqlite:checkin(Name, Token) || {_, Token} <- Leases]
+    after
+        kura_pool_sqlite:stop_pool(Name)
+    end.
+
+on_delete_cascade_removes_the_children_test() ->
+    with_file_pool(pool_for_cascade, fun(Name) ->
+        #{} = sql(Name, ~"CREATE TABLE parent (id INTEGER PRIMARY KEY)"),
+        #{} = sql(
+            Name,
+            ~"CREATE TABLE child (id INTEGER, parent_id INTEGER REFERENCES parent (id) ON DELETE CASCADE)"
+        ),
+        #{} = sql(Name, ~"INSERT INTO parent VALUES (1)"),
+        #{} = sql(Name, ~"INSERT INTO child VALUES (1, 1)"),
+        #{} = sql(Name, ~"DELETE FROM parent WHERE id = 1"),
+        ?assertMatch(#{rows := []}, sql(Name, ~"SELECT id FROM child"))
+    end).
+
+reference_to_a_missing_row_is_refused_test() ->
+    with_file_pool(pool_for_restrict, fun(Name) ->
+        #{} = sql(Name, ~"CREATE TABLE parent (id INTEGER PRIMARY KEY)"),
+        #{} = sql(Name, ~"CREATE TABLE child (parent_id INTEGER REFERENCES parent (id))"),
+        ?assertEqual({error, 787}, sql(Name, ~"INSERT INTO child VALUES (99)"))
+    end).
+
+replaced_connection_enforces_foreign_keys_test() ->
+    Name = pool_for_replaced_foreign_keys,
+    {ok, _} = kura_pool_sqlite:start_pool(Name, #{pool_size => 1}),
+    try
+        {Closed, ClosedToken} = checkout_within(Name, 1000),
+        ok = esqlite3:close(Closed),
+        ok = kura_pool_sqlite:checkin(Name, ClosedToken),
+        {Fresh, FreshToken} = checkout_within(Name, 1000),
+        ?assertEqual([[1]], esqlite3:q(Fresh, ~"PRAGMA foreign_keys")),
+        ok = kura_pool_sqlite:checkin(Name, FreshToken)
+    after
+        kura_pool_sqlite:stop_pool(Name)
+    end.
 
 safety_settings_are_not_inherited_test_() ->
     [
@@ -624,7 +739,7 @@ write_after_a_busy_statement_is_committed_test() ->
             end
         end),
         receive
-            {busy, Busied} -> ?assertEqual({case_clause, '$busy'}, Busied)
+            {busy, Busied} -> ?assertEqual({error, busy}, Busied)
         after 2000 -> error(never_busy)
         end,
         ok = esqlite3:exec(Other, ~"ROLLBACK"),
@@ -733,10 +848,34 @@ connection_that_could_not_be_replaced_is_opened_on_checkout_test() ->
         ?assertEqual([connection_not_replaced], logged()),
         ok = file:make_dir(Dir),
         {ok, _Conn, Token} = kura_pool_sqlite:checkout(Name, #{}),
-        ?assertEqual({error, no_conns}, kura_pool_sqlite:checkout(Name, #{})),
+        ?assertEqual({error, no_conns}, kura_pool_sqlite:checkout(Name, #{timeout => 0})),
         ok = kura_pool_sqlite:checkin(Name, Token)
     after
         _ = logger:remove_handler(Name),
+        kura_pool_sqlite:stop_pool(Name),
+        file:del_dir_r(Dir)
+    end.
+
+connection_opened_late_goes_to_a_waiter_first_test() ->
+    Dir = filename:join(os:getenv("TMPDIR", "/tmp"), "pool_for_late_reopen_waiter"),
+    _ = file:del_dir_r(Dir),
+    ok = file:make_dir(Dir),
+    Name = pool_for_late_reopen_waiter,
+    {ok, _} = kura_pool_sqlite:start_pool(Name, #{
+        database => filename:join(Dir, "db"), pool_size => 2
+    }),
+    try
+        {ok, _Held, Token} = kura_pool_sqlite:checkout(Name, #{}),
+        ok = file:del_dir_r(Dir),
+        ok = planted(Name, [~"CREATE TEMP TABLE scratch (id INTEGER)"]),
+        Waiter = waiter(Name, #{}),
+        ok = await_waiting(Name, 1),
+        ok = file:make_dir(Dir),
+        ?assertEqual({error, no_conns}, kura_pool_sqlite:checkout(Name, #{timeout => 0})),
+        ?assertMatch({ok, _, _}, result_of(Waiter)),
+        ok = released(Waiter),
+        ok = kura_pool_sqlite:checkin(Name, Token)
+    after
         kura_pool_sqlite:stop_pool(Name),
         file:del_dir_r(Dir)
     end.
@@ -760,6 +899,620 @@ reclaimed_given_away_connection_is_not_lent_again_test() ->
         ?assertEqual([[1]], esqlite3:q(Conn, ~"SELECT 1"))
     after
         kura_pool_sqlite:stop_pool(Name)
+    end.
+
+checkout_waits_for_a_checkin_test() ->
+    with_held(pool_for_waiting_checkout, fun(Name, Conn, Token) ->
+        Waiter = waiter(Name, #{}),
+        ok = await_waiting(Name, 1),
+        ok = kura_pool_sqlite:checkin(Name, Token),
+        ?assertMatch({ok, Conn, _}, result_of(Waiter)),
+        ?assertEqual(0, waiting(Name)),
+        ok = released(Waiter)
+    end).
+
+checkout_that_runs_out_of_time_returns_checkout_timeout_test() ->
+    with_held(pool_for_waiting_timeout, fun(Name, Conn, Token) ->
+        {Elapsed, Result} = timer:tc(kura_pool_sqlite, checkout, [Name, #{timeout => 100}]),
+        ?assertEqual({error, checkout_timeout}, Result),
+        ?assert(Elapsed >= 100000),
+        ?assertEqual(0, waiting(Name)),
+        ok = kura_pool_sqlite:checkin(Name, Token),
+        ?assertMatch({ok, Conn, _}, kura_pool_sqlite:checkout(Name, #{timeout => 0}))
+    end).
+
+waiters_are_served_in_the_order_they_came_test() ->
+    with_held(pool_for_waiting_order, fun(Name, Conn, Token) ->
+        First = waiter(Name, #{timeout => 5000}),
+        ok = await_waiting(Name, 1),
+        Second = waiter(Name, #{timeout => 5000}),
+        ok = await_waiting(Name, 2),
+        ok = kura_pool_sqlite:checkin(Name, Token),
+        ?assertMatch({ok, Conn, _}, result_of(First)),
+        ?assertEqual(1, waiting(Name)),
+        ok = released(First),
+        ?assertMatch({ok, Conn, _}, result_of(Second)),
+        ok = released(Second)
+    end).
+
+waiter_that_died_is_not_served_test() ->
+    with_held(pool_for_dead_waiter, fun(Name, Conn, Token) ->
+        Pool = whereis(Name),
+        {ok, Received} = received_by(Pool, fun() ->
+            Dead = waiter(Name, #{timeout => 100}),
+            ok = await_waiting(Name, 1),
+            ok = kill(Dead),
+            ok = await_waiting(Name, 0),
+            Live = waiter(Name, #{timeout => 5000}),
+            ok = await_waiting(Name, 1),
+            ok = kura_pool_sqlite:checkin(Name, Token),
+            ?assertMatch({ok, Conn, _}, result_of(Live)),
+            ok = released(Live),
+            timer:sleep(200)
+        end),
+        ?assertEqual([], timeouts(Received))
+    end).
+
+served_waiter_leaves_no_timer_behind_test() ->
+    with_held(pool_for_served_timer, fun(Name, _Conn, Token) ->
+        Pool = whereis(Name),
+        {ok, Received} = received_by(Pool, fun() ->
+            Waiter = waiter(Name, #{timeout => 100}),
+            ok = await_waiting(Name, 1),
+            ok = kura_pool_sqlite:checkin(Name, Token),
+            ?assertMatch({ok, _, _}, result_of(Waiter)),
+            ok = released(Waiter),
+            timer:sleep(200)
+        end),
+        ?assertEqual([], timeouts(Received))
+    end).
+
+checkout_without_a_timeout_waits_test() ->
+    with_held(pool_for_endless_wait, fun(Name, Conn, Token) ->
+        Waiter = waiter(Name, #{timeout => infinity}),
+        ok = await_waiting(Name, 1),
+        ok = kura_pool_sqlite:checkin(Name, Token),
+        ?assertMatch({ok, Conn, _}, result_of(Waiter)),
+        ok = released(Waiter)
+    end).
+
+checkout_wait_longer_than_a_timer_can_run_waits_test() ->
+    with_held(pool_for_longest_wait, fun(Name, Conn, Token) ->
+        Waiters = [
+            begin
+                Waiter = waiter(Name, #{timeout => Wait}),
+                ok = await_waiting(Name, Queued),
+                Waiter
+            end
+         || {Queued, Wait} <- lists:enumerate([16#FFFFFFFF - 500, 16#FFFFFFFF - 499, 5000000000])
+        ],
+        ok = kura_pool_sqlite:checkin(Name, Token),
+        _ = [
+            begin
+                ?assertMatch({ok, Conn, _}, result_of(Waiter)),
+                ok = released(Waiter)
+            end
+         || Waiter <- Waiters
+        ]
+    end).
+
+waiter_gone_from_the_middle_of_the_queue_is_skipped_test() ->
+    with_held(pool_for_middle_waiter, fun(Name, Conn, Token) ->
+        First = waiter(Name, #{}),
+        ok = await_waiting(Name, 1),
+        Gone = waiter(Name, #{}),
+        ok = await_waiting(Name, 2),
+        Last = waiter(Name, #{}),
+        ok = await_waiting(Name, 3),
+        ok = kill(Gone),
+        ok = await_waiting(Name, 2),
+        ok = kura_pool_sqlite:checkin(Name, Token),
+        ?assertMatch({ok, Conn, _}, result_of(First)),
+        ok = released(First),
+        ?assertMatch({ok, Conn, _}, result_of(Last)),
+        ok = released(Last),
+        ?assertEqual(0, waiting(Name))
+    end).
+
+checkout_that_reaches_the_pool_after_its_deadline_returns_checkout_timeout_test() ->
+    with_held(pool_for_expired_deadline, fun(Name, _Conn, _Token) ->
+        Expired = erlang:monotonic_time(millisecond) - 1,
+        ?assertEqual(
+            {error, checkout_timeout},
+            gen_server:call(Name, {checkout, self(), make_ref(), Expired})
+        ),
+        ?assertEqual({error, no_conns}, kura_pool_sqlite:checkout(Name, #{timeout => 0})),
+        ?assertEqual(0, waiting(Name))
+    end).
+
+checkout_with_a_bad_timeout_raises_test() ->
+    with_held(pool_for_bad_timeout, fun(Name, _Conn, _Token) ->
+        ?assertError({badarg, {timeout, -1}}, kura_pool_sqlite:checkout(Name, #{timeout => -1})),
+        ?assertError(
+            {badarg, {timeout, soon}}, kura_pool_sqlite:checkout(Name, #{timeout => soon})
+        ),
+        ?assertEqual(0, waiting(Name))
+    end).
+
+checkout_does_not_wait_when_nothing_can_come_back_test() ->
+    Name = pool_for_empty_wait,
+    {ok, _} = kura_pool_sqlite:start_pool(Name, #{database => ~":memory:", pool_size => 0}),
+    try
+        {Elapsed, Result} = timer:tc(kura_pool_sqlite, checkout, [Name, #{timeout => 5000}]),
+        ?assertEqual({error, no_conns}, Result),
+        ?assert(Elapsed < 1000000)
+    after
+        kura_pool_sqlite:stop_pool(Name)
+    end.
+
+replacement_connection_goes_to_a_waiter_test() ->
+    with_file_pool(pool_for_waiting_replacement, fun(Name) ->
+        {ok, Conn, Token} = kura_pool_sqlite:checkout(Name, #{}),
+        ok = esqlite3:exec(Conn, ~"CREATE TEMP TABLE scratch (id INTEGER)"),
+        ok = kura_pool_sqlite:dirty(Name, Conn),
+        Waiter = waiter(Name, #{timeout => 5000}),
+        ok = await_waiting(Name, 1),
+        ok = kura_pool_sqlite:checkin(Name, Token),
+        {ok, Fresh, _} = result_of(Waiter),
+        ?assertNotEqual(Conn, Fresh),
+        ok = released(Waiter)
+    end).
+
+waiter_is_refused_when_no_connection_can_be_opened_test() ->
+    Dir = filename:join(os:getenv("TMPDIR", "/tmp"), "pool_for_waiting_reopen"),
+    _ = file:del_dir_r(Dir),
+    ok = file:make_dir(Dir),
+    Name = pool_for_waiting_reopen,
+    {ok, _} = kura_pool_sqlite:start_pool(Name, #{
+        database => filename:join(Dir, "db"), pool_size => 1
+    }),
+    try
+        {ok, Conn, Token} = kura_pool_sqlite:checkout(Name, #{}),
+        ok = esqlite3:exec(Conn, ~"CREATE TEMP TABLE scratch (id INTEGER)"),
+        ok = kura_pool_sqlite:dirty(Name, Conn),
+        ok = file:del_dir_r(Dir),
+        Waiter = waiter(Name, #{timeout => 5000}),
+        ok = await_waiting(Name, 1),
+        ok = kura_pool_sqlite:checkin(Name, Token),
+        ?assertEqual({error, no_conns}, result_of(Waiter)),
+        ?assertEqual(0, waiting(Name))
+    after
+        kura_pool_sqlite:stop_pool(Name),
+        file:del_dir_r(Dir)
+    end.
+
+waiter_is_refused_when_the_database_leaves_utf8_test() ->
+    Name = pool_for_waiting_encoding,
+    Path = db_path(Name),
+    _ = file:delete(Path),
+    {ok, _} = kura_pool_sqlite:start_pool(Name, #{database => Path, pool_size => 2}),
+    try
+        Pool = whereis(Name),
+        {Switcher, SwitcherToken} = checkout_within(Name, 1000),
+        {_Reader, ReaderToken} = checkout_within(Name, 1000),
+        {Waiter, Received} = received_by(Pool, fun() ->
+            Waiter = waiter(Name, #{timeout => 300}),
+            ok = await_waiting(Name, 1),
+            ok = esqlite3:exec(
+                Switcher, ~"PRAGMA encoding = 'UTF-16le'; CREATE TABLE t (id INTEGER)"
+            ),
+            ok = kura_pool_sqlite:dirty(Name, Switcher),
+            ok = kura_pool_sqlite:checkin(Name, SwitcherToken),
+            ?assertEqual({error, no_conns}, result_of(Waiter)),
+            ok = released(Waiter),
+            timer:sleep(400),
+            Waiter
+        end),
+        ?assertEqual([], timeouts(Received)),
+        ?assertEqual([], [Down || {'DOWN', _, process, Pid, _} = Down <- Received, Pid =:= Waiter]),
+        ok = kura_pool_sqlite:checkin(Name, ReaderToken)
+    after
+        kura_pool_sqlite:stop_pool(Name),
+        file:delete(Path)
+    end.
+
+open_in_a_missing_directory_is_refused_before_esqlite_test() ->
+    Session = trace:session_create(?MODULE, self(), []),
+    try
+        _ = trace:process(Session, new, true, [call]),
+        1 = trace:function(Session, {esqlite3, open, 1}, true, [local]),
+        ?assertEqual(
+            {result, {error, 14}},
+            in_fresh(fun() ->
+                kura_pool_sqlite:start_pool(pool_for_missing_directory, #{
+                    database => ~"/nonexistent_dir/x.db", pool_size => 1
+                })
+            end)
+        ),
+        ?assertEqual([], traced(Session))
+    after
+        trace:session_destroy(Session)
+    end.
+
+file_uri_is_refused_before_esqlite_test() ->
+    Path = db_path(pool_for_file_uri),
+    _ = file:delete(Path),
+    ?assertEqual({error, uri_not_supported}, opened_with(<<"file:", Path/binary>>)),
+    ?assertEqual({error, uri_not_supported}, opened_with(~"file:/nonexistent_dir/x.db")),
+    _ = [
+        ?assertEqual({Uri, {error, uri_not_supported}}, {Uri, opened_with(Uri)})
+     || Uri <- [
+            ~"file:x.db",
+            ~"file:",
+            ~"file:?mode=memory",
+            ~"file::memory:?",
+            ~"file::memory:?cache=shared&mode=rw",
+            ~"file::memory:?mode=memory",
+            ~"file::memory:?cache=shared#x",
+            ~"file:mem?mode=ro",
+            ~"file:mem?mode=memory&vfs=unix",
+            ~"file:mem?mode=memory&cache=shared&cache=private",
+            ~"file:mem?mode=memory&",
+            ~"file:mem?mode=memory#x",
+            ~"file:mem%41?mode=memory",
+            ~"file:/mem?mode=memory",
+            ~"file://host/mem?mode=memory"
+        ]
+    ],
+    ?assertNot(filelib:is_file(Path)).
+
+in_memory_file_uri_is_opened_test() ->
+    _ = [
+        ?assertEqual({Uri, {ok, [Uri]}}, {Uri, opened_with(Uri)})
+     || Uri <- [
+            ~"file::memory:",
+            ~"file::memory:?cache=shared",
+            ~"file::memory:?cache=private",
+            ~"file:kura_mem?mode=memory",
+            ~"file:kura.mem-1?mode=memory&cache=shared",
+            ~"file:kura_mem?cache=private&mode=memory"
+        ]
+    ].
+
+shared_cache_memory_database_is_shared_by_the_pool_test() ->
+    Name = pool_for_shared_memory,
+    {ok, _} = kura_pool_sqlite:start_pool(Name, #{
+        database => ~"file:kura_pool_shared?mode=memory&cache=shared", pool_size => 2
+    }),
+    try
+        {ok, One, OneToken} = kura_pool_sqlite:checkout(Name, #{}),
+        {ok, Two, TwoToken} = kura_pool_sqlite:checkout(Name, #{}),
+        ?assertNotEqual(One, Two),
+        ok = esqlite3:exec(One, ~"CREATE TABLE shared (id INTEGER); INSERT INTO shared VALUES (1)"),
+        ?assertEqual([[1]], esqlite3:q(Two, ~"SELECT id FROM shared")),
+        ok = kura_pool_sqlite:checkin(Name, OneToken),
+        ok = kura_pool_sqlite:checkin(Name, TwoToken)
+    after
+        kura_pool_sqlite:stop_pool(Name)
+    end.
+
+dangling_symlink_is_refused_before_esqlite_test() ->
+    Link = db_path(pool_for_dangling_symlink),
+    _ = file:delete(Link),
+    ok = file:make_symlink(~"/nonexistent_dir/x.db", Link),
+    try
+        ?assertEqual({error, 14}, opened_with(Link))
+    after
+        file:delete(Link)
+    end.
+
+path_holding_a_nul_is_refused_before_esqlite_test() ->
+    Path = db_path(pool_for_nul),
+    ?assertEqual({error, invalid_filename}, opened_with(<<Path/binary, 0>>)),
+    ?assertEqual({error, invalid_filename}, opened_with(binary_to_list(Path) ++ [0])),
+    ?assertNot(filelib:is_file(Path)).
+
+string_path_holding_a_wide_character_is_refused_before_esqlite_test() ->
+    ?assertEqual(
+        {error, invalid_filename}, opened_with(binary_to_list(db_path(pool_for_wide)) ++ [16#3042])
+    ).
+
+unreadable_file_is_refused_before_esqlite_test() ->
+    Path = db_path(pool_for_unreadable),
+    ok = file:write_file(Path, ~""),
+    try
+        ok = file:change_mode(Path, 8#000),
+        case file:read_file_info(Path) of
+            {ok, #file_info{access = none}} -> ?assertEqual({error, 14}, opened_with(Path));
+            {ok, #file_info{}} -> ok
+        end
+    after
+        file:delete(Path)
+    end.
+
+read_only_file_is_opened_test() ->
+    Path = db_path(pool_for_read_only),
+    ok = file:write_file(Path, ~""),
+    try
+        ok = file:change_mode(Path, 8#444),
+        ?assertMatch({ok, [_]}, opened_with(Path))
+    after
+        file:delete(Path)
+    end.
+
+non_ascii_path_is_opened_and_created_test() ->
+    Path = db_path(pool_for_non_ascii),
+    Name = <<Path/binary, "_", "ö"/utf8>>,
+    _ = file:delete(Name),
+    try
+        ?assertEqual({ok, [Name]}, opened_with(Name)),
+        ?assert(filelib:is_regular(Name))
+    after
+        file:delete(Name)
+    end.
+
+created_database_is_not_group_or_world_writable_test() ->
+    Path = db_path(pool_for_created_mode),
+    _ = file:delete(Path),
+    try
+        ?assertEqual({ok, [Path]}, opened_with(Path)),
+        {ok, #file_info{mode = Mode}} = file:read_file_info(Path),
+        ?assert(is_integer(Mode) andalso Mode band 8#133 =:= 0)
+    after
+        file:delete(Path)
+    end.
+
+missing_file_in_a_read_only_directory_is_refused_and_not_created_test() ->
+    Dir = filename:join(os:getenv("TMPDIR", "/tmp"), "pool_for_read_only_directory"),
+    _ = file:del_dir_r(Dir),
+    ok = file:make_dir(Dir),
+    Path = iolist_to_binary(filename:join(Dir, "db")),
+    try
+        ok = file:change_mode(Dir, 8#555),
+        case file:read_file_info(Dir) of
+            {ok, #file_info{access = read}} ->
+                ?assertEqual({error, 14}, opened_with(Path)),
+                ?assertEqual({error, enoent}, file:read_link_info(Path));
+            {ok, #file_info{}} ->
+                ok
+        end
+    after
+        _ = file:change_mode(Dir, 8#755),
+        file:del_dir_r(Dir)
+    end.
+
+path_longer_than_sqlite_resolves_is_refused_before_esqlite_test() ->
+    with_deep_directory(pool_for_long_path, fun(Deep) ->
+        Existing = iolist_to_binary(filename:join(Deep, "db")),
+        ok = file:write_file(Existing, ~""),
+        ?assert(byte_size(Existing) > 512),
+        ?assertEqual({error, 14}, opened_with(Existing)),
+        Missing = iolist_to_binary(filename:join(Deep, "new")),
+        ?assertEqual({error, 14}, opened_with(Missing)),
+        ?assertEqual({error, enoent}, file:read_link_info(Missing))
+    end).
+
+relative_path_is_resolved_from_the_working_directory_test() ->
+    with_deep_directory(pool_for_relative_path, fun(Deep) ->
+        ok = file:write_file(filename:join(Deep, "db"), ~""),
+        {ok, Cwd} = file:get_cwd(),
+        try
+            ok = file:set_cwd(Deep),
+            ?assertEqual({error, 14}, opened_with(~"db")),
+            ok = file:set_cwd(filename:join(Deep, "../../..")),
+            Segment = filename:basename(Deep),
+            Back = filename:join([Segment, Segment, Segment]),
+            ?assertEqual({error, 14}, opened_with(iolist_to_binary([Back, "/../db"]))),
+            Up = iolist_to_binary(["./", filename:basename(Deep), "/../missing"]),
+            ?assertEqual({ok, [Up]}, opened_with(Up)),
+            ?assert(filelib:is_regular("missing"))
+        after
+            _ = file:delete("missing"),
+            ok = file:set_cwd(Cwd)
+        end
+    end).
+
+short_link_into_a_deep_directory_is_refused_before_esqlite_test() ->
+    with_deep_directory(pool_for_deep_link, fun(Deep) ->
+        ok = file:write_file(filename:join(Deep, "db"), ~""),
+        Link = db_path(pool_for_deep_link),
+        _ = file:delete(Link),
+        ok = file:make_symlink(Deep, Link),
+        try
+            Path = iolist_to_binary(filename:join(Link, "db")),
+            ?assert(byte_size(Path) < 200),
+            ?assertEqual({error, 14}, opened_with(Path))
+        after
+            file:delete(Link)
+        end
+    end).
+
+link_to_a_file_is_opened_test() ->
+    Path = db_path(pool_for_linked_file),
+    Link = db_path(pool_for_link),
+    _ = file:delete(Link),
+    ok = file:write_file(Path, ~""),
+    ok = file:make_symlink(filename:basename(Path), Link),
+    try
+        ?assertEqual({ok, [Link]}, opened_with(Link))
+    after
+        file:delete(Link),
+        file:delete(Path)
+    end.
+
+non_ascii_missing_directory_is_refused_before_esqlite_test() ->
+    ?assertEqual({error, 14}, opened_with(<<"/nonexistent_", "ö"/utf8, "/x.db">>)).
+
+empty_path_opens_a_temporary_database_test() ->
+    ?assertEqual({ok, [~""]}, opened_with(~"")).
+
+%% Starts and stops a one-connection pool on Database, returning what
+%% start_pool/2 returned, or the paths esqlite was asked to open.
+opened_with(Database) ->
+    Name = pool_for_opened_with,
+    Session = trace:session_create(?MODULE, self(), []),
+    try
+        _ = trace:process(Session, new, true, [call]),
+        1 = trace:function(Session, {esqlite3, open, 1}, true, [local]),
+        {result, Started} = in_fresh(fun() ->
+            case kura_pool_sqlite:start_pool(Name, #{database => Database, pool_size => 1}) of
+                {ok, _} -> kura_pool_sqlite:stop_pool(Name);
+                {error, _} = Error -> Error
+            end
+        end),
+        Opened = [list_to_binary(Filename) || Filename <- traced(Session), is_list(Filename)],
+        case Started of
+            ok -> {ok, Opened};
+            {error, _} when Opened =:= [] -> Started
+        end
+    after
+        trace:session_destroy(Session)
+    end.
+
+checkout_that_reaches_a_backed_up_pool_late_is_not_queued_test() ->
+    with_held(pool_for_backlog, fun(Name, Conn, Token) ->
+        ok = sys:suspend(Name),
+        Late = waiter(Name, #{timeout => 100}),
+        Result =
+            receive
+                {checked_out, Late, Checked} -> Checked
+            after 2000 -> error(never_timed_out)
+            end,
+        ok = sys:resume(Name),
+        ?assertEqual({error, checkout_timeout}, Result),
+        ?assertEqual(0, waiting(Name)),
+        ok = kura_pool_sqlite:checkin(Name, Token),
+        ?assertMatch({ok, Conn, _}, kura_pool_sqlite:checkout(Name, #{timeout => 0})),
+        ok = kill(Late)
+    end).
+
+abandoned_checkout_leaves_the_queue_test() ->
+    with_held(pool_for_abandoned_waiter, fun(Name, Conn, Token) ->
+        Pool = whereis(Name),
+        {ok, Received} = received_by(Pool, fun() ->
+            Gone = waiter(Name, #{timeout => 1000}),
+            ok = await_waiting(Name, 1),
+            [Lease] = waiting_leases(Name),
+            gen_server:cast(Name, {abandon, Lease}),
+            ok = await_waiting(Name, 0),
+            ok = kura_pool_sqlite:checkin(Name, Token),
+            ?assertMatch({ok, Conn, _}, kura_pool_sqlite:checkout(Name, #{timeout => 0})),
+            ok = kill(Gone),
+            timer:sleep(1100)
+        end),
+        ?assertEqual([], timeouts(Received)),
+        ?assertEqual([], [Down || {'DOWN', _, process, _, shutdown} = Down <- Received])
+    end).
+
+database_path_that_is_a_directory_is_refused_before_esqlite_test() ->
+    Dir = filename:join(os:getenv("TMPDIR", "/tmp"), "pool_for_directory_path"),
+    _ = file:del_dir_r(Dir),
+    ok = file:make_dir(Dir),
+    Session = trace:session_create(?MODULE, self(), []),
+    try
+        _ = trace:process(Session, new, true, [call]),
+        1 = trace:function(Session, {esqlite3, open, 1}, true, [local]),
+        ?assertEqual(
+            {result, {error, 14}},
+            in_fresh(fun() ->
+                kura_pool_sqlite:start_pool(pool_for_directory_path, #{database => Dir})
+            end)
+        ),
+        ?assertEqual([], traced(Session))
+    after
+        trace:session_destroy(Session),
+        file:del_dir_r(Dir)
+    end.
+
+with_deep_directory(Name, Test) ->
+    Top = filename:join(os:getenv("TMPDIR", "/tmp"), atom_to_list(Name)),
+    _ = file:del_dir_r(Top),
+    Segment = binary:copy(~"a", 200),
+    Deep = filename:join([Top, Segment, Segment, Segment]),
+    ok = filelib:ensure_path(Deep),
+    try
+        Test(Deep)
+    after
+        file:del_dir_r(Top)
+    end.
+
+with_held(Name, Test) ->
+    {ok, _} = kura_pool_sqlite:start_pool(Name, #{database => ~":memory:", pool_size => 1}),
+    try
+        {ok, Conn, Token} = kura_pool_sqlite:checkout(Name, #{}),
+        Test(Name, Conn, Token)
+    after
+        kura_pool_sqlite:stop_pool(Name)
+    end.
+
+waiter(Name, Opts) ->
+    Self = self(),
+    spawn(fun() ->
+        Result = kura_pool_sqlite:checkout(Name, Opts),
+        Self ! {checked_out, self(), Result},
+        receive
+            release ->
+                case Result of
+                    {ok, _Conn, Token} -> kura_pool_sqlite:checkin(Name, Token);
+                    {error, _} -> ok
+                end,
+                Self ! {released, self()}
+        end
+    end).
+
+result_of(Waiter) ->
+    receive
+        {checked_out, Waiter, Result} -> Result
+    after 1000 -> error(still_waiting)
+    end.
+
+released(Waiter) ->
+    Waiter ! release,
+    receive
+        {released, Waiter} -> ok
+    after 1000 -> error(never_released)
+    end.
+
+waiting(Name) ->
+    case sys:get_state(Name) of
+        #{waiting_leases := Waiting} when is_map(Waiting) -> map_size(Waiting)
+    end.
+
+waiting_leases(Name) ->
+    case sys:get_state(Name) of
+        #{waiting_leases := Waiting} when is_map(Waiting) -> maps:keys(Waiting)
+    end.
+
+await_waiting(Name, N) ->
+    await_waiting(Name, N, 100).
+
+await_waiting(_Name, _N, 0) ->
+    error(wrong_number_waiting);
+await_waiting(Name, N, Tries) ->
+    case waiting(Name) of
+        N ->
+            ok;
+        _ ->
+            timer:sleep(10),
+            await_waiting(Name, N, Tries - 1)
+    end.
+
+timeouts(Received) ->
+    [Message || {waited, _} = Message <- Received].
+
+received_by(Pid, Fun) ->
+    Session = trace:session_create(?MODULE, self(), []),
+    try
+        1 = trace:process(Session, Pid, true, ['receive']),
+        Result = Fun(),
+        {Result, traced(Session)}
+    after
+        trace:session_destroy(Session)
+    end.
+
+traced(Session) ->
+    Ref = trace:delivered(Session, all),
+    receive
+        {trace_delivered, all, Ref} -> ok
+    after 1000 -> error(trace_not_delivered)
+    end,
+    trace_messages().
+
+trace_messages() ->
+    receive
+        {trace, _Pid, 'receive', Message} -> [Message | trace_messages()];
+        {trace, _Pid, call, {esqlite3, open, [Filename]}} -> [Filename | trace_messages()]
+    after 0 -> []
     end.
 
 sql(Name, SQL) ->
@@ -815,7 +1568,7 @@ wait_for_checkout(Name, Timeout) ->
     wait_for_checkout_loop(Name, Deadline).
 
 wait_for_checkout_loop(Name, Deadline) ->
-    case kura_pool_sqlite:checkout(Name, #{}) of
+    case kura_pool_sqlite:checkout(Name, #{timeout => 0}) of
         {ok, _Conn, Token} ->
             kura_pool_sqlite:checkin(Name, Token);
         {error, Unavailable} when Unavailable =:= no_conns; Unavailable =:= no_pool ->
@@ -878,7 +1631,7 @@ checkout_within(Name, Timeout) ->
     checkout_within_loop(Name, Deadline).
 
 checkout_within_loop(Name, Deadline) ->
-    case kura_pool_sqlite:checkout(Name, #{}) of
+    case kura_pool_sqlite:checkout(Name, #{timeout => 0}) of
         {ok, Conn, Token} ->
             {Conn, Token};
         {error, no_conns} ->
@@ -892,7 +1645,8 @@ checkout_within_loop(Name, Deadline) ->
     end.
 
 db_path(Name) ->
-    iolist_to_binary(filename:join(os:getenv("TMPDIR", "/tmp"), atom_to_list(Name) ++ ".db")).
+    File = atom_to_list(Name) ++ "_" ++ os:getpid() ++ ".db",
+    iolist_to_binary(filename:join(os:getenv("TMPDIR", "/tmp"), File)).
 
 logged() ->
     receive
