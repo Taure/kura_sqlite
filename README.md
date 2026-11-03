@@ -99,7 +99,8 @@ to start on this backend via `kura_capabilities:require/2`.
 - **Arrays of encrypted values** are not supported on SQLite. A migration
   declaring one, and a write of a list to one, raise
   `{kura_sqlite, {unsupported_type, {array, Inner}}}`, and a where or
-  having on one raises `{kura_sqlite, {encrypted_field_in_where, Field}}`.
+  having condition on one other than `is_nil` and `is_not_nil` raises
+  `{kura_sqlite, {encrypted_field_in_where, Field}}`.
 - **Deterministic lookups**: the `encrypted_in` and `encrypted_not_in`
   conditions kura builds for a deterministic field
   (`{encrypted, Inner, #{mode => deterministic}}`) compile to `IN` and

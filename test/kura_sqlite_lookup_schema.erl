@@ -13,7 +13,8 @@ fields() ->
         #kura_field{name = name, type = string},
         #kura_field{name = token, type = encrypted(string, #{mode => deterministic})},
         #kura_field{name = 'code?', type = encrypted(binary, #{mode => deterministic})},
-        #kura_field{name = tags, type = {array, {encrypted, string}}}
+        #kura_field{name = tags, type = {array, {encrypted, string}}},
+        #kura_field{name = secret, type = encrypted(string, #{mode => deterministic})}
     ].
 
 %% {encrypted, Inner, Opts} is not a kura_types:kura_type() before kura#219.

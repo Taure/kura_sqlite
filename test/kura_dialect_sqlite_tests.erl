@@ -635,6 +635,7 @@ cached_blob_fields(Key) ->
 
 -define(LOOKUP_SCHEMA, kura_sqlite_lookup_schema).
 -define(DETERMINISTIC, ?LOOKUP_SCHEMA:encrypted(string, #{mode => deterministic})).
+-define(PLAIN_SCHEMA, kura_sqlite_plain_secret_schema).
 
 encrypted_forms_are_blob_columns_test_() ->
     Blob = kura_dialect_sqlite:column_type(binary),
@@ -721,6 +722,21 @@ where_lookup_on_a_field_that_is_not_deterministic_raises_test_() ->
             )
         ].
 
+%% A plain field of the same name in another joined schema does not hide
+%% an encrypted one, whichever comes first.
+where_on_a_field_encrypted_in_one_joined_schema_raises_test_() ->
+    Orders = [{?BLOB_SCHEMA, ?PLAIN_SCHEMA}, {?PLAIN_SCHEMA, ?BLOB_SCHEMA}],
+    [
+        ?_assertError(
+            {kura_sqlite, {encrypted_field_in_where, secret}},
+            unchecked_where(
+                kura_query:join(kura_query:from(From), inner, Joined, {owner_id, id}),
+                {secret, ~"plaintext"}
+            )
+        )
+     || {From, Joined} <- Orders
+    ].
+
 having_lookup_on_a_field_that_is_not_deterministic_raises_test() ->
     Q = (kura_query:from(?BLOB_SCHEMA))#kura_query{
         group_bys = [secret], havings = [{secret, encrypted_in, [~"f1"]}]
@@ -791,13 +807,16 @@ three_tuple_schema_tests() ->
         ?_assertEqual(
             [{blob, ~"t"}], element(2, kura_dialect_sqlite:update_all(Q, #{token => ~"t"}))
         ),
-        ?_assertEqual([token, 'code?'], kura_dialect_sqlite:blob_columns(?LOOKUP_SCHEMA)),
+        ?_assertEqual([token, 'code?', secret], kura_dialect_sqlite:blob_columns(?LOOKUP_SCHEMA)),
         ?_assertError(Tags, kura_dialect_sqlite:insert(?LOOKUP_SCHEMA, [tags], #{tags => [~"x"]})),
         ?_assertError(
             Tags, kura_dialect_sqlite:insert_all(?LOOKUP_SCHEMA, [tags], [#{tags => [~"x"]}])
         ),
         ?_assertError(Tags, kura_dialect_sqlite:update_all(Q, #{tags => [~"x"]})),
         ?_assertError(Tags, kura_dialect_sqlite:delete(?LOOKUP_SCHEMA, [{tags, [~"x"]}])),
+        ?_assertError(
+            Tags, kura_dialect_sqlite:update(?LOOKUP_SCHEMA, [tags], #{tags => [~"x"]}, [{id, 1}])
+        ),
         ?_assertEqual(
             [[~"x"]],
             element(2, kura_dialect_sqlite:insert(?LOOKUP_SCHEMA, [name], #{name => [~"x"]}))
@@ -829,6 +848,12 @@ three_tuple_schema_tests() ->
 
 %% Only kura#219 has a deterministic field. On an earlier kura `token` is
 %% an unsupported encrypted type, and a lookup on it raises.
+deterministic_kura_is_detected_test() ->
+    {module, kura_types} = code:ensure_loaded(kura_types),
+    ?assertEqual(
+        erlang:function_exported(kura_types, validate_encryption, 1), deterministic_kura()
+    ).
+
 deterministic_kura() ->
     case kura_types:encryption(?DETERMINISTIC) of
         {ok, #{mode := deterministic}} -> true;
@@ -880,18 +905,49 @@ lookup_tests() ->
         }
     ],
     [
-        lookup_case(Clause, Query, Condition, Op, Expected)
+        lookup_case(Clause, Query, Condition, {token, Op}, Expected)
      || {Clause, Query, Condition, Op, Expected} <- Cases
     ] ++
+        [
+            lookup_case(
+                where,
+                PlainJoin,
+                {secret, encrypted_in, [~"f1"]},
+                {secret, encrypted_in},
+                {<<"\"secret\" IN (CAST(?1 AS BLOB))">>, [~"f1"]}
+            )
+         || PlainJoin <- plain_secret_joins()
+        ] ++
+        lists:append([
+            [
+                ?_assertError(
+                    {kura_sqlite, {unsupported_blob_condition, token, encrypted_in}},
+                    unchecked_where(PlainJoin, {token, encrypted_in, [~"f1"]})
+                ),
+                ?_assertError(
+                    {kura_sqlite, {encrypted_field_in_where, token}},
+                    unchecked_where(PlainJoin, {token, ~"t"})
+                )
+            ]
+         || PlainJoin <- plain_secret_joins()
+        ]) ++
         [?_test(lookup_matches_stored_frames())].
 
-lookup_case(Clause, Query, Condition, Op, Expected) ->
+%% kura_sqlite_plain_secret_schema has a plain `secret` and a randomized
+%% `token`, the lookup schema a deterministic `secret` and `token`.
+plain_secret_joins() ->
+    [
+        kura_query:join(kura_query:from(?LOOKUP_SCHEMA), inner, ?PLAIN_SCHEMA, {owner_id, id}),
+        kura_query:join(kura_query:from(?PLAIN_SCHEMA), inner, ?LOOKUP_SCHEMA, {id, owner_id})
+    ].
+
+lookup_case(Clause, Query, Condition, {Field, Op}, Expected) ->
     case deterministic_kura() of
         true ->
             ?_assertEqual(Expected, compiled_clause(Clause, Query, Condition));
         false ->
             ?_assertError(
-                {kura_sqlite, {unsupported_blob_condition, token, Op}},
+                {kura_sqlite, {unsupported_blob_condition, Field, Op}},
                 compiled_clause(Clause, Query, Condition)
             )
     end.

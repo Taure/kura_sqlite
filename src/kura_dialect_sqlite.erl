@@ -71,8 +71,9 @@ PG dialect does, so a migration declaring one fails. A type with no
 SQLite storage raises `{kura_sqlite, {unsupported_type, Type}}`, and so
 does an array of an encrypted type: in `column_type/1`, and when a list is
 written to such a field by `insert`, `update`, `delete`, `insert_all` or
-the `SET` of `update_all`. A condition on an encrypted
-field other than `is_nil`, `is_not_nil` or a deterministic lookup raises
+the `SET` of `update_all`. A condition on an encrypted field, an array
+of an encrypted type among them, other than `is_nil`, `is_not_nil` or a
+deterministic lookup raises
 `{kura_sqlite, {encrypted_field_in_where, Field}}`, in a where or a
 having, on the `from` schema or a joined one. A value encrypted under a
 fresh nonce never equals the stored ciphertext, and the plaintext would
@@ -138,9 +139,6 @@ reach SQLite.
 ]).
 
 -define(CAST, ~"CAST(? AS BLOB)").
--type fields() :: {
-    Types :: #{atom() => kura_types:kura_type()}, Blobs :: #{atom() => kura_types:kura_type()}
-}.
 %% column_type/1 of a byte column. The comment is the marker blob_checks/1
 %% replaces, since a column's CHECK names it and column_type/1 is not given
 %% the name.
@@ -154,6 +152,10 @@ reach SQLite.
     (Op =:= '=' orelse Op =:= '!=' orelse Op =:= '<' orelse Op =:= '>' orelse Op =:= '<=' orelse
         Op =:= '>=')
 ).
+
+-type schema_fields() :: {
+    Types :: #{atom() => kura_types:kura_type()}, Blobs :: #{atom() => kura_types:kura_type()}
+}.
 
 %%----------------------------------------------------------------------
 %% kura_dialect callbacks
@@ -556,7 +558,7 @@ blob_keys(Table, KeyClauses) ->
     Fields = schema_fields(Table),
     [{Field, blob_value(Field, Value, Fields)} || {Field, Value} <- KeyClauses].
 
--spec blob_value(atom(), term(), fields()) -> term().
+-spec blob_value(atom(), term(), schema_fields()) -> term().
 blob_value(Field, Value, {_Types, Blobs}) when is_binary(Value), is_map_key(Field, Blobs) ->
     {blob, Value};
 blob_value(Field, Value, {Types, _Blobs}) when is_list(Value) ->
@@ -578,7 +580,7 @@ blob_fields(Table) ->
 %% module, and recomputed when kura's field types differ, as they do after
 %% kura_schema:forget/1. A module that is not a schema is not cached, since
 %% it may be loaded later.
--spec schema_fields(term()) -> fields().
+-spec schema_fields(term()) -> schema_fields().
 schema_fields(Mod) when is_atom(Mod), Mod =/= undefined ->
     Key = {?MODULE, blob_fields, Mod},
     case cached(Key) of
@@ -596,7 +598,7 @@ schema_fields(Mod) when is_atom(Mod), Mod =/= undefined ->
 schema_fields(_Table) ->
     {#{}, #{}}.
 
--spec cache_schema_fields(term(), #{atom() => kura_types:kura_type()}) -> fields().
+-spec cache_schema_fields(term(), #{atom() => kura_types:kura_type()}) -> schema_fields().
 cache_schema_fields(Key, Types) ->
     Fields = {Types, schema_blob_fields(Types)},
     persistent_term:put(Key, Fields),
@@ -654,14 +656,32 @@ blob_query(#kura_query{from = From, joins = Joins, wheres = Wheres, havings = Ha
 
 %% A where-field is not qualified by its table, so the fields of every
 %% joined schema are rewritten too. A name in two of the tables is an
-%% ambiguous column to SQLite.
--spec joined_fields([term()]) -> fields().
+%% ambiguous column to SQLite; its most restrictive type is kept, so a
+%% plain or deterministic field never hides a randomized one.
+-spec joined_fields([term()]) -> schema_fields().
 joined_fields([]) ->
     {#{}, #{}};
 joined_fields([Table | Rest]) ->
     {Types, Blobs} = schema_fields(Table),
     {RestTypes, RestBlobs} = joined_fields(Rest),
-    {maps:merge(Types, RestTypes), maps:merge(Blobs, RestBlobs)}.
+    {maps:merge_with(fun joined_type/3, Types, RestTypes), maps:merge(Blobs, RestBlobs)}.
+
+-spec joined_type(atom(), kura_types:kura_type(), kura_types:kura_type()) ->
+    kura_types:kura_type().
+joined_type(_Field, Type, Other) ->
+    case restriction(Type) >= restriction(Other) of
+        true -> Type;
+        false -> Other
+    end.
+
+-spec restriction(kura_types:kura_type()) -> 0..2.
+restriction(Type) ->
+    Encryption = kura_types:encryption(Type),
+    case {Encryption, deterministic(Encryption)} of
+        {none, _} -> 0;
+        {_, true} -> 1;
+        {_, false} -> 2
+    end.
 
 -spec blob_named([{Name, #kura_query{}}]) -> [{Name, #kura_query{}}].
 blob_named(Queries) ->
@@ -671,11 +691,11 @@ blob_named(Queries) ->
 blob_subquery(#kura_query{} = Query) -> blob_query(Query);
 blob_subquery(Other) -> Other.
 
--spec blob_conditions([term()], fields()) -> [term()].
+-spec blob_conditions([term()], schema_fields()) -> [term()].
 blob_conditions(Conditions, Fields) ->
     [blob_condition(Condition, Fields) || Condition <- Conditions].
 
--spec blob_condition(term(), fields()) -> term().
+-spec blob_condition(term(), schema_fields()) -> term().
 blob_condition({Op, Conditions}, Fields) when
     (Op =:= 'and' orelse Op =:= 'or'), is_list(Conditions)
 ->
