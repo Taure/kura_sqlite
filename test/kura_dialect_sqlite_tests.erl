@@ -587,9 +587,8 @@ where_on_joined_encrypted_field_raises_test() ->
         unchecked_where_sql(Joined, {secret, ~"pii"})
     ).
 
-%% Under a join a field of the from schema names the from table's column,
-%% so whether it is encrypted is the from schema's answer, whatever a joined
-%% schema declares under the same name.
+%% A field encrypted in any joined schema is refused, whichever schema is
+%% the from schema, so a plain namesake never hides an encrypted field.
 where_on_encrypted_from_field_with_a_plain_joined_namesake_raises_test() ->
     Joined = kura_query:join(
         kura_query:from(kura_sqlite_vault_schema), inner, kura_sqlite_plain_secret_schema, {id, id}
@@ -599,13 +598,14 @@ where_on_encrypted_from_field_with_a_plain_joined_namesake_raises_test() ->
         unchecked_where_sql(Joined, {secret, ~"pii"})
     ).
 
-where_on_plain_from_field_with_an_encrypted_joined_namesake_test() ->
+where_on_plain_from_field_with_an_encrypted_joined_namesake_raises_test() ->
     Joined = kura_query:join(
         kura_query:from(kura_sqlite_plain_secret_schema), inner, kura_sqlite_vault_schema, {id, id}
     ),
-    {SQL, Params} = unchecked_where_sql(Joined, {secret, ~"plain"}),
-    [_, Where] = binary:split(iolist_to_binary(SQL), ~" WHERE "),
-    ?assertEqual({<<"\"notes\".\"secret\" = ?1">>, [~"plain"]}, {Where, Params}),
+    ?assertError(
+        {kura_sqlite, {encrypted_field_in_where, secret}},
+        unchecked_where_sql(Joined, {secret, ~"plain"})
+    ),
     ?assertError(
         {kura, {encrypted_field_in_where, secret}}, where_sql(Joined, {secret, ~"plain"})
     ).
@@ -683,3 +683,503 @@ cached_blob_fields(Key) ->
     case persistent_term:get(Key) of
         {_Types, Blobs} when is_map(Blobs) -> Blobs
     end.
+
+%%----------------------------------------------------------------------
+%% Every encrypted form, and deterministic lookups (Taure/kura#219)
+%%----------------------------------------------------------------------
+
+-define(LOOKUP_SCHEMA, kura_sqlite_lookup_schema).
+-define(DETERMINISTIC, ?LOOKUP_SCHEMA:encrypted(string, #{mode => deterministic})).
+-define(PLAIN_SCHEMA, kura_sqlite_plain_secret_schema).
+
+encrypted_forms_are_blob_columns_test_() ->
+    Blob = kura_dialect_sqlite:column_type(binary),
+    [
+        ?_assertEqual(Blob, kura_dialect_sqlite:column_type({encrypted, string})),
+        ?_assertEqual(~"TEXT", kura_dialect_sqlite:column_type({array, string})),
+        ?_assertError(
+            {kura_crypto, unsupported_encrypted_type},
+            kura_dialect_sqlite:column_type(?LOOKUP_SCHEMA:encrypted(string, not_options))
+        ),
+        ?_assertError(
+            {kura_sqlite, {unsupported_type, vector}}, kura_dialect_sqlite:column_type(vector)
+        )
+    ] ++
+        [
+            options_column(Type)
+         || Type <- [?DETERMINISTIC, ?LOOKUP_SCHEMA:encrypted(binary, #{})]
+        ] ++
+        [
+            ?_assertError(
+                {kura_sqlite, {unsupported_type, Type}}, kura_dialect_sqlite:column_type(Type)
+            )
+         || Type <- [
+                {array, {encrypted, string}},
+                {array, {array, {encrypted, string}}},
+                {array, ?DETERMINISTIC}
+            ]
+        ].
+
+%% kura#219 reads {encrypted, Inner, Opts}; an earlier kura reports it
+%% unsupported, and kura_types:to_pg_type/1 raises on it.
+options_column(Type) ->
+    case kura_types:encryption(Type) of
+        {ok, _} ->
+            ?_assertEqual(
+                kura_dialect_sqlite:column_type(binary), kura_dialect_sqlite:column_type(Type)
+            );
+        unsupported ->
+            ?_assertError(
+                {kura_crypto, unsupported_encrypted_type}, kura_dialect_sqlite:column_type(Type)
+            )
+    end.
+
+encrypted_column_refuses_text_test() ->
+    Column = kura_dialect_sqlite:column_type({encrypted, string}),
+    ?assertEqual(
+        {ok, ~"CREATE TABLE \"t\" (\"token\" BLOB CHECK (typeof(\"token\") IN ('blob', 'null')))"},
+        kura_dialect_sqlite:blob_checks(<<"CREATE TABLE \"t\" (\"token\" ", Column/binary, ")">>)
+    ).
+
+%% On a randomized or plain byte field the frames would be plaintext, and
+%% encrypted_not_in would match every row.
+where_lookup_on_a_field_that_is_not_deterministic_raises_test_() ->
+    Q = kura_query:from(?BLOB_SCHEMA),
+    Joined = kura_query:join(
+        kura_query:from(kura_sqlite_owner_schema), inner, ?BLOB_SCHEMA, {owner_id, id}
+    ),
+    Cases = [
+        {Q, secret, encrypted_in},
+        {Q, secret, encrypted_not_in},
+        {Q, data, encrypted_in},
+        {Q, data, encrypted_not_in},
+        {Q, digest, encrypted_in},
+        {Q, name, encrypted_in},
+        {Joined, secret, encrypted_not_in},
+        {kura_query:from(vault), secret, encrypted_not_in},
+        {kura_query:from(kura_sqlite_question_schema), 'secret?', encrypted_in}
+    ],
+    [
+        ?_assertError(
+            {kura_sqlite, {unsupported_blob_condition, Field, Op}},
+            unchecked_where(Query, {Field, Op, [~"f1"]})
+        )
+     || {Query, Field, Op} <- Cases
+    ] ++
+        [
+            ?_assertError(
+                {kura_sqlite, {unsupported_blob_condition, secret, encrypted_in}},
+                unchecked_where(Q, {'not', {secret, encrypted_in, []}})
+            ),
+            ?_assertError(
+                {kura_sqlite, {encrypted_field_in_where, secret}},
+                unchecked_where(Q, {secret, encrypted_in, ~"f1"})
+            )
+        ].
+
+%% A plain field of the same name in another joined schema does not hide
+%% an encrypted one, whichever comes first.
+where_on_a_field_encrypted_in_one_joined_schema_raises_test_() ->
+    Orders = [{?BLOB_SCHEMA, ?PLAIN_SCHEMA}, {?PLAIN_SCHEMA, ?BLOB_SCHEMA}],
+    [
+        ?_assertError(
+            {kura_sqlite, {encrypted_field_in_where, secret}},
+            unchecked_where(
+                kura_query:join(kura_query:from(From), inner, Joined, {owner_id, id}),
+                {secret, ~"plaintext"}
+            )
+        )
+     || {From, Joined} <- Orders
+    ].
+
+having_lookup_on_a_field_that_is_not_deterministic_raises_test() ->
+    Q = (kura_query:from(?BLOB_SCHEMA))#kura_query{
+        group_bys = [secret], havings = [{secret, encrypted_in, [~"f1"]}]
+    },
+    ?assertError(
+        {kura_sqlite, {unsupported_blob_condition, secret, encrypted_in}},
+        kura_dialect_sqlite:to_sql(Q)
+    ).
+
+%% A kura without {encrypted, Inner, Opts} refuses the schema when it is
+%% first read, so its field types are put in kura's cache, as kura#219
+%% reads them.
+three_tuple_schema_test_() ->
+    {setup, fun read_lookup_schema/0, fun forget_lookup_schema/1, fun(_) ->
+        three_tuple_schema_tests() ++ lookup_tests()
+    end}.
+
+read_lookup_schema() ->
+    Key = {kura_schema, field_types, ?LOOKUP_SCHEMA},
+    try kura_schema:field_types(?LOOKUP_SCHEMA) of
+        #{} -> read
+    catch
+        error:{kura, {unsupported_encrypted_type, ?LOOKUP_SCHEMA, _}} ->
+            persistent_term:put(
+                Key,
+                #{
+                    Field => Type
+                 || #kura_field{name = Field, type = Type} <- ?LOOKUP_SCHEMA:fields()
+                }
+            ),
+            {seeded, Key}
+    end.
+
+forget_lookup_schema(Read) ->
+    _ = persistent_term:erase({kura_dialect_sqlite, blob_fields, ?LOOKUP_SCHEMA}),
+    case Read of
+        {seeded, Key} -> _ = persistent_term:erase(Key);
+        read -> ok
+    end,
+    ok.
+
+three_tuple_schema_tests() ->
+    Q = kura_query:from(?LOOKUP_SCHEMA),
+    Values = #{name => ~"n", token => ~"t", 'code?' => ~"c", tags => null},
+    Fields = [name, token, 'code?', tags],
+    Tags = {kura_sqlite, {unsupported_type, {array, {encrypted, string}}}},
+    [
+        ?_assertEqual(
+            [~"n", {blob, ~"t"}, {blob, ~"c"}, null],
+            element(2, kura_dialect_sqlite:insert(?LOOKUP_SCHEMA, Fields, Values))
+        ),
+        ?_assertEqual(
+            [~"n", {blob, ~"t"}, {blob, ~"c"}, null],
+            element(2, kura_dialect_sqlite:insert_all(?LOOKUP_SCHEMA, Fields, [Values]))
+        ),
+        ?_assertEqual(
+            [{blob, ~"t"}, {blob, ~"k"}],
+            element(
+                2,
+                kura_dialect_sqlite:update(?LOOKUP_SCHEMA, [token], #{token => ~"t"}, [
+                    {token, ~"k"}
+                ])
+            )
+        ),
+        ?_assertEqual(
+            [{blob, ~"k"}], element(2, kura_dialect_sqlite:delete(?LOOKUP_SCHEMA, [{token, ~"k"}]))
+        ),
+        ?_assertEqual(
+            [{blob, ~"t"}], element(2, kura_dialect_sqlite:update_all(Q, #{token => ~"t"}))
+        ),
+        ?_assertEqual([token, 'code?', secret], kura_dialect_sqlite:blob_columns(?LOOKUP_SCHEMA)),
+        ?_assertError(Tags, kura_dialect_sqlite:insert(?LOOKUP_SCHEMA, [tags], #{tags => [~"x"]})),
+        ?_assertError(
+            Tags, kura_dialect_sqlite:insert_all(?LOOKUP_SCHEMA, [tags], [#{tags => [~"x"]}])
+        ),
+        ?_assertError(Tags, kura_dialect_sqlite:update_all(Q, #{tags => [~"x"]})),
+        ?_assertError(Tags, kura_dialect_sqlite:delete(?LOOKUP_SCHEMA, [{tags, [~"x"]}])),
+        ?_assertError(
+            Tags, kura_dialect_sqlite:update(?LOOKUP_SCHEMA, [tags], #{tags => [~"x"]}, [{id, 1}])
+        ),
+        ?_assertEqual(
+            [[~"x"]],
+            element(2, kura_dialect_sqlite:insert(?LOOKUP_SCHEMA, [name], #{name => [~"x"]}))
+        ),
+        ?_assertError(
+            {kura_sqlite, {encrypted_field_in_where, token}}, unchecked_where(Q, {token, ~"t"})
+        ),
+        ?_assertError(
+            {kura_sqlite, {encrypted_field_in_where, 'code?'}},
+            unchecked_where(Q, {'code?', '=', ~"c"})
+        ),
+        ?_assertError(
+            {kura_sqlite, {unsupported_blob_condition, 'code?', encrypted_in}},
+            unchecked_where(Q, {'code?', encrypted_in, [~"f1"]})
+        ),
+        ?_assertError(
+            {kura_sqlite, {encrypted_field_in_where, tags}}, unchecked_where(Q, {tags, [~"x"]})
+        ),
+        ?_assertError(
+            {kura_sqlite, {encrypted_field_in_where, tags}},
+            unchecked_where(Q, {tags, encrypted_in, ~"x"})
+        ),
+        ?_assertError(
+            {kura_sqlite, {unsupported_blob_condition, tags, encrypted_in}},
+            unchecked_where(Q, {tags, encrypted_in, [~"x"]})
+        ),
+        ?_assertEqual({<<"\"tags\" IS NULL">>, []}, unchecked_where(Q, {tags, is_nil}))
+    ].
+
+%% Only kura#219 has a deterministic field. On an earlier kura `token` is
+%% an unsupported encrypted type, and a lookup on it raises.
+deterministic_kura_is_detected_test() ->
+    {module, kura_types} = code:ensure_loaded(kura_types),
+    ?assertEqual(
+        erlang:function_exported(kura_types, validate_encryption, 1), deterministic_kura()
+    ).
+
+deterministic_kura() ->
+    case kura_types:encryption(?DETERMINISTIC) of
+        {ok, #{mode := deterministic}} -> true;
+        _ -> false
+    end.
+
+lookup_tests() ->
+    Q = kura_query:from(?LOOKUP_SCHEMA),
+    Joined = kura_query:join(
+        kura_query:from(kura_sqlite_owner_schema), inner, ?LOOKUP_SCHEMA, {owner_id, id}
+    ),
+    Having = (kura_query:from(?LOOKUP_SCHEMA))#kura_query{group_bys = [token]},
+    Cases = [
+        {
+            where,
+            Q,
+            {token, encrypted_in, [~"f1", ~"f2"]},
+            encrypted_in,
+            {<<"\"token\" IN (CAST(?1 AS BLOB), CAST(?2 AS BLOB))">>, [~"f1", ~"f2"]}
+        },
+        {
+            where,
+            Q,
+            {token, encrypted_not_in, [~"f1", ~"f2"]},
+            encrypted_not_in,
+            {<<"\"token\" NOT IN (CAST(?1 AS BLOB), CAST(?2 AS BLOB))">>, [~"f1", ~"f2"]}
+        },
+        {where, Q, {token, encrypted_in, []}, encrypted_in, {<<"\"token\" IN ()">>, []}},
+        {
+            where,
+            Q,
+            {'and', [{name, ~"n"}, {'or', [{'not', {token, encrypted_in, [~"f1"]}}]}]},
+            encrypted_in,
+            {<<"(\"name\" = ?1 AND (NOT (\"token\" IN (CAST(?2 AS BLOB)))))">>, [~"n", ~"f1"]}
+        },
+        {
+            where,
+            Joined,
+            {token, encrypted_not_in, [~"f1"]},
+            encrypted_not_in,
+            {<<"\"token\" NOT IN (CAST(?1 AS BLOB))">>, [~"f1"]}
+        },
+        {
+            having,
+            Having,
+            {token, encrypted_in, [~"f1"]},
+            encrypted_in,
+            {<<"\"token\" IN (CAST(?1 AS BLOB))">>, [~"f1"]}
+        }
+    ],
+    [
+        lookup_case(Clause, Query, Condition, {token, Op}, Expected)
+     || {Clause, Query, Condition, Op, Expected} <- Cases
+    ] ++
+        [
+            lookup_case(
+                where,
+                hd(plain_secret_joins()),
+                {secret, encrypted_in, [~"f1"]},
+                {secret, encrypted_in},
+                {<<"\"lookups\".\"secret\" IN (CAST(?1 AS BLOB))">>, [~"f1"]}
+            ),
+            ?_assertError(
+                {kura_sqlite, {unsupported_blob_condition, secret, encrypted_in}},
+                unchecked_where(lists:last(plain_secret_joins()), {secret, encrypted_in, [~"f1"]})
+            )
+        ] ++
+        lists:append([
+            [
+                ?_assertError(
+                    {kura_sqlite, {unsupported_blob_condition, token, encrypted_in}},
+                    unchecked_where(PlainJoin, {token, encrypted_in, [~"f1"]})
+                ),
+                ?_assertError(
+                    {kura_sqlite, {encrypted_field_in_where, token}},
+                    unchecked_where(PlainJoin, {token, ~"t"})
+                )
+            ]
+         || PlainJoin <- plain_secret_joins()
+        ]) ++
+        [?_test(lookup_matches_stored_frames())].
+
+%% kura_sqlite_plain_secret_schema has a plain `secret` and a randomized
+%% `token`, the lookup schema a deterministic `secret` and `token`. Under a
+%% join kura qualifies `secret` with the from table, so a lookup on it names
+%% the lookup table's column, or is refused when the from schema's `secret`
+%% is plain.
+plain_secret_joins() ->
+    [
+        kura_query:join(kura_query:from(?LOOKUP_SCHEMA), inner, ?PLAIN_SCHEMA, {owner_id, id}),
+        kura_query:join(kura_query:from(?PLAIN_SCHEMA), inner, ?LOOKUP_SCHEMA, {id, owner_id})
+    ].
+
+lookup_case(Clause, Query, Condition, {Field, Op}, Expected) ->
+    case deterministic_kura() of
+        true ->
+            ?_assertEqual(Expected, compiled_clause(Clause, Query, Condition));
+        false ->
+            ?_assertError(
+                {kura_sqlite, {unsupported_blob_condition, Field, Op}},
+                compiled_clause(Clause, Query, Condition)
+            )
+    end.
+
+compiled_clause(where, Query, Condition) ->
+    unchecked_where(Query, Condition);
+compiled_clause(having, Query, Condition) ->
+    {SQL, Params} = kura_dialect_sqlite:to_sql(Query#kura_query{havings = [Condition]}),
+    [_, Having] = binary:split(iolist_to_binary(SQL), ~" HAVING "),
+    {Having, Params}.
+
+lookup_matches_stored_frames() ->
+    {ok, _} = application:ensure_all_started(esqlite),
+    {ok, Conn} = esqlite3:open(":memory:"),
+    try
+        ok = esqlite3:exec(
+            Conn,
+            ~"CREATE TABLE lookups (id INTEGER PRIMARY KEY, name TEXT, token BLOB, \"code?\" BLOB, tags TEXT)"
+        ),
+        Odd = <<0, 255, 254, 128, $a, 192>>,
+        _ = [
+            kura_driver_sqlite:query_on(Conn, SQL, Params, #{})
+         || Frame <- [Odd, <<1, 2, 3>>, ~"plain"],
+            {SQL, Params} <- [
+                kura_dialect_sqlite:insert(?LOOKUP_SCHEMA, [token], #{token => Frame})
+            ]
+        ],
+        Ids = fun(Condition) ->
+            Q = kura_query:select(kura_query:from(?LOOKUP_SCHEMA), [id]),
+            {SQL, Params} = unchecked_where_sql(kura_query:order_by(Q, [{id, asc}]), Condition),
+            #{rows := Rows} = kura_driver_sqlite:query_on(Conn, SQL, Params, #{}),
+            [Id || #{id := Id} <- Rows]
+        end,
+        case deterministic_kura() of
+            true ->
+                ?assertEqual([1, 3], Ids({token, encrypted_in, [Odd, ~"plain"]})),
+                ?assertEqual([2], Ids({token, encrypted_not_in, [Odd, ~"plain"]}));
+            false ->
+                ?assertError(
+                    {kura_sqlite, {unsupported_blob_condition, token, encrypted_in}},
+                    Ids({token, encrypted_in, [Odd]})
+                )
+        end
+    after
+        esqlite3:close(Conn)
+    end.
+
+unchecked_where(Query, Condition) ->
+    {SQL, Params} = unchecked_where_sql(Query, Condition),
+    [_, Where] = binary:split(iolist_to_binary(SQL), ~" WHERE "),
+    {Where, Params}.
+
+%%----------------------------------------------------------------------
+%% Vector distance
+%%----------------------------------------------------------------------
+
+-define(UNSUPPORTED, {unsupported, vector_distance}).
+-define(DISTANCE, {distance, embedding, cosine, ~"[1.0,2.0,3.0]"}).
+
+distance_queries() ->
+    D = ?DISTANCE,
+    Sub = #kura_query{from = items, select = [id], wheres = [{D, '<', 0.5}]},
+    [
+        {"select expression", #kura_query{from = items, select = {exprs, [{id, id}, {d, D}]}}},
+        {"order_by", #kura_query{from = items, order_bys = [{id, asc}, {D, asc}]}},
+        {"where threshold", #kura_query{from = items, wheres = [{id, 1}, {D, '<', 0.5}]}},
+        {"having threshold", #kura_query{from = items, havings = [{D, '>=', 0.5}]}},
+        {"threshold under and, or and not", #kura_query{
+            from = items, wheres = [{'or', [{id, 1}, {'and', [{'not', {D, '<=', 0.5}}]}]}]
+        }},
+        {"bare distance condition", #kura_query{from = items, wheres = [{D, 0.5}]}},
+        {"in subquery", #kura_query{from = items, wheres = [{id, in, {subquery, Sub}}]}},
+        {"exists subquery", #kura_query{from = items, wheres = [{exists, {subquery, Sub}}]}},
+        {"not_exists subquery", #kura_query{
+            from = items, havings = [{not_exists, {subquery, Sub}}]
+        }},
+        {"distance in subquery", #kura_query{
+            from = items, wheres = [{D, in, {subquery, #kura_query{from = items}}}]
+        }},
+        {"select expression after a malformed one", #kura_query{
+            from = items, select = {exprs, [not_an_expr, {d, D}]}
+        }},
+        {"order_by after a malformed one", #kura_query{
+            from = items, order_bys = [not_an_order, {D, asc}]
+        }},
+        {"cte", kura_query:with_cte(#kura_query{from = items}, ~"near", Sub)},
+        {"second cte",
+            kura_query:with_cte(
+                kura_query:with_cte(#kura_query{from = items}, ~"plain", #kura_query{from = items}),
+                ~"near",
+                Sub
+            )},
+        {"combination", kura_query:union(#kura_query{from = items}, Sub)}
+    ].
+
+distance_raises_unsupported_in_every_position_test_() ->
+    [
+        {Title, [
+            ?_assertError(?UNSUPPORTED, kura_dialect_sqlite:to_sql(Q)),
+            ?_assertError(?UNSUPPORTED, kura_dialect_sqlite:to_sql_from(Q, 1)),
+            ?_assertError(?UNSUPPORTED, kura_dialect_sqlite:delete_all(Q)),
+            ?_assertError(?UNSUPPORTED, kura_dialect_sqlite:update_all(Q, #{content => ~"x"}))
+        ]}
+     || {Title, Q} <- distance_queries()
+    ].
+
+%% Malformed lists and conditions with no distance are left to
+%% kura_dialect_pg, as before.
+queries_without_a_distance_still_compile_test_() ->
+    Sub = #kura_query{from = items, select = [id], wheres = [{id, '>', 1}]},
+    Queries = [
+        #kura_query{from = items, select = {exprs, [{id, id}, {n, {fragment, ~"1", []}}]}},
+        #kura_query{from = items, order_bys = [{id, desc}]},
+        #kura_query{
+            from = items,
+            wheres = [
+                {'and', [{id, 1}, {'not', {name, like, ~"a%"}}]},
+                {deleted_at, is_nil},
+                {fragment, ~"1 = ?", [1]},
+                {id, in, {subquery, Sub}},
+                {exists, {subquery, Sub}}
+            ],
+            havings = [{id, '>', 0}]
+        },
+        kura_query:union(#kura_query{from = items}, Sub)
+    ],
+    [?_assertMatch({_, _}, kura_dialect_sqlite:to_sql(Q)) || Q <- Queries].
+
+%% Through the compiler, the cached path included: a shape the dialect
+%% raises on is cached as uncacheable, and every run raises from the
+%% direct compile.
+distance_query_through_the_compiler_raises_test_() ->
+    {setup,
+        fun() ->
+            application:set_env(kura, repos, #{
+                kura_sqlite_vector_repo => #{dialect => kura_dialect_sqlite}
+            }),
+            kura_query_cache:init(),
+            kura_query_cache:flush()
+        end,
+        fun(_) ->
+            kura_query_cache:flush(),
+            application:unset_env(kura, repos)
+        end,
+        fun(_) ->
+            D = kura_query:distance(embedding, cosine, [1, 2, 3]),
+            Q0 = kura_query:select_expr(
+                kura_query:from(kura_sqlite_vector_schema), [{id, id}, {dist, D}]
+            ),
+            Q = kura_query:limit(kura_query:order_by(Q0, [{dist, asc}]), 5),
+            Ordered = kura_query:order_by(kura_query:from(kura_sqlite_vector_schema), [{D, asc}]),
+            [
+                ?_assertError(?UNSUPPORTED, kura_query_compiler:to_sql(kura_sqlite_vector_repo, Q)),
+                ?_assertError(
+                    ?UNSUPPORTED, kura_query_compiler:to_sql_cached(kura_sqlite_vector_repo, Q)
+                ),
+                ?_assertError(
+                    ?UNSUPPORTED,
+                    kura_query_compiler:to_sql_cached(kura_sqlite_vector_repo, Ordered)
+                ),
+                ?_assertError(
+                    ?UNSUPPORTED, kura_query_compiler:to_sql_cached(kura_sqlite_vector_repo, Q)
+                ),
+                ?_test(begin
+                    {Shape, _Values} = kura_query_shape:split(Q),
+                    ?assertEqual(
+                        {ok, uncacheable},
+                        kura_query_cache:get(
+                            {kura_sqlite_vector_repo, kura_tenant:get_tenant(), Shape}
+                        )
+                    )
+                end)
+            ]
+        end}.

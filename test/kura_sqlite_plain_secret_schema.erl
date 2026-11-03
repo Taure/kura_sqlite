@@ -5,10 +5,12 @@
 
 -export([table/0, fields/0]).
 
-table() -> ~"notes".
+table() -> ~"plain_rows".
 
 fields() ->
     [
         #kura_field{name = id, type = id, primary_key = true, nullable = false},
-        #kura_field{name = secret, type = string}
+        #kura_field{name = owner_id, type = integer},
+        #kura_field{name = secret, type = string},
+        #kura_field{name = token, type = {encrypted, string}}
     ].
