@@ -275,18 +275,15 @@ date_filters() ->
     [?assertEqual({C, Ids}, {C, flag_ids(C)}) || {C, Ids} <- Cases].
 
 %% kura_sqlite 1.1 bound true and false as the text 'true' and 'false', which
-%% an INTEGER column keeps as TEXT. The README's upgrade note gives this repair.
+%% an INTEGER column keeps as TEXT. This runs the README's repair as written,
+%% with its table and column renamed.
 boolean_text_repair() ->
     ok = flag_table(),
     {ok, _} = kura_repo_worker:query(
         ?REPO, ~"INSERT INTO flags (id, active) VALUES (3, 'true'), (4, 'false')", []
     ),
     ?assertEqual([1], flag_ids({active, true})),
-    {ok, _} = kura_repo_worker:query(
-        ?REPO,
-        ~"UPDATE \"flags\" SET \"active\" = (\"active\" = 'true') WHERE typeof(\"active\") = 'text'",
-        []
-    ),
+    {ok, _} = kura_repo_worker:query(?REPO, readme_boolean_repair(~"flags", ~"active"), []),
     ?assertMatch(
         {ok, [
             #{id := 1, active := 1, t := ~"integer"},
@@ -300,3 +297,13 @@ boolean_text_repair() ->
     ),
     ?assertEqual([1, 3], flag_ids({active, true})),
     ?assertEqual([2, 4], flag_ids({active, false})).
+
+readme_boolean_repair(Table, Column) ->
+    {ok, Readme} = file:read_file(filename:join([filename:dirname(?FILE), "..", "README.md"])),
+    [_, Upgrade] = binary:split(Readme, ~"## Upgrading from 1.1"),
+    [_, AfterFence] = binary:split(Upgrade, ~"```sql\n"),
+    [Block, _] = binary:split(AfterFence, ~"```"),
+    {Start, _} = binary:match(Block, ~"UPDATE \"posts\""),
+    [SQL | _] = binary:split(binary:part(Block, Start, byte_size(Block) - Start), ~"\n"),
+    Renamed = binary:replace(SQL, ~"\"posts\"", <<$", Table/binary, $">>, [global]),
+    binary:replace(Renamed, ~"\"published\"", <<$", Column/binary, $">>, [global]).
