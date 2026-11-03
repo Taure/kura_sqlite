@@ -262,6 +262,11 @@ where_sql(Query, Condition) ->
     [_, Where] = binary:split(iolist_to_binary(SQL), ~" WHERE "),
     {Where, Params}.
 
+%% kura refuses an encrypted field in kura_query:where/2. Setting the record
+%% field directly reaches the dialect's own refusal behind it.
+unchecked_where_sql(Query = #kura_query{wheres = Wheres}, Condition) ->
+    kura_dialect_sqlite:to_sql(Query#kura_query{wheres = Wheres ++ [Condition]}).
+
 utf16_database_keeps_inserted_bytes_test() ->
     {ok, _} = application:ensure_all_started(esqlite),
     {ok, Conn} = esqlite3:open(":memory:"),
@@ -516,12 +521,19 @@ where_on_encrypted_field_raises_test_() ->
         {'not', {secret, '=', ~"pii"}},
         {'and', [{name, ~"n"}, {'or', [{secret, ~"pii"}]}]}
     ],
-    [
-        ?_assertError(
-            {kura_sqlite, {encrypted_field_in_where, secret}}, where_sql(Condition)
-        )
+    Q = kura_query:from(?BLOB_SCHEMA),
+    lists:append([
+        [
+            ?_assertError(
+                {kura, {encrypted_field_in_where, secret}}, where_sql(Condition)
+            ),
+            ?_assertError(
+                {kura_sqlite, {encrypted_field_in_where, secret}},
+                unchecked_where_sql(Q, Condition)
+            )
+        ]
      || Condition <- Conditions
-    ].
+    ]).
 
 having_on_encrypted_field_raises_test() ->
     Q = (kura_query:from(?BLOB_SCHEMA))#kura_query{
@@ -536,13 +548,21 @@ where_on_joined_encrypted_field_raises_test() ->
         kura_query:from(kura_sqlite_owner_schema), inner, ?BLOB_SCHEMA, {owner_id, id}
     ),
     ?assertError(
-        {kura_sqlite, {encrypted_field_in_where, secret}}, where_sql(Joined, {secret, ~"pii"})
+        {kura, {encrypted_field_in_where, secret}}, where_sql(Joined, {secret, ~"pii"})
+    ),
+    ?assertError(
+        {kura_sqlite, {encrypted_field_in_where, secret}},
+        unchecked_where_sql(Joined, {secret, ~"pii"})
     ).
 
 where_on_encrypted_field_named_with_a_placeholder_raises_test() ->
+    Q = kura_query:from(kura_sqlite_question_schema),
+    ?assertError(
+        {kura, {encrypted_field_in_where, 'secret?'}}, where_sql(Q, {'secret?', ~"pii"})
+    ),
     ?assertError(
         {kura_sqlite, {encrypted_field_in_where, 'secret?'}},
-        where_sql(kura_query:from(kura_sqlite_question_schema), {'secret?', ~"pii"})
+        unchecked_where_sql(Q, {'secret?', ~"pii"})
     ).
 
 insert_binds_encrypted_field_named_with_a_placeholder_as_blob_test() ->
