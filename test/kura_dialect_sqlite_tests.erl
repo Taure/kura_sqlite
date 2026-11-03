@@ -706,7 +706,8 @@ queries_without_a_distance_still_compile_test_() ->
     [?_assertMatch({_, _}, kura_dialect_sqlite:to_sql(Q)) || Q <- Queries].
 
 %% Through the compiler, the cached path included: a shape the dialect
-%% raises on is not cached, and the query raises from the direct compile.
+%% raises on is cached as uncacheable, and every run raises from the
+%% direct compile.
 distance_query_through_the_compiler_raises_test_() ->
     {setup,
         fun() ->
@@ -738,6 +739,15 @@ distance_query_through_the_compiler_raises_test_() ->
                 ),
                 ?_assertError(
                     ?UNSUPPORTED, kura_query_compiler:to_sql_cached(kura_sqlite_vector_repo, Q)
-                )
+                ),
+                ?_test(begin
+                    {Shape, _Values} = kura_query_shape:split(Q),
+                    ?assertEqual(
+                        {ok, uncacheable},
+                        kura_query_cache:get(
+                            {kura_sqlite_vector_repo, kura_tenant:get_tenant(), Shape}
+                        )
+                    )
+                end)
             ]
         end}.
