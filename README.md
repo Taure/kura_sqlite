@@ -165,18 +165,18 @@ to start on this backend via `kura_capabilities:require/2`.
   if multiple checkouts must observe the same data, a shared-cache URI
   such as `<<"file:my_db?mode=memory&cache=shared">>`, or a file path.
 
-## Upgrading from 1.1
+## Upgrading from 1.2
 
-- **Booleans** bind as 1/0. 1.1 bound `true`/`false` as the text
+- **Booleans** bind as 1/0. 1.2 and earlier bound `true`/`false` as the text
   `'true'`/`'false'`, which an INTEGER column keeps as TEXT, so a filter
-  on such a column misses the rows 1.1 wrote. Repair each boolean column
+  on such a column misses the rows they wrote. Repair each boolean column
   once:
 
   ```sql
   UPDATE "posts" SET "published" = ("published" = 'true') WHERE typeof("published") = 'text';
   ```
 
-- **Dates and datetimes** can now be written and filtered; 1.1 refused
+- **Dates and datetimes** can now be written and filtered; 1.2 refused
   a date or datetime tuple with `{error, {unsupported_param, N}}`.
 
 ## Upgrading from 0.5

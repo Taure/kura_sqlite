@@ -18,7 +18,7 @@ smoke_test_() ->
                 fun boolean_and_date_storage/0},
             {"a boolean filter matches by 1/0 or true/false", fun boolean_filters/0},
             {"a date or datetime filter matches the stored text", fun date_filters/0},
-            {"the 1.1 boolean repair turns stored 'true'/'false' into 1/0",
+            {"the 1.2 boolean repair turns stored 'true'/'false' into 1/0",
                 fun boolean_text_repair/0}
         ]
     end}.
@@ -274,7 +274,7 @@ date_filters() ->
     ],
     [?assertEqual({C, Ids}, {C, flag_ids(C)}) || {C, Ids} <- Cases].
 
-%% kura_sqlite 1.1 bound true and false as the text 'true' and 'false', which
+%% kura_sqlite 1.2 and earlier bound true and false as the text 'true' and 'false', which
 %% an INTEGER column keeps as TEXT. This runs the README's repair as written,
 %% with its table and column renamed.
 boolean_text_repair() ->
@@ -300,7 +300,7 @@ boolean_text_repair() ->
 
 readme_boolean_repair(Table, Column) ->
     {ok, Readme} = file:read_file(filename:join([filename:dirname(?FILE), "..", "README.md"])),
-    [_, Upgrade] = binary:split(Readme, ~"## Upgrading from 1.1"),
+    [_, Upgrade] = binary:split(Readme, ~"## Upgrading from 1.2"),
     [_, AfterFence] = binary:split(Upgrade, ~"```sql\n"),
     [Block, _] = binary:split(AfterFence, ~"```"),
     {Start, _} = binary:match(Block, ~"UPDATE \"posts\""),
