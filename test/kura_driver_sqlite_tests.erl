@@ -205,6 +205,11 @@ nested_tests() ->
             end}
         end,
         fun(Pool) ->
+            {"a transaction that ended leaves no note in the process", fun() ->
+                transaction_leaves_no_note(Pool)
+            end}
+        end,
+        fun(Pool) ->
             {"query_on/4: a COMMIT inside a transaction it started raises", fun() ->
                 query_on_commit_inside_raises(Pool)
             end}
@@ -217,6 +222,11 @@ nested_tests() ->
         fun(Pool) ->
             {"query_on/4: starts forgets an earlier end on the connection", fun() ->
                 query_on_starts_forgets_the_end(Pool)
+            end}
+        end,
+        fun(Pool) ->
+            {"query_on/4: a transaction after an end it noted runs", fun() ->
+                query_on_end_then_transaction_runs(Pool)
             end}
         end,
         fun(Pool) ->
@@ -419,6 +429,17 @@ transaction_after_caught_end_runs({Pool, _}) ->
     ?assertEqual(ok, transaction(Pool, fun() -> insert(Pool, 1) end)),
     ?assertEqual([1], ids(Pool)).
 
+%% The note would keep the connection's handle alive in this process.
+transaction_leaves_no_note({Pool, _}) ->
+    ?assertError(
+        ?ENDED,
+        transaction(Pool, fun() ->
+            ?assertError(?ENDED, sql(Pool, ~"COMMIT")),
+            done
+        end)
+    ),
+    ?assertEqual([], [Key || {{kura_driver_sqlite, ended, _} = Key, _} <- get()]).
+
 query_on_commit_inside_raises({Pool, _}) ->
     on_checked_out(Pool, fun(Conn) ->
         #{} = on(Conn, ~"BEGIN", [], starts),
@@ -449,6 +470,15 @@ query_on_starts_forgets_the_end({Pool, _}) ->
         #{} = on(Conn, ~"ROLLBACK", [], none)
     end),
     ?assertEqual([], ids(Pool)).
+
+%% Every checkout lands on one connection when the pool has one.
+query_on_end_then_transaction_runs({Pool, _}) ->
+    on_checked_out(Pool, fun(Conn) ->
+        #{} = on(Conn, ~"BEGIN", [], starts),
+        ?assertError(?ENDED, on(Conn, ~"COMMIT", [], inside))
+    end),
+    ?assertEqual(ok, transaction(Pool, fun() -> insert(Pool, 1) end)),
+    ?assertEqual([1], ids(Pool)).
 
 query_on_without_option_commits({Pool, _}) ->
     on_checked_out(Pool, fun(Conn) ->

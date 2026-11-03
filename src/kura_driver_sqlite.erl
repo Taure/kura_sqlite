@@ -244,6 +244,8 @@ transaction(PoolMod, Pool, Fun, _Opts) ->
 outermost(Pool, Conn, Fun) ->
     case esqlite3:exec(Conn, ~"BEGIN") of
         ok ->
+            %% A sandboxed statement in this process may have noted an end.
+            _ = erlang:erase({?MODULE, ended, Conn}),
             _ = erlang:put({kura_sqlite_tx_conn, Pool}, Conn),
             try Fun() of
                 Result -> committed(Conn, Result)
