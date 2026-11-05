@@ -474,6 +474,7 @@ checkin_of_a_closed_connection_replaces_it_test() ->
 reset_that_raises_is_logged_test() ->
     Name = pool_for_raising_reset,
     {ok, _} = kura_pool_sqlite:start_pool(Name, #{database => ~":memory:", pool_size => 1}),
+    _ = logger:remove_handler(Name),
     ok = logger:add_handler(Name, ?MODULE, #{config => #{test => self()}}),
     try
         {ok, Conn, Token} = kura_pool_sqlite:checkout(Name, #{}),
@@ -839,6 +840,7 @@ connection_that_could_not_be_replaced_is_opened_on_checkout_test() ->
     {ok, _} = kura_pool_sqlite:start_pool(Name, #{
         database => filename:join(Dir, "db"), pool_size => 1
     }),
+    _ = logger:remove_handler(Name),
     ok = logger:add_handler(Name, ?MODULE, #{config => #{test => self()}}),
     try
         ok = file:del_dir_r(Dir),
@@ -1209,6 +1211,7 @@ string_path_holding_a_wide_character_is_refused_before_esqlite_test() ->
 
 unreadable_file_is_refused_before_esqlite_test() ->
     Path = db_path(pool_for_unreadable),
+    _ = file:delete(Path),
     ok = file:write_file(Path, ~""),
     try
         ok = file:change_mode(Path, 8#000),
@@ -1222,6 +1225,7 @@ unreadable_file_is_refused_before_esqlite_test() ->
 
 read_only_file_is_opened_test() ->
     Path = db_path(pool_for_read_only),
+    _ = file:delete(Path),
     ok = file:write_file(Path, ~""),
     try
         ok = file:change_mode(Path, 8#444),
