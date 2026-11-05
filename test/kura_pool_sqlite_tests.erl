@@ -1200,9 +1200,14 @@ dangling_symlink_is_refused_before_esqlite_test() ->
 
 path_holding_a_nul_is_refused_before_esqlite_test() ->
     Path = db_path(pool_for_nul),
-    ?assertEqual({error, invalid_filename}, opened_with(<<Path/binary, 0>>)),
-    ?assertEqual({error, invalid_filename}, opened_with(binary_to_list(Path) ++ [0])),
-    ?assertNot(filelib:is_file(Path)).
+    _ = file:delete(Path),
+    try
+        ?assertEqual({error, invalid_filename}, opened_with(<<Path/binary, 0>>)),
+        ?assertEqual({error, invalid_filename}, opened_with(binary_to_list(Path) ++ [0])),
+        ?assertNot(filelib:is_file(Path))
+    after
+        file:delete(Path)
+    end.
 
 string_path_holding_a_wide_character_is_refused_before_esqlite_test() ->
     ?assertEqual(
@@ -1595,15 +1600,22 @@ changed_settings() ->
 
 with_file_pool(Name, Test) ->
     Path = db_path(Name),
-    _ = file:delete(Path),
+    ok = delete_database(Path),
     {ok, _} = kura_pool_sqlite:start_pool(Name, #{database => Path, pool_size => 1}),
     try
         #{} = sql(Name, ~"CREATE TABLE t (id INTEGER)"),
         Test(Name)
     after
         kura_pool_sqlite:stop_pool(Name),
-        file:delete(Path)
+        delete_database(Path)
     end.
+
+delete_database(Path) ->
+    _ = [
+        file:delete(<<Path/binary, Suffix/binary>>)
+     || Suffix <- [~"", ~"-wal", ~"-shm", ~"-journal"]
+    ],
+    ok.
 
 planted(Name, Statements) ->
     kura_driver_sqlite:transaction(
