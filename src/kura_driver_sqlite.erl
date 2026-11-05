@@ -9,8 +9,11 @@ in use.
 ## Result shape
 
 Returns `#{rows := Rows, num_rows := N, command := C}`, the shape the
-other kura drivers return. `Rows` are maps keyed by atom column names,
-and a NULL column value is `null`, as kura expects of every driver.
+other kura drivers return. `Rows` are maps keyed by column name, and a
+NULL column value is `null`, as kura expects of every driver. A column
+name that is already an atom, such as a schema field or an alias the
+calling code matches on, is the atom; any other name stays a binary, so
+a query can never grow the atom table.
 `command` is one of `select | insert | update | delete | other`, read
 from the statement's leading keyword, `REPLACE` counting as `insert`.
 After a leading `WITH` it is read from the keyword that follows the
@@ -153,7 +156,7 @@ the workload. esqlite sets 2 seconds by default.
 
 -type words() :: {binary(), binary()}.
 -type command() :: select | insert | update | delete | other.
--type result() :: #{rows := [#{atom() => term()}], _ => _} | {error, term()}.
+-type result() :: #{rows := [#{atom() | binary() => term()}], _ => _} | {error, term()}.
 
 -define(IS_INT64(Int), (is_integer(Int) andalso Int >= -(1 bsl 63) andalso Int < 1 bsl 63)).
 -define(IS_INT32(Int), (is_integer(Int) andalso Int >= -(1 bsl 31) andalso Int < 1 bsl 31)).
@@ -559,7 +562,7 @@ tx_conn(Pool) ->
     erlang:get({kura_sqlite_tx_conn, Pool}).
 
 -spec collect_rows(esqlite3:esqlite3_stmt(), [binary()]) ->
-    [#{atom() => term()}] | {error, term()}.
+    [#{atom() | binary() => term()}] | {error, term()}.
 collect_rows(Stmt, ColNames) ->
     case esqlite3:step(Stmt) of
         %% A '$busy' clause would be unreachable to dialyzer: esqlite3_nif's
@@ -579,25 +582,31 @@ collect_rows(Stmt, ColNames) ->
             end
     end.
 
--spec row_to_map([term()], [binary()]) -> #{atom() => term()}.
+-spec row_to_map([term()], [binary()]) -> #{atom() | binary() => term()}.
 row_to_map(Row, ColNames) ->
     row_to_map(Row, ColNames, #{}).
 
--spec row_to_map([term()], [binary()], #{atom() => term()}) -> #{atom() => term()}.
+-spec row_to_map([term()], [binary()], #{atom() | binary() => term()}) ->
+    #{atom() | binary() => term()}.
 row_to_map([], _ColNames, Acc) ->
     Acc;
 row_to_map(_Row, [], Acc) ->
     Acc;
 row_to_map([Cell | RestRow], [Name | RestNames], Acc) ->
-    row_to_map(RestRow, RestNames, Acc#{name_to_atom(Name) => cell(Cell)}).
+    row_to_map(RestRow, RestNames, Acc#{column_key(Name) => cell(Cell)}).
 
 %% kura reads a NULL column as `null`, which esqlite returns as `undefined`.
 -spec cell(term()) -> term().
 cell(undefined) -> null;
 cell(Cell) -> Cell.
 
--spec name_to_atom(binary()) -> atom().
-name_to_atom(N) -> binary_to_atom(N, utf8).
+-spec column_key(binary()) -> atom() | binary().
+column_key(Name) ->
+    try
+        binary_to_existing_atom(Name, utf8)
+    catch
+        error:badarg -> Name
+    end.
 
 -spec command_of(binary()) -> command().
 command_of(~"SELECT") -> select;

@@ -559,6 +559,24 @@ ids(Pool) ->
     #{rows := Rows} = sql(Pool, ~"SELECT id FROM nested ORDER BY id"),
     [Id || #{id := Id} <- Rows].
 
+unknown_column_name_stays_a_binary_test() ->
+    {ok, Conn} = esqlite3:open(":memory:"),
+    try
+        Alias = iolist_to_binary([
+            ~"kura_sqlite_never_an_atom_", integer_to_binary(erlang:unique_integer([positive]))
+        ]),
+        SQL = iolist_to_binary([~"SELECT 1 AS one, 2 AS \"", Alias, ~"\""]),
+        #{rows := [_]} = kura_driver_sqlite:query_on(Conn, ~"SELECT 1 AS one", [], #{}),
+        AtomsBefore = erlang:system_info(atom_count),
+        Result = kura_driver_sqlite:query_on(Conn, SQL, [], #{}),
+        ?assertEqual(AtomsBefore, erlang:system_info(atom_count)),
+        ?assertMatch(#{rows := [#{one := 1}]}, Result),
+        #{rows := [Row]} = Result,
+        ?assertEqual(2, maps:get(Alias, Row))
+    after
+        esqlite3:close(Conn)
+    end.
+
 no_connection_raises_test() ->
     Pool = kura_driver_sqlite_without_connections,
     {ok, _} = kura_pool_sqlite:start_pool(Pool, #{database => ~":memory:", pool_size => 0}),
