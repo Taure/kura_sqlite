@@ -56,8 +56,10 @@ These binaries still bind as TEXT:
   `!=`, `not_in`, `NOT (=)`, `>` and `>=` match every row and `=`, `in`,
   `<` and `<=` match none.
 
-The byte fields of the `from` schema and of every joined schema are
-rewritten, since a where-field is not qualified by its table.
+In a query with joins, kura qualifies a field of the `from` schema with
+the `from` table, so it is rewritten only if it is a byte field of the
+`from` schema. Any other where-field is not qualified, so the byte fields
+of every joined schema are rewritten too.
 
 A byte column `kura_migrator` creates is declared
 `BLOB CHECK (typeof(col) IN ('blob', 'null'))`, so it refuses a TEXT value
@@ -155,6 +157,11 @@ reach SQLite.
 
 -type schema_fields() :: {
     Types :: #{atom() => kura_types:kura_type()}, Blobs :: #{atom() => kura_types:kura_type()}
+}.
+-type where_fields() :: {
+    Types :: #{atom() => kura_types:kura_type()},
+    Blobs :: #{atom() => kura_types:kura_type()},
+    FromTypes :: #{atom() => kura_types:kura_type()}
 }.
 
 %%----------------------------------------------------------------------
@@ -645,19 +652,39 @@ blob_type(_Type) -> false.
 %% A query compiled once is reused with other values, so the cast is written
 %% into the SQL rather than into the parameters.
 -spec blob_query(#kura_query{}) -> #kura_query{}.
-blob_query(#kura_query{from = From, joins = Joins, wheres = Wheres, havings = Havings} = Query) ->
-    Fields = joined_fields([From | [Table || {_Type, Table, _On, _As} <- Joins]]),
+blob_query(#kura_query{wheres = Wheres, havings = Havings} = Query) ->
+    {Fields, Quals} = query_blob_fields(Query),
     Query#kura_query{
-        wheres = blob_conditions(Wheres, Fields),
-        havings = blob_conditions(Havings, Fields),
+        wheres = blob_conditions(Wheres, Fields, Quals),
+        havings = blob_conditions(Havings, Fields, Quals),
         ctes = blob_named(Query#kura_query.ctes),
         combinations = blob_named(Query#kura_query.combinations)
     }.
 
-%% A where-field is not qualified by its table, so the fields of every
-%% joined schema are rewritten too. A name in two of the tables is an
-%% ambiguous column to SQLite; its most restrictive type is kept, so a
-%% plain or deterministic field never hides a randomized one.
+%% After a join kura qualifies a bare field of the `from` schema with the
+%% `from` table (kura_dialect:qualified_columns/1), so such a field is
+%% cast as bytes only if the `from` schema stores it as bytes, and its cast
+%% is qualified the same way. Any other where-field is not qualified, so
+%% the byte fields of every joined schema are rewritten too. The types
+%% checked for encryption are merged over every table, keeping the most
+%% restrictive, so a plain or deterministic field never hides a randomized
+%% one. A lookup on a qualified field must also be deterministic in the
+%% `from` schema itself, since that is the column it is compared with.
+-spec query_blob_fields(#kura_query{}) -> {where_fields(), #{atom() => binary()}}.
+query_blob_fields(#kura_query{from = From, joins = Joins} = Query) ->
+    {Types, AllBlobs} = joined_fields([From | [Table || {_Type, Table, _On, _As} <- Joins]]),
+    case kura_dialect:qualified_columns(Query) of
+        undefined ->
+            {{Types, AllBlobs, Types}, #{}};
+        {Table, FromFields} ->
+            Qualified = maps:keys(FromFields),
+            Blobs = maps:merge(
+                maps:without(Qualified, AllBlobs), maps:with(Qualified, blob_fields(From))
+            ),
+            FromTypes = maps:merge(Types, FromFields),
+            {{Types, Blobs, FromTypes}, maps:from_keys(Qualified, quote(Table))}
+    end.
+
 -spec joined_fields([term()]) -> schema_fields().
 joined_fields([]) ->
     {#{}, #{}};
@@ -693,32 +720,37 @@ blob_named(Queries) ->
 blob_subquery(#kura_query{} = Query) -> blob_query(Query);
 blob_subquery(Other) -> Other.
 
--spec blob_conditions([term()], schema_fields()) -> [term()].
-blob_conditions(Conditions, Fields) ->
-    [blob_condition(Condition, Fields) || Condition <- Conditions].
+-spec blob_conditions([term()], where_fields(), #{atom() => binary()}) -> [term()].
+blob_conditions(Conditions, Fields, Quals) ->
+    [blob_condition(Condition, Fields, Quals) || Condition <- Conditions].
 
--spec blob_condition(term(), schema_fields()) -> term().
-blob_condition({Op, Conditions}, Fields) when
+-spec blob_condition(term(), where_fields(), #{atom() => binary()}) -> term().
+blob_condition({Op, Conditions}, Fields, Quals) when
     (Op =:= 'and' orelse Op =:= 'or'), is_list(Conditions)
 ->
-    {Op, blob_conditions(Conditions, Fields)};
-blob_condition({fragment, _SQL, _Params} = Condition, _Fields) ->
+    {Op, blob_conditions(Conditions, Fields, Quals)};
+blob_condition({fragment, _SQL, _Params} = Condition, _Fields, _Quals) ->
     Condition;
-blob_condition({'not', Condition}, Fields) ->
-    {'not', blob_condition(Condition, Fields)};
-blob_condition({Exists, {subquery, Sub}}, _Fields) when Exists =:= exists; Exists =:= not_exists ->
+blob_condition({'not', Condition}, Fields, Quals) ->
+    {'not', blob_condition(Condition, Fields, Quals)};
+blob_condition({Exists, {subquery, Sub}}, _Fields, _Quals) when
+    Exists =:= exists; Exists =:= not_exists
+->
     {Exists, {subquery, blob_subquery(Sub)}};
-blob_condition({Field, Op, Frames}, {Types, Blobs}) when
+blob_condition({Field, Op, Frames}, {Types, Blobs, FromTypes}, Quals) when
     is_atom(Field), ?IS_LOOKUP_OP(Op), is_list(Frames)
 ->
-    case deterministic_field(Field, Types) of
-        true -> cast_condition({Field, lookup_in(Op), Frames}, Blobs);
+    case
+        deterministic_field(Field, Types) andalso deterministic_field(Field, FromTypes) andalso
+            is_map_key(Field, Blobs)
+    of
+        true -> cast_condition({Field, lookup_in(Op), Frames}, Blobs, Quals);
         false -> error({kura_sqlite, {unsupported_blob_condition, Field, Op}})
     end;
-blob_condition(Condition, {Types, Blobs}) ->
+blob_condition(Condition, {Types, Blobs, _FromTypes}, Quals) ->
     case [Field || Field <- compared_fields(Condition), is_encrypted(Field, Types)] of
         [Field | _] -> error({kura_sqlite, {encrypted_field_in_where, Field}});
-        [] -> cast_condition(Condition, Blobs)
+        [] -> cast_condition(Condition, Blobs, Quals)
     end.
 
 %% Only a deterministic field is looked up: on any other field the frames
@@ -755,21 +787,23 @@ is_encrypted(Field, Types) ->
         #{} -> false
     end.
 
--spec cast_condition(term(), #{atom() => kura_types:kura_type()}) -> term().
-cast_condition({Field, in, {subquery, Sub}}, _Blobs) ->
+-spec cast_condition(term(), #{atom() => kura_types:kura_type()}, #{atom() => binary()}) ->
+    term().
+cast_condition({Field, in, {subquery, Sub}}, _Blobs, _Quals) ->
     {Field, in, {subquery, blob_subquery(Sub)}};
-cast_condition({Field, Op, Value}, Blobs) when
+cast_condition({Field, Op, Value}, Blobs, Quals) when
     is_atom(Field), ?IS_COMPARISON(Op), is_map_key(Field, Blobs)
 ->
-    {fragment, <<(ident(Field))/binary, " ", (atom_to_binary(Op))/binary, " ", ?CAST/binary>>, [
-        Value
-    ]};
-cast_condition({Field, In, [_ | _] = Values}, Blobs) when
+    {fragment,
+        <<(ident(Field, Quals))/binary, " ", (atom_to_binary(Op))/binary, " ", ?CAST/binary>>, [
+            Value
+        ]};
+cast_condition({Field, In, [_ | _] = Values}, Blobs, Quals) when
     is_atom(Field), (In =:= in orelse In =:= not_in), is_map_key(Field, Blobs)
 ->
     Casts = comma([?CAST || _ <- Values]),
-    {fragment, <<(ident(Field))/binary, (in_sql(In))/binary, Casts/binary, ")">>, Values};
-cast_condition({[_ | _] = Fields, in, [_ | _] = Rows} = Condition, Blobs) ->
+    {fragment, <<(ident(Field, Quals))/binary, (in_sql(In))/binary, Casts/binary, ")">>, Values};
+cast_condition({[_ | _] = Fields, in, [_ | _] = Rows} = Condition, Blobs, Quals) ->
     Arity = length(Fields),
     Atoms = [Field || Field <- Fields, is_atom(Field)],
     Values = [tuple_to_list(Row) || Row <- Rows, is_tuple(Row), tuple_size(Row) =:= Arity],
@@ -777,38 +811,40 @@ cast_condition({[_ | _] = Fields, in, [_ | _] = Rows} = Condition, Blobs) ->
         length(Atoms) =:= Arity andalso length(Values) =:= length(Rows) andalso
             lists:any(fun(Field) -> is_map_key(Field, Blobs) end, Atoms)
     of
-        true -> row_fragment(Atoms, Values, Blobs);
+        true -> row_fragment(Atoms, Values, Blobs, Quals);
         false -> Condition
     end;
-cast_condition({Field, between, {Low, High}}, Blobs) when
+cast_condition({Field, between, {Low, High}}, Blobs, Quals) when
     is_atom(Field), is_map_key(Field, Blobs)
 ->
-    {fragment, <<(ident(Field))/binary, " BETWEEN ", ?CAST/binary, " AND ", ?CAST/binary>>, [
-        Low, High
-    ]};
-cast_condition({Field, Value}, Blobs) when
+    {fragment, <<(ident(Field, Quals))/binary, " BETWEEN ", ?CAST/binary, " AND ", ?CAST/binary>>, [
+            Low, High
+        ]};
+cast_condition({Field, Value}, Blobs, Quals) when
     is_atom(Field), not ?IS_UNARY_OP(Value), is_map_key(Field, Blobs)
 ->
-    cast_condition({Field, '=', Value}, Blobs);
-cast_condition({Field, Op, _Value} = Condition, Blobs) when
+    cast_condition({Field, '=', Value}, Blobs, Quals);
+cast_condition({Field, Op, _Value} = Condition, Blobs, _Quals) when
     is_atom(Field), (Op =:= like orelse Op =:= ilike), is_map_key(Field, Blobs)
 ->
     Condition;
-cast_condition({Field, In, []} = Condition, Blobs) when
+cast_condition({Field, In, []} = Condition, Blobs, _Quals) when
     is_atom(Field), (In =:= in orelse In =:= not_in), is_map_key(Field, Blobs)
 ->
     Condition;
-cast_condition({Field, Op, _Value}, Blobs) when is_atom(Field), is_map_key(Field, Blobs) ->
+cast_condition({Field, Op, _Value}, Blobs, _Quals) when is_atom(Field), is_map_key(Field, Blobs) ->
     error({kura_sqlite, {unsupported_blob_condition, Field, Op}});
-cast_condition(Condition, _Blobs) ->
+cast_condition(Condition, _Blobs, _Quals) ->
     Condition.
 
--spec row_fragment([atom()], [[term()]], #{atom() => kura_types:kura_type()}) ->
+-spec row_fragment(
+    [atom()], [[term()]], #{atom() => kura_types:kura_type()}, #{atom() => binary()}
+) ->
     {fragment, binary(), [term()]}.
-row_fragment(Fields, Values, Blobs) ->
+row_fragment(Fields, Values, Blobs, Quals) ->
     Row = <<"(", (comma([placeholder(Field, Blobs) || Field <- Fields]))/binary, ")">>,
     Rows = comma([Row || _ <- Values]),
-    Columns = comma([ident(Field) || Field <- Fields]),
+    Columns = comma([ident(Field, Quals) || Field <- Fields]),
     {fragment, <<"(", Columns/binary, ") IN (", Rows/binary, ")">>, lists:append(Values)}.
 
 -spec placeholder(atom(), #{atom() => kura_types:kura_type()}) -> binary().
@@ -828,9 +864,17 @@ comma([]) -> <<>>;
 comma([Part]) -> Part;
 comma([Part | Rest]) -> <<Part/binary, ", ", (comma(Rest))/binary>>.
 
--spec ident(atom()) -> binary().
-ident(Field) ->
-    Escaped = binary:replace(atom_to_binary(Field, utf8), ~"\"", ~"\"\"", [global]),
+-spec ident(atom(), #{atom() => binary()}) -> binary().
+ident(Field, Quals) ->
+    Column = quote(atom_to_binary(Field, utf8)),
+    case Quals of
+        #{Field := Qualifier} -> <<Qualifier/binary, ".", Column/binary>>;
+        #{} -> Column
+    end.
+
+-spec quote(binary()) -> binary().
+quote(Name) ->
+    Escaped = binary:replace(Name, ~"\"", ~"\"\"", [global]),
     <<$", Escaped/binary, $">>.
 
 %%----------------------------------------------------------------------

@@ -139,9 +139,17 @@ the workload. esqlite sets 2 seconds by default.
 
 ## Caveats (phase 2 skeleton)
 
-- Type encoding: pass-through. SQLite has type affinity, so booleans
-  arrive as 0/1 rather than `true`/`false`. Phase 3 normalizes via
-  the kura type system.
+- Type encoding: a parameter is bound by its Erlang shape. `true` and
+  `false` bind as the integers 1 and 0, the way a boolean column stores
+  them, so a filter on a boolean matches whether it is given `true` or
+  `~"1"`. A `{{Y, M, D}, {H, Mi, S}}` datetime binds as the text
+  `YYYY-MM-DD HH:MM:SS`, the form SQLite's `datetime()` and
+  `CURRENT_TIMESTAMP` produce, and a `{Y, M, D}` date whose year is above
+  24 binds as `YYYY-MM-DD`. A three-integer tuple whose first element is
+  24 or less could be a `{H, M, S}` time, so it is refused as
+  `{error, {unsupported_param, N}}`; pass a time as text. Other atoms bind
+  as their name. Results are not normalized: a boolean reads back as 0/1
+  and a date as its text.
 - `query/5` always opens a fresh checkout when not in a transaction;
   there is no per-query optimization yet.
 """.
@@ -160,7 +168,6 @@ the workload. esqlite sets 2 seconds by default.
 
 -define(IS_INT64(Int), (is_integer(Int) andalso Int >= -(1 bsl 63) andalso Int < 1 bsl 63)).
 -define(IS_INT32(Int), (is_integer(Int) andalso Int >= -(1 bsl 31) andalso Int < 1 bsl 31)).
-
 -define(NOTHING_DROPPED, [~"Init", ~"Transaction", ~"JournalMode", ~"Goto", ~"Halt"]).
 
 -define(REFERENCING,
@@ -540,6 +547,8 @@ bound(Stmt, Index, Float) when is_float(Float) ->
     esqlite3:bind_double(Stmt, Index, Float);
 bound(Stmt, Index, Text) when is_binary(Text); is_list(Text) ->
     esqlite3:bind_text(Stmt, Index, Text);
+bound(Stmt, Index, Bool) when is_boolean(Bool) ->
+    esqlite3:bind_int64(Stmt, Index, boolean_int(Bool));
 bound(Stmt, Index, Atom) when is_atom(Atom) ->
     esqlite3:bind_text(Stmt, Index, atom_to_binary(Atom, utf8));
 bound(Stmt, Index, {blob, Bytes}) when is_binary(Bytes); is_list(Bytes) ->
@@ -552,8 +561,56 @@ bound(Stmt, Index, {int64, Int}) when ?IS_INT64(Int) ->
     esqlite3:bind_int64(Stmt, Index, Int);
 bound(Stmt, Index, {float, Float}) when is_float(Float) ->
     esqlite3:bind_double(Stmt, Index, Float);
+bound(Stmt, Index, Tuple) when is_tuple(Tuple) ->
+    case date_param(Tuple) of
+        {ok, Text} -> esqlite3:bind_text(Stmt, Index, Text);
+        error -> {error, {unsupported_param, Index}}
+    end;
 bound(_Stmt, Index, _Param) ->
     {error, {unsupported_param, Index}}.
+
+-spec boolean_int(boolean()) -> 0 | 1.
+boolean_int(true) -> 1;
+boolean_int(false) -> 0.
+
+%% A date tuple is told from a {H, M, S} time by its year, so years up to 24
+%% do not bind as dates. A datetime goes through gregorian seconds, so
+%% 24:00:00 and a leap second are stored as the instant they name, the way
+%% kura's cast reads them.
+-spec date_param(tuple()) -> {ok, binary()} | error.
+date_param({{Y, Mo, D} = Date, {H, Mi, S}}) when
+    is_integer(Y), is_integer(Mo), is_integer(D), is_integer(H), is_integer(Mi), is_integer(S)
+->
+    case Y >= 0 andalso calendar:valid_date(Date) andalso valid_time(H, Mi, S) of
+        true ->
+            Seconds = calendar:date_to_gregorian_days(Date) * 86400 + H * 3600 + Mi * 60 + S,
+            datetime_text(calendar:gregorian_seconds_to_datetime(Seconds));
+        false ->
+            error
+    end;
+date_param({Y, Mo, D} = Date) when is_integer(Y), is_integer(Mo), is_integer(D) ->
+    case Y > 24 andalso Y =< 9999 andalso calendar:valid_date(Date) of
+        true -> {ok, date_text(Date)};
+        false -> error
+    end;
+date_param(_) ->
+    error.
+
+-spec valid_time(integer(), integer(), integer()) -> boolean().
+valid_time(24, 0, 0) ->
+    true;
+valid_time(H, Mi, S) ->
+    H >= 0 andalso H =< 23 andalso Mi >= 0 andalso Mi =< 59 andalso S >= 0 andalso S =< 60.
+
+-spec date_text(calendar:date()) -> binary().
+date_text({Y, M, D}) ->
+    iolist_to_binary(io_lib:format("~4..0B-~2..0B-~2..0B", [Y, M, D])).
+
+-spec datetime_text(calendar:datetime()) -> {ok, binary()} | error.
+datetime_text({{Y, _, _} = Date, {H, Mi, S}}) when Y =< 9999 ->
+    {ok, iolist_to_binary([date_text(Date), io_lib:format(" ~2..0B:~2..0B:~2..0B", [H, Mi, S])])};
+datetime_text(_) ->
+    error.
 
 %% The process dictionary is untyped; what is stored is the connection put
 %% there by the outermost transaction.

@@ -13,7 +13,13 @@ smoke_test_() ->
             {"encrypted value round-trips through a BLOB column", fun encrypted_roundtrip/0},
             {"NULL encrypted value reads back as undefined", fun encrypted_null_reads_undefined/0},
             {"bulk writes report the rows they changed", fun bulk_writes_report_rows_changed/0},
-            {"aggregate over no rows is null", fun aggregate_over_no_rows_is_null/0}
+            {"aggregate over no rows is null", fun aggregate_over_no_rows_is_null/0},
+            {"boolean and date values are stored as SQLite stores them",
+                fun boolean_and_date_storage/0},
+            {"a boolean filter matches by 1/0 or true/false", fun boolean_filters/0},
+            {"a date or datetime filter matches the stored text", fun date_filters/0},
+            {"the 1.2 boolean repair turns stored 'true'/'false' into 1/0",
+                fun boolean_text_repair/0}
         ]
     end}.
 
@@ -204,3 +210,100 @@ aggregate_over_no_rows_is_null() ->
     ?assertEqual({ok, null}, kura_repo_worker:aggregate(?REPO, Vault, {avg, id})),
     ?assertEqual({ok, 0}, kura_repo_worker:aggregate(?REPO, Vault, {sum, id}, 0)),
     ?assertEqual({ok, 0}, kura_repo_worker:count(?REPO, Vault)).
+
+flag_table() ->
+    DDL = kura_migrator:compile_operation(
+        ?REPO,
+        {create_table, ~"flags", [
+            #kura_column{name = id, type = id, primary_key = true, nullable = false},
+            #kura_column{name = active, type = boolean},
+            #kura_column{name = day, type = date},
+            #kura_column{name = at, type = utc_datetime}
+        ]}
+    ),
+    #{} = kura_db:query(?REPO, ~"DROP TABLE IF EXISTS flags", []),
+    #{} = kura_db:query(?REPO, DDL, []),
+    {ok, 2} = kura_repo_worker:insert_all(?REPO, kura_sqlite_flag_schema, [
+        #{active => true, day => {2024, 1, 2}, at => {{2024, 1, 2}, {1, 0, 0}}},
+        #{active => false, day => {2024, 1, 3}, at => {{2024, 1, 3}, {1, 0, 0}}}
+    ]),
+    ok.
+
+flag_ids(Condition) ->
+    Q = kura_query:where(kura_query:from(kura_sqlite_flag_schema), Condition),
+    {ok, Rows} = kura_repo_worker:all(?REPO, kura_query:select(Q, [id])),
+    lists:sort([Id || #{id := Id} <- Rows]).
+
+boolean_and_date_storage() ->
+    ok = flag_table(),
+    ?assertMatch(
+        {ok, [
+            #{active := 1, day := ~"2024-01-02", at := ~"2024-01-02 01:00:00"},
+            #{active := 0, day := ~"2024-01-03", at := ~"2024-01-03 01:00:00"}
+        ]},
+        kura_repo_worker:query(?REPO, ~"SELECT active, day, at FROM flags ORDER BY id", [])
+    ).
+
+boolean_filters() ->
+    ok = flag_table(),
+    Cases = [
+        {{active, true}, [1]},
+        {{active, ~"1"}, [1]},
+        {{active, false}, [2]},
+        {{active, '=', true}, [1]},
+        {{active, '!=', ~"1"}, [2]},
+        {{active, '!=', true}, [2]},
+        {{active, not_in, [~"1"]}, [2]},
+        {{active, not_in, [true]}, [2]},
+        {{active, in, [true]}, [1]},
+        {{'not', {active, ~"1"}}, [2]},
+        {{'not', {active, true}}, [2]}
+    ],
+    [?assertEqual({C, Ids}, {C, flag_ids(C)}) || {C, Ids} <- Cases].
+
+date_filters() ->
+    ok = flag_table(),
+    Cases = [
+        {{day, {2024, 1, 2}}, [1]},
+        {{day, ~"2024-01-02"}, [1]},
+        {{day, '>', {2024, 1, 2}}, [2]},
+        {{day, between, {{2024, 1, 1}, {2024, 1, 3}}}, [1, 2]},
+        {{day, in, [{2024, 1, 3}]}, [2]},
+        {{at, {{2024, 1, 2}, {1, 0, 0}}}, [1]},
+        {{at, '>=', {{2024, 1, 2}, {1, 0, 1}}}, [2]}
+    ],
+    [?assertEqual({C, Ids}, {C, flag_ids(C)}) || {C, Ids} <- Cases].
+
+%% kura_sqlite 1.2 and earlier bound true and false as the text 'true' and 'false', which
+%% an INTEGER column keeps as TEXT. This runs the README's repair as written,
+%% with its table and column renamed.
+boolean_text_repair() ->
+    ok = flag_table(),
+    {ok, _} = kura_repo_worker:query(
+        ?REPO, ~"INSERT INTO flags (id, active) VALUES (3, 'true'), (4, 'false')", []
+    ),
+    ?assertEqual([1], flag_ids({active, true})),
+    {ok, _} = kura_repo_worker:query(?REPO, readme_boolean_repair(~"flags", ~"active"), []),
+    ?assertMatch(
+        {ok, [
+            #{id := 1, active := 1, t := ~"integer"},
+            #{id := 2, active := 0, t := ~"integer"},
+            #{id := 3, active := 1, t := ~"integer"},
+            #{id := 4, active := 0, t := ~"integer"}
+        ]},
+        kura_repo_worker:query(
+            ?REPO, ~"SELECT id, active, typeof(active) AS t FROM flags ORDER BY id", []
+        )
+    ),
+    ?assertEqual([1, 3], flag_ids({active, true})),
+    ?assertEqual([2, 4], flag_ids({active, false})).
+
+readme_boolean_repair(Table, Column) ->
+    {ok, Readme} = file:read_file(filename:join([filename:dirname(?FILE), "..", "README.md"])),
+    [_, Upgrade] = binary:split(Readme, ~"## Upgrading from 1.2"),
+    [_, AfterFence] = binary:split(Upgrade, ~"```sql\n"),
+    [Block, _] = binary:split(AfterFence, ~"```"),
+    {Start, _} = binary:match(Block, ~"UPDATE \"posts\""),
+    [SQL | _] = binary:split(binary:part(Block, Start, byte_size(Block) - Start), ~"\n"),
+    Renamed = binary:replace(SQL, ~"\"posts\"", <<$", Table/binary, $">>, [global]),
+    binary:replace(Renamed, ~"\"published\"", <<$", Column/binary, $">>, [global]).

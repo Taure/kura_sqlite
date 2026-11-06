@@ -219,12 +219,44 @@ where_on_joined_byte_field_casts_placeholder_test_() ->
         {{data, '!=', ~"d"}, <<"\"data\" != CAST(?1 AS BLOB)">>},
         {{data, not_in, [~"d"]}, <<"\"data\" NOT IN (CAST(?1 AS BLOB))">>},
         {{'not', {data, ~"d"}}, <<"NOT (\"data\" = CAST(?1 AS BLOB))">>},
-        {{label, ~"d"}, <<"\"label\" = ?1">>}
+        {{label, ~"d"}, <<"\"owners\".\"label\" = ?1">>}
     ],
     [
         ?_assertEqual({Where, [~"d"]}, where_sql(Joined, Condition))
      || {Condition, Where} <- Cases
     ].
+
+where_on_from_byte_field_under_join_casts_qualified_column_test_() ->
+    Joined = kura_query:join(
+        kura_query:from(kura_sqlite_owner_bytes_schema), inner, ?BLOB_SCHEMA, {owner_id, id}
+    ),
+    Cases = [
+        {{key, ~"k"}, <<"\"owners\".\"key\" = CAST(?1 AS BLOB)">>},
+        {{key, in, [~"k"]}, <<"\"owners\".\"key\" IN (CAST(?1 AS BLOB))">>},
+        {
+            {key, between, {~"k", ~"k"}},
+            <<"\"owners\".\"key\" BETWEEN CAST(?1 AS BLOB) AND CAST(?2 AS BLOB)">>
+        },
+        {
+            {[owner_id, key], in, [{1, ~"k"}]},
+            <<"(\"owners\".\"owner_id\", \"owners\".\"key\") IN ((?1, CAST(?2 AS BLOB)))">>
+        }
+    ],
+    [
+        ?_assertMatch({Where, _}, where_sql(Joined, Condition))
+     || {Condition, Where} <- Cases
+    ].
+
+where_on_from_text_field_that_a_join_stores_as_bytes_is_not_cast_test() ->
+    Joined = kura_query:join(
+        kura_query:from(kura_sqlite_owner_schema),
+        inner,
+        kura_sqlite_label_bytes_schema,
+        {owner_id, id}
+    ),
+    ?assertEqual(
+        {<<"\"owners\".\"label\" = ?1">>, [~"d"]}, where_sql(Joined, {label, ~"d"})
+    ).
 
 where_on_byte_field_of_a_table_joined_by_name_is_untouched_test() ->
     Joined = kura_query:join(
@@ -553,6 +585,29 @@ where_on_joined_encrypted_field_raises_test() ->
     ?assertError(
         {kura_sqlite, {encrypted_field_in_where, secret}},
         unchecked_where_sql(Joined, {secret, ~"pii"})
+    ).
+
+%% A field encrypted in any joined schema is refused, whichever schema is
+%% the from schema, so a plain namesake never hides an encrypted field.
+where_on_encrypted_from_field_with_a_plain_joined_namesake_raises_test() ->
+    Joined = kura_query:join(
+        kura_query:from(kura_sqlite_vault_schema), inner, kura_sqlite_plain_secret_schema, {id, id}
+    ),
+    ?assertError(
+        {kura_sqlite, {encrypted_field_in_where, secret}},
+        unchecked_where_sql(Joined, {secret, ~"pii"})
+    ).
+
+where_on_plain_from_field_with_an_encrypted_joined_namesake_raises_test() ->
+    Joined = kura_query:join(
+        kura_query:from(kura_sqlite_plain_secret_schema), inner, kura_sqlite_vault_schema, {id, id}
+    ),
+    ?assertError(
+        {kura_sqlite, {encrypted_field_in_where, secret}},
+        unchecked_where_sql(Joined, {secret, ~"plain"})
+    ),
+    ?assertError(
+        {kura, {encrypted_field_in_where, secret}}, where_sql(Joined, {secret, ~"plain"})
     ).
 
 where_on_encrypted_field_named_with_a_placeholder_raises_test() ->
@@ -911,12 +966,15 @@ lookup_tests() ->
         [
             lookup_case(
                 where,
-                PlainJoin,
+                hd(plain_secret_joins()),
                 {secret, encrypted_in, [~"f1"]},
                 {secret, encrypted_in},
-                {<<"\"secret\" IN (CAST(?1 AS BLOB))">>, [~"f1"]}
+                {<<"\"lookups\".\"secret\" IN (CAST(?1 AS BLOB))">>, [~"f1"]}
+            ),
+            ?_assertError(
+                {kura_sqlite, {unsupported_blob_condition, secret, encrypted_in}},
+                unchecked_where(lists:last(plain_secret_joins()), {secret, encrypted_in, [~"f1"]})
             )
-         || PlainJoin <- plain_secret_joins()
         ] ++
         lists:append([
             [
@@ -931,10 +989,35 @@ lookup_tests() ->
             ]
          || PlainJoin <- plain_secret_joins()
         ]) ++
+        [
+            ?_assertError(
+                {kura_sqlite, {unsupported_blob_condition, token, Op}},
+                unchecked_where(plain_bytes_join(), {token, Op, [~"f1"]})
+            )
+         || Op <- [encrypted_in, encrypted_not_in]
+        ] ++
+        [
+            ?_assertError(
+                {kura, {encrypted_field_in_where, token}}, where_sql(plain_bytes_join(), Cond)
+            )
+         || Cond <- [{token, ~"t"}, {token, '!=', ~"t"}]
+        ] ++
         [?_test(lookup_matches_stored_frames())].
 
+%% `token` is a plain byte column of the from schema and a deterministic
+%% field of the joined lookup schema. Under the join it names the from
+%% table's column, so a lookup's frames must not be compared with it: `=`
+%% would match nothing and `!=` every row.
+plain_bytes_join() ->
+    kura_query:join(
+        kura_query:from(kura_sqlite_plain_bytes_schema), inner, ?LOOKUP_SCHEMA, {owner_id, id}
+    ).
+
 %% kura_sqlite_plain_secret_schema has a plain `secret` and a randomized
-%% `token`, the lookup schema a deterministic `secret` and `token`.
+%% `token`, the lookup schema a deterministic `secret` and `token`. Under a
+%% join kura qualifies `secret` with the from table, so a lookup on it names
+%% the lookup table's column, or is refused when the from schema's `secret`
+%% is plain.
 plain_secret_joins() ->
     [
         kura_query:join(kura_query:from(?LOOKUP_SCHEMA), inner, ?PLAIN_SCHEMA, {owner_id, id}),

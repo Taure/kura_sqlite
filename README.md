@@ -31,8 +31,8 @@ On application start, Kura resolves the aggregator and auto-populates `dialect`,
 ## Status
 
 Working: schemas, queries, migrations, `INSERT … ON CONFLICT`,
-`RETURNING`, transactions, JSON storage as TEXT, boolean as `0`/`1`
-(transparently round-tripped via `kura_types:cast/2`).
+`RETURNING`, transactions, JSON storage as TEXT, boolean as `0`/`1`,
+dates and datetimes as TEXT.
 
 Not yet: `kura_sandbox` test fixtures, JSONB operators (`->`, `->>`,
 `@>`), arrays.
@@ -49,9 +49,22 @@ to start on this backend via `kura_capabilities:require/2`.
 
 ## Caveats
 
-- **Booleans** encode as INTEGER 0/1 on disk. `kura_types:cast/2`
-  transparently decodes them back to `true`/`false` on read, so user
-  code is unaffected.
+- **Booleans** are written and filtered as INTEGER 0/1: `true` and
+  `false` bind as 1 and 0, and so does a `~"1"`/`~"0"` filter value.
+- **Dates and datetimes** are written and filtered as TEXT: a
+  `{{Y, M, D}, {H, Mi, S}}` datetime binds as `YYYY-MM-DD HH:MM:SS` (the
+  form of SQLite's `datetime()` and `CURRENT_TIMESTAMP`) and a `{Y, M, D}`
+  date whose year is above 24 as `YYYY-MM-DD`. A smaller three-integer
+  tuple could be an `{H, M, S}` time and is refused; pass a time as text.
+  A binary datetime filter value is compared as text, so it matches only
+  a row stored in the same form (`~"2024-01-02 01:00:00"`, not
+  `~"2024-01-02T01:00:00Z"`). A day the month does not have
+  (`{2024, 2, 30}`), a minute over 59 or a second over 60 is refused; a
+  datetime at `24:00:00` or on a leap second is stored as the next day
+  or minute, as kura's cast reads it.
+- **Reads return raw values.** A boolean reads back as 1/0 and a date or
+  datetime as its text; they are not converted to `true`/`false` or
+  tuples yet. Normalising them on read is planned.
 - **JSON** values store as TEXT. JSONB operators (`->`, `->>`, `@>`)
   are not available; use Erlang map operations after decoding.
 - **Arrays** are unsupported.
@@ -151,6 +164,20 @@ to start on this backend via `kura_capabilities:require/2`.
 - **In-memory** (`<<":memory:">>`) is per-connection. Use `pool_size: 1`
   if multiple checkouts must observe the same data, a shared-cache URI
   such as `<<"file:my_db?mode=memory&cache=shared">>`, or a file path.
+
+## Upgrading from 1.2
+
+- **Booleans** bind as 1/0. 1.2 and earlier bound `true`/`false` as the text
+  `'true'`/`'false'`, which an INTEGER column keeps as TEXT, so a filter
+  on such a column misses the rows they wrote. Repair each boolean column
+  once:
+
+  ```sql
+  UPDATE "posts" SET "published" = ("published" = 'true') WHERE typeof("published") = 'text';
+  ```
+
+- **Dates and datetimes** can now be written and filtered; 1.2 refused
+  a date or datetime tuple with `{error, {unsupported_param, N}}`.
 
 ## Upgrading from 0.5
 
