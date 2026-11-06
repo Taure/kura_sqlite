@@ -1317,7 +1317,8 @@ path_longer_than_sqlite_resolves_is_refused_before_esqlite_test() ->
 relative_path_is_resolved_from_the_working_directory_test() ->
     with_deep_directory(pool_for_relative_path, fun(Deep) ->
         ok = file:write_file(filename:join(Deep, "db"), ~""),
-        Cwd = original_cwd(),
+        ok = original_cwd(),
+        {ok, Cwd} = file:get_cwd(),
         try
             ok = file:set_cwd(Deep),
             ?assertEqual({error, 14}, opened_with(~"db")),
@@ -1452,13 +1453,11 @@ database_path_that_is_a_directory_is_refused_before_esqlite_test() ->
 original_cwd() ->
     Key = {?MODULE, original_cwd},
     case persistent_term:get(Key, undefined) of
-        Cwd when is_list(Cwd) ->
-            ok = file:set_cwd(Cwd),
-            Cwd;
+        Cwd when is_binary(Cwd) ->
+            file:set_cwd(Cwd);
         undefined ->
             {ok, Cwd} = file:get_cwd(),
-            persistent_term:put(Key, Cwd),
-            Cwd
+            persistent_term:put(Key, unicode:characters_to_binary(Cwd))
     end.
 
 with_deep_directory(Name, Test) ->
