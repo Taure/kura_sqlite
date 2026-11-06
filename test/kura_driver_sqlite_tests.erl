@@ -1112,7 +1112,13 @@ params_bind_by_position_test_() ->
         {[{blob, ~"b"}, ~"t"], {~"blob", ~"b"}, {~"text", ~"t"}},
         {[1, 2.5], {~"integer", 1}, {~"real", 2.5}},
         {["chars", [~"io", "list"]], {~"text", ~"chars"}, {~"text", ~"iolist"}},
-        {[true, false], {~"text", ~"true"}, {~"text", ~"false"}},
+        {[true, false], {~"integer", 1}, {~"integer", 0}},
+        {[atom, {2024, 1, 2}], {~"text", ~"atom"}, {~"text", ~"2024-01-02"}},
+        {
+            [{{2024, 1, 2}, {3, 4, 5}}, {{999, 12, 31}, {24, 0, 0}}],
+            {~"text", ~"2024-01-02 03:04:05"},
+            {~"text", ~"1000-01-01 00:00:00"}
+        },
         {[{text, ~"t"}, {int64, 7}], {~"text", ~"t"}, {~"integer", 7}},
         {[{int, 3}, {float, 1.5}], {~"integer", 3}, {~"real", 1.5}}
     ],
@@ -1148,6 +1154,53 @@ unrecognised_blob_column_is_refused_test() ->
             kura_driver_sqlite:query_on(Conn, <<"CREATE TABLE t (c ", Blob/binary, ")">>, [], #{})
         end)
     ).
+
+%% A {H, M, S} time has the shape of a date, so a three-integer tuple that
+%% could be one is refused rather than bound as a date.
+params_that_may_be_a_time_or_are_out_of_range_are_refused_test_() ->
+    [
+        ?_assertEqual({error, {unsupported_param, 1}}, bound([Param, 1]))
+     || Param <- [
+            {12, 5, 6},
+            {24, 1, 1},
+            {2024, 13, 1},
+            {2024, 1, 0},
+            {10000, 1, 1},
+            {2024, 1, 2.0},
+            {{2024, 1, 2}, {25, 0, 0}},
+            {{2024, 1, 2}, {1, 2, 3.5}},
+            {{2024, 1, 2}, {1, 2, 3, 4}},
+            {2024, 2, 30},
+            {{2024, 2, 30}, {0, 0, 0}},
+            {{2023, 2, 29}, {0, 0, 0}},
+            {{2024, 1, 2}, {1, 60, 0}},
+            {{2024, 1, 2}, {1, 2, 61}},
+            {{2024, 1, 2}, {24, 0, 1}},
+            {{2024, 1, 2}, {-1, 0, 0}},
+            {{2024, 1, 2}, {1, -1, 0}},
+            {{2024, 1, 2}, {1, 2, -1}},
+            {{-1, 1, 1}, {0, 0, 0}},
+            {{9999, 12, 31}, {24, 0, 0}}
+        ]
+    ].
+
+%% Kura's cast reads 24:00:00 as the next day and a leap second as the next
+%% minute, so the driver stores the instant, never the raw clock.
+dates_and_datetimes_at_the_boundaries_bind_test_() ->
+    Cases = [
+        {{25, 1, 1}, ~"0025-01-01"},
+        {{2024, 2, 29}, ~"2024-02-29"},
+        {{9999, 12, 31}, ~"9999-12-31"},
+        {{{2024, 1, 2}, {1, 2, 60}}, ~"2024-01-02 01:03:00"},
+        {{{2024, 12, 31}, {23, 59, 60}}, ~"2025-01-01 00:00:00"},
+        {{{2024, 12, 31}, {24, 0, 0}}, ~"2025-01-01 00:00:00"},
+        {{{0, 1, 1}, {0, 0, 0}}, ~"0000-01-01 00:00:00"},
+        {{{9999, 12, 31}, {23, 59, 59}}, ~"9999-12-31 23:59:59"}
+    ],
+    [
+        ?_assertMatch(#{rows := [#{t1 := ~"text", v1 := Text}]}, bound([Param, 1]))
+     || {Param, Text} <- Cases
+    ].
 
 params_esqlite_cannot_bind_are_refused_test_() ->
     [
