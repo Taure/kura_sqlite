@@ -333,6 +333,8 @@ borrower_killed_during_commit_does_not_pass_on_its_transaction_test() ->
     _ = file:delete(Path),
     {ok, _} = kura_pool_sqlite:start_pool(Name, #{database => Path, pool_size => 1}),
     {ok, Reader} = esqlite3:open(binary_to_list(Path)),
+    {ok, Probe} = esqlite3:open(binary_to_list(Path)),
+    ok = esqlite3:exec(Probe, ~"PRAGMA busy_timeout = 0"),
     try
         #{} = sql(Name, ~"CREATE TABLE t (id INTEGER)"),
         ok = esqlite3:exec(Reader, ~"BEGIN"),
@@ -357,7 +359,7 @@ borrower_killed_during_commit_does_not_pass_on_its_transaction_test() ->
             {committing, Committer} -> Committer ! commit
         after 1000 -> error(never_committed)
         end,
-        ok = wait_in_nif(Committer, {esqlite3_nif, exec, 2}),
+        ok = wait_for_pending_lock(Probe),
         ok = kill(Committer),
         {Conn, Token} = checkout_within(Name, 2000),
         _ = esqlite3:exec(Conn, ~""),
@@ -365,9 +367,30 @@ borrower_killed_during_commit_does_not_pass_on_its_transaction_test() ->
         ?assertEqual([], esqlite3:q(Conn, ~"SELECT id FROM t")),
         ok = kura_pool_sqlite:checkin(Name, Token)
     after
+        _ = esqlite3:close(Probe),
         _ = esqlite3:close(Reader),
         kura_pool_sqlite:stop_pool(Name),
         file:delete(Path)
+    end.
+
+%% A COMMIT waiting out the reader holds the PENDING lock, which refuses new
+%% readers. process_info/2 cannot show this: a process running a dirty NIF
+%% reports the function it was in before the call.
+wait_for_pending_lock(Probe) ->
+    {ok, Read} = esqlite3:prepare(Probe, ~"SELECT count(*) FROM t"),
+    wait_for_pending_lock(Read, 400).
+
+wait_for_pending_lock(_Read, 0) ->
+    error(commit_never_waited);
+wait_for_pending_lock(Read, N) ->
+    case esqlite3:step(Read) of
+        '$busy' ->
+            {error, _Busy} = esqlite3:reset(Read),
+            ok;
+        [_Count] ->
+            ok = esqlite3:reset(Read),
+            timer:sleep(1),
+            wait_for_pending_lock(Read, N - 1)
     end.
 
 pool_answers_while_a_returned_connection_waits_for_its_statement_test() ->
@@ -1200,9 +1223,14 @@ dangling_symlink_is_refused_before_esqlite_test() ->
 
 path_holding_a_nul_is_refused_before_esqlite_test() ->
     Path = db_path(pool_for_nul),
-    ?assertEqual({error, invalid_filename}, opened_with(<<Path/binary, 0>>)),
-    ?assertEqual({error, invalid_filename}, opened_with(binary_to_list(Path) ++ [0])),
-    ?assertNot(filelib:is_file(Path)).
+    _ = file:delete(Path),
+    try
+        ?assertEqual({error, invalid_filename}, opened_with(<<Path/binary, 0>>)),
+        ?assertEqual({error, invalid_filename}, opened_with(binary_to_list(Path) ++ [0])),
+        ?assertNot(filelib:is_file(Path))
+    after
+        file:delete(Path)
+    end.
 
 string_path_holding_a_wide_character_is_refused_before_esqlite_test() ->
     ?assertEqual(
@@ -1289,6 +1317,7 @@ path_longer_than_sqlite_resolves_is_refused_before_esqlite_test() ->
 relative_path_is_resolved_from_the_working_directory_test() ->
     with_deep_directory(pool_for_relative_path, fun(Deep) ->
         ok = file:write_file(filename:join(Deep, "db"), ~""),
+        ok = original_cwd(),
         {ok, Cwd} = file:get_cwd(),
         try
             ok = file:set_cwd(Deep),
@@ -1416,6 +1445,19 @@ database_path_that_is_a_directory_is_refused_before_esqlite_test() ->
     after
         trace:session_destroy(Session),
         file:del_dir_r(Dir)
+    end.
+
+%% A run killed after set_cwd/1 skips its `after` and leaves the VM inside a
+%% directory the next with_deep_directory/2 deletes, so the first run's cwd is
+%% kept for the life of the VM and every run starts from it.
+original_cwd() ->
+    Key = {?MODULE, original_cwd},
+    case persistent_term:get(Key, undefined) of
+        Cwd when is_binary(Cwd) ->
+            file:set_cwd(Cwd);
+        undefined ->
+            {ok, Cwd} = file:get_cwd(),
+            persistent_term:put(Key, unicode:characters_to_binary(Cwd))
     end.
 
 with_deep_directory(Name, Test) ->
@@ -1595,15 +1637,22 @@ changed_settings() ->
 
 with_file_pool(Name, Test) ->
     Path = db_path(Name),
-    _ = file:delete(Path),
+    ok = delete_database(Path),
     {ok, _} = kura_pool_sqlite:start_pool(Name, #{database => Path, pool_size => 1}),
     try
         #{} = sql(Name, ~"CREATE TABLE t (id INTEGER)"),
         Test(Name)
     after
         kura_pool_sqlite:stop_pool(Name),
-        file:delete(Path)
+        delete_database(Path)
     end.
+
+delete_database(Path) ->
+    _ = [
+        file:delete(<<Path/binary, Suffix/binary>>)
+     || Suffix <- [~"", ~"-wal", ~"-shm", ~"-journal"]
+    ],
+    ok.
 
 planted(Name, Statements) ->
     kura_driver_sqlite:transaction(
