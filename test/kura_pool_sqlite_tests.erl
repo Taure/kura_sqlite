@@ -333,6 +333,8 @@ borrower_killed_during_commit_does_not_pass_on_its_transaction_test() ->
     _ = file:delete(Path),
     {ok, _} = kura_pool_sqlite:start_pool(Name, #{database => Path, pool_size => 1}),
     {ok, Reader} = esqlite3:open(binary_to_list(Path)),
+    {ok, Probe} = esqlite3:open(binary_to_list(Path)),
+    ok = esqlite3:exec(Probe, ~"PRAGMA busy_timeout = 0"),
     try
         #{} = sql(Name, ~"CREATE TABLE t (id INTEGER)"),
         ok = esqlite3:exec(Reader, ~"BEGIN"),
@@ -357,7 +359,7 @@ borrower_killed_during_commit_does_not_pass_on_its_transaction_test() ->
             {committing, Committer} -> Committer ! commit
         after 1000 -> error(never_committed)
         end,
-        ok = wait_in_nif(Committer, {esqlite3_nif, exec, 2}),
+        ok = wait_for_pending_lock(Probe),
         ok = kill(Committer),
         {Conn, Token} = checkout_within(Name, 2000),
         _ = esqlite3:exec(Conn, ~""),
@@ -365,9 +367,30 @@ borrower_killed_during_commit_does_not_pass_on_its_transaction_test() ->
         ?assertEqual([], esqlite3:q(Conn, ~"SELECT id FROM t")),
         ok = kura_pool_sqlite:checkin(Name, Token)
     after
+        _ = esqlite3:close(Probe),
         _ = esqlite3:close(Reader),
         kura_pool_sqlite:stop_pool(Name),
         file:delete(Path)
+    end.
+
+%% A COMMIT waiting out the reader holds the PENDING lock, which refuses new
+%% readers. process_info/2 cannot show this: a process running a dirty NIF
+%% reports the function it was in before the call.
+wait_for_pending_lock(Probe) ->
+    {ok, Read} = esqlite3:prepare(Probe, ~"SELECT count(*) FROM t"),
+    wait_for_pending_lock(Read, 400).
+
+wait_for_pending_lock(_Read, 0) ->
+    error(commit_never_waited);
+wait_for_pending_lock(Read, N) ->
+    case esqlite3:step(Read) of
+        '$busy' ->
+            {error, _Busy} = esqlite3:reset(Read),
+            ok;
+        [_Count] ->
+            ok = esqlite3:reset(Read),
+            timer:sleep(1),
+            wait_for_pending_lock(Read, N - 1)
     end.
 
 pool_answers_while_a_returned_connection_waits_for_its_statement_test() ->
