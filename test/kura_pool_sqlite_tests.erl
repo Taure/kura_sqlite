@@ -1317,7 +1317,7 @@ path_longer_than_sqlite_resolves_is_refused_before_esqlite_test() ->
 relative_path_is_resolved_from_the_working_directory_test() ->
     with_deep_directory(pool_for_relative_path, fun(Deep) ->
         ok = file:write_file(filename:join(Deep, "db"), ~""),
-        {ok, Cwd} = file:get_cwd(),
+        Cwd = original_cwd(),
         try
             ok = file:set_cwd(Deep),
             ?assertEqual({error, 14}, opened_with(~"db")),
@@ -1444,6 +1444,21 @@ database_path_that_is_a_directory_is_refused_before_esqlite_test() ->
     after
         trace:session_destroy(Session),
         file:del_dir_r(Dir)
+    end.
+
+%% A run killed after set_cwd/1 skips its `after` and leaves the VM inside a
+%% directory the next with_deep_directory/2 deletes, so the first run's cwd is
+%% kept for the life of the VM and every run starts from it.
+original_cwd() ->
+    Key = {?MODULE, original_cwd},
+    case persistent_term:get(Key, undefined) of
+        undefined ->
+            {ok, Cwd} = file:get_cwd(),
+            persistent_term:put(Key, Cwd),
+            Cwd;
+        Cwd ->
+            ok = file:set_cwd(Cwd),
+            Cwd
     end.
 
 with_deep_directory(Name, Test) ->
