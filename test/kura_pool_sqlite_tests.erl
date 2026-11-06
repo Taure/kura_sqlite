@@ -1452,12 +1452,12 @@ database_path_that_is_a_directory_is_refused_before_esqlite_test() ->
 original_cwd() ->
     Key = {?MODULE, original_cwd},
     case persistent_term:get(Key, undefined) of
+        Cwd when is_list(Cwd) ->
+            ok = file:set_cwd(Cwd),
+            Cwd;
         undefined ->
             {ok, Cwd} = file:get_cwd(),
             persistent_term:put(Key, Cwd),
-            Cwd;
-        Cwd ->
-            ok = file:set_cwd(Cwd),
             Cwd
     end.
 
