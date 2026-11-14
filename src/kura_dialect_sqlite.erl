@@ -33,6 +33,22 @@ does not find `Å`. The backslash is the escape character of `like` and
 `ilike`, as on PostgreSQL, so a pattern built with
 `kura_query:escape_like/1` matches the text it was built from.
 
+## Not supported
+
+Raised as `{kura, {unsupported_capability, Capability, kura_pool_sqlite}}`,
+the error `kura_capabilities:check_query/2` raises, before any SQL is
+emitted:
+
+- `kura_query:lock/2`, as `row_locks`, or
+  `select_for_update_skip_locked` for a `skip_locked` lock. SQLite locks the
+  whole database and has no lock clause.
+- `kura_query:distinct/2` with a list of fields (`DISTINCT ON`), as
+  `distinct_on`.
+- `{Field, matches, Query}`, as `full_text_search`.
+
+`insert_all` with more values than SQLite binds in one statement, 32766,
+raises `{kura, {too_many_parameters, Count, 32766}}`.
+
 An empty `in` list compiles to `1 = 0` and an empty `not_in` list to
 `1 = 1`.
 
@@ -164,6 +180,12 @@ reach SQLite.
 ]).
 
 -define(CAST, ~"CAST(? AS BLOB)").
+%% SQLITE_MAX_VARIABLE_NUMBER of the SQLite esqlite builds. esqlite has no
+%% sqlite3_limit/3 to ask a connection with.
+-define(MAX_BIND_PARAMETERS, 32766).
+%% The error kura_capabilities:check_query/2 raises, for what kura does not
+%% check or checks only from the release after 2.30.
+-define(UNSUPPORTED(Capability), {kura, {unsupported_capability, Capability, kura_pool_sqlite}}).
 %% A text match escapes its value in SQL, so the value is bound untouched.
 %% The patterns hold no `?`: char(63) stands for it, since a kura up to 2.30
 %% reads a `?` inside a literal of a fragment as a placeholder.
@@ -209,13 +231,13 @@ reach SQLite.
 
 -spec to_sql(#kura_query{}) -> {iodata(), [term()]}.
 to_sql(Query) ->
-    ok = refuse_distances(Query),
+    ok = refuse_unsupported(Query),
     {SQL, Params} = kura_dialect_pg:to_sql(blob_query(Query)),
     {swap_placeholders(SQL), Params}.
 
 -spec to_sql_from(#kura_query{}, pos_integer()) -> {iodata(), [term()], pos_integer()}.
 to_sql_from(Query, StartCounter) ->
-    ok = refuse_distances(Query),
+    ok = refuse_unsupported(Query),
     {SQL, Params, NextCounter} = kura_dialect_pg:to_sql_from(blob_query(Query), StartCounter),
     {swap_placeholders(SQL), Params, NextCounter}.
 
@@ -248,29 +270,36 @@ delete(SchemaOrTable, KeyClauses) ->
 
 -spec update_all(#kura_query{}, map()) -> {iodata(), [term()]}.
 update_all(#kura_query{from = From} = Query, SetMap) ->
-    ok = refuse_distances(Query),
+    ok = refuse_unsupported(Query),
     {SQL, Params} = kura_dialect_pg:update_all(blob_query(Query), blob_values(From, SetMap)),
     {swap_placeholders(SQL), Params}.
 
 -spec delete_all(#kura_query{}) -> {iodata(), [term()]}.
 delete_all(Query) ->
-    ok = refuse_distances(Query),
+    ok = refuse_unsupported(Query),
     {SQL, Params} = kura_dialect_pg:delete_all(blob_query(Query)),
     {swap_placeholders(SQL), Params}.
 
 -spec insert_all(atom() | module(), [atom()], [map()]) -> {iodata(), [term()]}.
 insert_all(SchemaOrTable, Fields, Rows) ->
+    ok = check_parameter_count(length(Rows) * length(Fields)),
     {SQL, Params} = kura_dialect_pg:insert_all(
-        SchemaOrTable, Fields, [blob_values(SchemaOrTable, Row) || Row <- Rows]
+        SchemaOrTable, Fields, blob_rows(SchemaOrTable, Rows)
     ),
     {swap_placeholders(SQL), Params}.
 
 -spec insert_all(atom() | module(), [atom()], [map()], map()) -> {iodata(), [term()]}.
 insert_all(SchemaOrTable, Fields, Rows, Opts) ->
+    ok = check_parameter_count(length(Rows) * length(Fields)),
     {SQL, Params} = kura_dialect_pg:insert_all(
-        SchemaOrTable, Fields, [blob_values(SchemaOrTable, Row) || Row <- Rows], Opts
+        SchemaOrTable, Fields, blob_rows(SchemaOrTable, Rows), Opts
     ),
     {swap_placeholders(SQL), Params}.
+
+-spec check_parameter_count(non_neg_integer()) -> ok.
+check_parameter_count(Count) when Count =< ?MAX_BIND_PARAMETERS -> ok;
+check_parameter_count(Count) ->
+    erlang:error({kura, {too_many_parameters, Count, ?MAX_BIND_PARAMETERS}}).
 
 %%----------------------------------------------------------------------
 %% DDL: column type + default value emit
@@ -501,91 +530,107 @@ blob_columns(Schema) ->
     [Field || Field <- kura_schema:non_virtual_fields(Schema), is_map_key(Field, Blobs)].
 
 %%----------------------------------------------------------------------
-%% Vector distance
+%% What SQLite cannot run
 %%----------------------------------------------------------------------
 
-%% kura_dialect_pg would emit pgvector's operators, which SQLite does not
-%% have. Every position it compiles a distance in is checked: a select
-%% expression, an order_by and the left side of a condition, in the query
-%% and in its CTEs, combinations and condition subqueries.
--spec refuse_distances(term()) -> ok.
-refuse_distances(#kura_query{
+%% kura_dialect_pg would emit a row lock clause, DISTINCT ON and pgvector's
+%% operators, none of which SQLite has. A distance is looked for in every
+%% position it is compiled in: a select expression, an order_by and the left
+%% side of a condition. The query's CTEs, combinations and condition
+%% subqueries are checked too.
+-spec refuse_unsupported(term()) -> ok.
+refuse_unsupported(#kura_query{
     select = Select,
     wheres = Wheres,
     havings = Havings,
     order_bys = Orders,
+    lock = Lock,
+    distinct = Distinct,
     ctes = Ctes,
     combinations = Combinations
 }) ->
-    ok = refuse_select_distances(Select),
-    ok = refuse_condition_distances(Wheres),
-    ok = refuse_condition_distances(Havings),
-    ok = refuse_order_distances(Orders),
-    ok = refuse_named_distances(Ctes),
-    refuse_named_distances(Combinations);
-refuse_distances(_Query) ->
+    ok = refuse_lock(Lock),
+    ok = refuse_distinct_on(Distinct),
+    ok = refuse_select(Select),
+    ok = refuse_conditions(Wheres),
+    ok = refuse_conditions(Havings),
+    ok = refuse_orders(Orders),
+    ok = refuse_named(Ctes),
+    refuse_named(Combinations);
+refuse_unsupported(_Query) ->
     ok.
 
--spec refuse_select_distances(term()) -> ok.
-refuse_select_distances({exprs, Exprs}) ->
-    refuse_expr_distances(Exprs);
-refuse_select_distances(_Select) ->
+-spec refuse_select(term()) -> ok.
+refuse_select({exprs, Exprs}) ->
+    refuse_exprs(Exprs);
+refuse_select(_Select) ->
     ok.
 
--spec refuse_expr_distances(term()) -> ok.
-refuse_expr_distances([{_Alias, Expr} | Rest]) ->
+-spec refuse_exprs(term()) -> ok.
+refuse_exprs([{_Alias, Expr} | Rest]) ->
     ok = refuse_distance(Expr),
-    refuse_expr_distances(Rest);
-refuse_expr_distances([_ | Rest]) ->
-    refuse_expr_distances(Rest);
-refuse_expr_distances(_Exprs) ->
+    refuse_exprs(Rest);
+refuse_exprs([_ | Rest]) ->
+    refuse_exprs(Rest);
+refuse_exprs(_Exprs) ->
     ok.
 
--spec refuse_order_distances(term()) -> ok.
-refuse_order_distances([{Expr, _Dir} | Rest]) ->
+-spec refuse_orders(term()) -> ok.
+refuse_orders([{Expr, _Dir} | Rest]) ->
     ok = refuse_distance(Expr),
-    refuse_order_distances(Rest);
-refuse_order_distances([_ | Rest]) ->
-    refuse_order_distances(Rest);
-refuse_order_distances(_Orders) ->
+    refuse_orders(Rest);
+refuse_orders([_ | Rest]) ->
+    refuse_orders(Rest);
+refuse_orders(_Orders) ->
     ok.
 
--spec refuse_condition_distances(term()) -> ok.
-refuse_condition_distances([Condition | Rest]) ->
-    ok = refuse_condition_distance(Condition),
-    refuse_condition_distances(Rest);
-refuse_condition_distances(_Conditions) ->
+-spec refuse_conditions(term()) -> ok.
+refuse_conditions([Condition | Rest]) ->
+    ok = refuse_condition(Condition),
+    refuse_conditions(Rest);
+refuse_conditions(_Conditions) ->
     ok.
 
--spec refuse_condition_distance(term()) -> ok.
-refuse_condition_distance({Op, Conditions}) when Op =:= 'and'; Op =:= 'or' ->
-    refuse_condition_distances(Conditions);
-refuse_condition_distance({'not', Condition}) ->
-    refuse_condition_distance(Condition);
-refuse_condition_distance({Exists, {subquery, Sub}}) when
+-spec refuse_condition(term()) -> ok.
+refuse_condition({Op, Conditions}) when Op =:= 'and'; Op =:= 'or' ->
+    refuse_conditions(Conditions);
+refuse_condition({'not', Condition}) ->
+    refuse_condition(Condition);
+refuse_condition({Exists, {subquery, Sub}}) when
     Exists =:= exists; Exists =:= not_exists
 ->
-    refuse_distances(Sub);
-refuse_condition_distance({Field, in, {subquery, Sub}}) ->
+    refuse_unsupported(Sub);
+refuse_condition({Field, in, {subquery, Sub}}) ->
     ok = refuse_distance(Field),
-    refuse_distances(Sub);
-refuse_condition_distance({Field, _Op, _Value}) ->
+    refuse_unsupported(Sub);
+refuse_condition({Field, _Op, _Value}) ->
     refuse_distance(Field);
-refuse_condition_distance({Field, _Value}) ->
+refuse_condition({Field, _Value}) ->
     refuse_distance(Field);
-refuse_condition_distance(_Condition) ->
+refuse_condition(_Condition) ->
     ok.
 
--spec refuse_named_distances(term()) -> ok.
-refuse_named_distances([{_Name, Query} | Rest]) ->
-    ok = refuse_distances(Query),
-    refuse_named_distances(Rest);
-refuse_named_distances(_Queries) ->
+-spec refuse_named(term()) -> ok.
+refuse_named([{_Name, Query} | Rest]) ->
+    ok = refuse_unsupported(Query),
+    refuse_named(Rest);
+refuse_named(_Queries) ->
     ok.
 
 -spec refuse_distance(term()) -> ok.
 refuse_distance({distance, _Field, _Metric, _Vector}) -> error({unsupported, vector_distance});
 refuse_distance(_Expr) -> ok.
+
+%% SQLite locks the database, never a row. A transaction that has to keep
+%% other writers out takes the write lock with its first write.
+-spec refuse_lock(term()) -> ok.
+refuse_lock(undefined) -> ok;
+refuse_lock({_Strength, skip_locked}) -> error(?UNSUPPORTED(select_for_update_skip_locked));
+refuse_lock(_Lock) -> error(?UNSUPPORTED(row_locks)).
+
+-spec refuse_distinct_on(term()) -> ok.
+refuse_distinct_on(Fields) when is_list(Fields) -> error(?UNSUPPORTED(distinct_on));
+refuse_distinct_on(_Distinct) -> ok.
 
 %%----------------------------------------------------------------------
 %% Byte fields
@@ -593,7 +638,17 @@ refuse_distance(_Expr) -> ok.
 
 -spec blob_values(term(), map()) -> map().
 blob_values(Table, Values) ->
-    {Types, _Blobs} = Fields = schema_fields(Table),
+    typed_values(schema_fields(Table), Values).
+
+%% The table's fields are looked up once for all the rows: for a table that
+%% is not a schema module the lookup is not cached.
+-spec blob_rows(term(), [map()]) -> [map()].
+blob_rows(Table, Rows) ->
+    Fields = schema_fields(Table),
+    [typed_values(Fields, Row) || Row <- Rows].
+
+-spec typed_values(schema_fields(), map()) -> map().
+typed_values({Types, _Blobs} = Fields, Values) ->
     case map_size(Types) of
         0 -> Values;
         _ -> maps:map(fun(Field, Value) -> blob_value(Field, Value, Fields) end, Values)
@@ -904,6 +959,8 @@ cast_condition({Field, Op, Text}, _Blobs, Idents) when is_atom(Field), ?IS_EXACT
 cast_condition({Field, Op, Text}, _Blobs, Idents) when is_atom(Field), ?IS_FOLDED_MATCH(Op) ->
     Pattern = text_pattern(Op, ~"'%'", ?LIKE_TEXT),
     {fragment, <<(ident(Field, Idents))/binary, " LIKE ", Pattern/binary, " ESCAPE '!'">>, [Text]};
+cast_condition({Field, matches, _Query}, _Blobs, _Idents) when is_atom(Field) ->
+    error(?UNSUPPORTED(full_text_search));
 cast_condition(Condition, _Blobs, _Idents) ->
     Condition.
 

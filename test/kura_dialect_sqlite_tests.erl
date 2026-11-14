@@ -1331,3 +1331,69 @@ renamed_column_in_rewritten_conditions_test_() ->
                 [raw, token, ssn], kura_dialect_sqlite:blob_columns(kura_sqlite_orm_secret)
             )
         ].
+
+%%----------------------------------------------------------------------
+%% What SQLite cannot run
+%%----------------------------------------------------------------------
+
+-define(REFUSED(Capability), {kura, {unsupported_capability, Capability, kura_pool_sqlite}}).
+
+unsupported_query_raises_test_() ->
+    Q = kura_query:from(?BLOB_SCHEMA),
+    Locked = Q#kura_query{lock = for_update},
+    Refused = [
+        {row_locks, Locked},
+        {row_locks, Q#kura_query{lock = {for_share, nowait}}},
+        {row_locks, Q#kura_query{lock = {fragment, ~"FOR UPDATE OF vault"}}},
+        {row_locks, Q#kura_query{lock = ~"FOR UPDATE"}},
+        {select_for_update_skip_locked, Q#kura_query{lock = {for_update, skip_locked}}},
+        {distinct_on, kura_query:distinct(Q, [name])},
+        {full_text_search, kura_query:where(Q, {name, matches, ~"n"})},
+        {full_text_search, kura_query:where(Q, {'not', {name, matches, ~"n"}})},
+        {row_locks, kura_query:where(Q, {id, in, {subquery, Locked}})},
+        {row_locks, kura_query:where(Q, {exists, {subquery, Locked}})},
+        {row_locks, kura_query:with_cte(Q, ~"locked", Locked)},
+        {row_locks, kura_query:union(Q, Locked)}
+    ],
+    [
+        ?_assertError(?REFUSED(Capability), kura_dialect_sqlite:to_sql(Query))
+     || {Capability, Query} <- Refused
+    ] ++
+        [
+            ?_assertError(?REFUSED(row_locks), kura_dialect_sqlite:to_sql_from(Locked, 1)),
+            ?_assertError(?REFUSED(row_locks), kura_dialect_sqlite:delete_all(Locked)),
+            ?_assertError(
+                ?REFUSED(row_locks), kura_dialect_sqlite:update_all(Locked, #{name => ~"n"})
+            ),
+            ?_assertMatch({_, []}, kura_dialect_sqlite:to_sql(kura_query:distinct(Q)))
+        ].
+
+%%----------------------------------------------------------------------
+%% Bound values in one statement
+%%----------------------------------------------------------------------
+
+insert_all_parameter_limit_test_() ->
+    Rows = fun(Count) -> [#{id => N, name => ~"n"} || N <- lists:seq(1, Count)] end,
+    Over = {kura, {too_many_parameters, 32768, 32766}},
+    [
+        ?_assertEqual(
+            32766,
+            length(element(2, kura_dialect_sqlite:insert_all(vault, [id, name], Rows(16383))))
+        ),
+        ?_assertEqual(
+            32766,
+            length(
+                element(
+                    2,
+                    kura_dialect_sqlite:insert_all(vault, [id, name], Rows(16383), #{
+                        returning => true
+                    })
+                )
+            )
+        ),
+        ?_assertError(Over, kura_dialect_sqlite:insert_all(vault, [id, name], Rows(16384))),
+        ?_assertError(
+            Over,
+            kura_dialect_sqlite:insert_all(vault, [id, name], Rows(16384), #{returning => true})
+        )
+    ].
