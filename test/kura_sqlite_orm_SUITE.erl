@@ -14,6 +14,7 @@ result it gives on PostgreSQL or is refused before a statement runs.
     insert_writes_a_renamed_column/1,
     arrays_are_refused/1,
     other_scalar_types/1,
+    a_decimal_is_the_number_sqlite_holds/1,
     every_field_type_is_written_and_found/1,
     booleans_and_dates_read_back_as_written/1,
     get_get_by_and_reload/1,
@@ -81,6 +82,7 @@ all() ->
         booleans_and_dates_read_back_as_written,
         arrays_are_refused,
         other_scalar_types,
+        a_decimal_is_the_number_sqlite_holds,
         every_field_type_is_written_and_found,
         get_get_by_and_reload,
         update_stamps_and_keeps_the_rest,
@@ -307,6 +309,34 @@ other_scalar_types(_Config) ->
     ?assertEqual([~"Early"], names(where(kura_query:from(?AUTHOR), {wakes, {7, 30, 0}}))),
     ?assertEqual([~"Early"], names(where(kura_query:from(?AUTHOR), {wakes, '<', {12, 5, 6}}))),
     ?assertEqual([], names(where(kura_query:from(?AUTHOR), {wakes, '>', {12, 5, 6}}))).
+
+%% SQLite has no exact numeric type. A NUMERIC column holds an integer or a
+%% float, so a decimal without a fraction comes back as an integer and one
+%% longer than a float holds comes back rounded, also when written as text.
+a_decimal_is_the_number_sqlite_holds(_Config) ->
+    Read = fun(Name, Balance) ->
+        {ok, #{id := Id}} = insert_author(#{name => Name, balance => Balance}),
+        {ok, #{balance := Held}} = kura_repo_worker:get(?REPO, ?AUTHOR, Id),
+        Held
+    end,
+    ?assertEqual(1.25, Read(~"fraction", 1.25)),
+    ?assertEqual(7, Read(~"integer", 7)),
+    ?assertEqual(2, Read(~"whole float", 2.0)),
+    #{} = kura_db:query(
+        ?REPO,
+        ~"INSERT INTO authors (name, balance) VALUES ('long', '12345678901234567.89')",
+        []
+    ),
+    ?assertMatch(
+        [#{balance := 12345678901234568}],
+        all(where(kura_query:from(?AUTHOR), {name, ~"long"}))
+    ),
+    ?assertMatch(
+        #{rows := [#{kind := ~"integer"}]},
+        kura_db:query(
+            ?REPO, ~"SELECT typeof(balance) AS kind FROM authors WHERE name = 'long'", []
+        )
+    ).
 
 %% One value of every type SQLite stores goes through kura's dump, the
 %% dialect and the driver's bind. Each is read back with a raw query, as

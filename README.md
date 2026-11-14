@@ -76,6 +76,12 @@ refuses a query that needs one with
   a stored 0/1 into `false`/`true` and a stored date, time or datetime into
   its tuple. Text in such a column that is not a date or time stays text. A
   raw `kura_db:query/3`, which has no schema, returns the stored forms.
+- **Decimals** are not exact. A `decimal` column is `NUMERIC`, which holds
+  an integer or a 64-bit float: `1.25` reads back as `1.25`, `2.0` as the
+  integer `2`, and a value of more than 15 significant digits is rounded
+  when it is stored, also when it is written as text
+  (`'12345678901234567.89'` is held as `12345678901234568`). Keep an exact
+  amount in an `integer` field of its smallest unit.
 - **JSON** values store as TEXT. JSONB operators (`->`, `->>`, `@>`)
   are not available; use Erlang map operations after decoding.
 - **Arrays** are unsupported. A migration declaring an `{array, Inner}`
