@@ -40,12 +40,16 @@ Not yet: `kura_sandbox` test fixtures, JSONB operators (`->`, `->>`,
 `kura_pool_sqlite:capabilities/0`:
 
 ```
-[returning, json, partial_indexes, transactions, savepoints, prepared_statements]
+[returning, json, partial_indexes, window_functions, transactions, savepoints,
+ prepared_statements]
 ```
 
-PG-only features (`advisory_locks`, `listen_notify`, `arrays`,
-`jsonb`) are deliberately absent; consumers that require them refuse
-to start on this backend via `kura_capabilities:require/2`.
+PG-only features (`advisory_locks`, `listen_notify`, `arrays`, `jsonb`,
+`select_for_update_skip_locked`, `concurrent_indexes`, `full_text_search`,
+`vector`) are deliberately absent; consumers that require them refuse
+to start on this backend via `kura_capabilities:require/2`, and kura
+refuses a query that needs one with
+`{kura, {unsupported_capability, Capability, kura_pool_sqlite}}`.
 
 ## Caveats
 
@@ -67,7 +71,31 @@ to start on this backend via `kura_capabilities:require/2`.
   tuples yet. Normalising them on read is planned.
 - **JSON** values store as TEXT. JSONB operators (`->`, `->>`, `@>`)
   are not available; use Erlang map operations after decoding.
-- **Arrays** are unsupported.
+- **Arrays** are unsupported. A migration declaring an `{array, Inner}`
+  column, and a write of a list to an array field, raise
+  `{kura_sqlite, {unsupported_type, {array, Inner}}}`.
+- **`like` and `ilike`** both compile to `LIKE ? ESCAPE '\'`. SQLite's
+  `LIKE` ignores the case of ASCII letters, so `like` matches what `ilike`
+  does, and neither folds a letter outside ASCII (`å` does not match `Å`).
+  The backslash escapes `%` and `_`, as on Postgres, so
+  `kura_query:escape_like/1` works.
+- **Literal text matches**: `contains`, `starts_with` and `ends_with`
+  compile to `GLOB` and match case exactly. `icontains`, `istarts_with`
+  and `iends_with` compile to `LIKE` and ignore the case of ASCII letters
+  only.
+- **Row locks**: SQLite locks the whole database, so `kura_query:lock/2`
+  raises `{kura, {unsupported_capability, row_locks, kura_pool_sqlite}}`
+  (`select_for_update_skip_locked` for a `skip_locked` lock).
+  `kura_query:distinct/2` with fields (`DISTINCT ON`) raises the same
+  error with `distinct_on`, and `{Field, matches, Query}` with
+  `full_text_search`.
+- **`insert_all`** binds at most 32766 values in one statement
+  (`SQLITE_MAX_VARIABLE_NUMBER`). More raises
+  `{kura, {too_many_parameters, Count, 32766}}`; split the list.
+- **`kura_stream`** declares a server-side cursor, which SQLite does not
+  have, and returns an error.
+- **Constraint errors** come back as the SQLite result code
+  (`{error, 2067}` for a unique violation), not as a changeset error.
 - **Composite primary and foreign keys** work the same as on Postgres
   (SQLite supports `PRIMARY KEY (a, b)` and row-value `IN`).
 - **Foreign keys** are enforced. The pool turns `PRAGMA foreign_keys` on
