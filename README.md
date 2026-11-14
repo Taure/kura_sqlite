@@ -71,9 +71,10 @@ refuses a query that needs one with
   (`{2024, 2, 30}`), a minute over 59 or a second over 60 is refused; a
   datetime at `24:00:00` or on a leap second is stored as the next day
   or minute, as kura's cast reads it.
-- **Reads return raw values.** A boolean reads back as 1/0 and a date or
-  datetime as its text; they are not converted to `true`/`false` or
-  tuples yet. Normalising them on read is planned.
+- **Reads** through a schema return the values that were written: kura
+  2.31 loads a stored 0/1 as `false`/`true` and a stored date or datetime
+  as its tuple. A raw `kura_db:query/3`, which has no schema, returns the
+  stored forms.
 - **JSON** values store as TEXT. JSONB operators (`->`, `->>`, `@>`)
   are not available; use Erlang map operations after decoding.
 - **Arrays** are unsupported. A migration declaring an `{array, Inner}`
