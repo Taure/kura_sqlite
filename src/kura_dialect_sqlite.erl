@@ -11,11 +11,10 @@ The main wire-protocol difference vs PG is the placeholder syntax: PG
 uses `$N`, SQLite uses `?N`.
 
 This dialect delegates the AST-to-SQL emission to `kura_dialect_pg` and
-post-processes the SQL string to swap `$N` for `?N`. The number of
-placeholders and their positions are unchanged. Edge cases where SQL
-bytes between dialects truly diverge (`JSONB` operators, advisory
-locks, partial-index expressions, etc.) are out of scope for this
-phase 2 skeleton and will be addressed by capability flags in phase 3.
+rewrites each `$N` placeholder of the result to `?N` (see
+`swap_placeholders/1`). The number of placeholders and their positions are
+unchanged. Where the SQL of the two backends diverges, the query node is
+replaced before it reaches `kura_dialect_pg`, or refused.
 
 ## Byte fields
 
@@ -884,23 +883,57 @@ quote(Name) ->
 -doc """
 Rewrite PG's `$N` placeholders to SQLite's `?N` form.
 
-Both backends accept positional and numbered placeholders. SQLite
-specifically: `?NNN` where NNN is a 1-indexed integer. Position-for-
-position swap; counts and ordering preserved.
+`?N` is SQLite's numbered parameter: it takes the `N`th value whatever its
+place in the statement, as `$N` does in PostgreSQL, so a number that is
+repeated or out of order still names the same value. `kura_driver_sqlite`
+binds the values by that number.
 
-Bytes inside string literals are not rewritten; SQLite uses single
-quotes for literals (`SQLITE_DQS=0` excludes double-quoted strings)
-and the kura emitter follows the same convention.
+Only a placeholder is rewritten. A `$` inside a string literal, a quoted
+identifier (`"..."`, `` `...` `` or `[...]`), a `--` or `/* */` comment or an
+identifier (`a$1`), and one not followed by a digit, is text and is left as
+it is.
 """.
 -spec swap_placeholders(iodata()) -> binary().
 swap_placeholders(SQL) ->
-    Bin = iolist_to_binary(SQL),
-    swap(Bin, <<>>).
+    statement_text(iolist_to_binary(SQL), $\s, <<>>).
 
--spec swap(binary(), binary()) -> binary().
-swap(<<>>, Acc) ->
+%% Previous is the byte before the one being read, which tells a
+%% placeholder from the `$` of an identifier.
+-spec statement_text(binary(), byte(), binary()) -> binary().
+statement_text(<<>>, _Previous, Acc) ->
     Acc;
-swap(<<$$, Rest/binary>>, Acc) ->
-    swap(Rest, <<Acc/binary, $?>>);
-swap(<<C, Rest/binary>>, Acc) ->
-    swap(Rest, <<Acc/binary, C>>).
+statement_text(<<$$, Digit, Rest/binary>>, Previous, Acc) when Digit >= $0, Digit =< $9 ->
+    case identifier_byte(Previous) of
+        true -> statement_text(Rest, Digit, <<Acc/binary, $$, Digit>>);
+        false -> statement_text(Rest, Digit, <<Acc/binary, $?, Digit>>)
+    end;
+statement_text(<<Quote, Rest/binary>>, _Previous, Acc) when
+    Quote =:= $'; Quote =:= $"; Quote =:= $`
+->
+    {Quoted, Tail} = quoted(Rest, Quote, <<Quote>>),
+    statement_text(Tail, Quote, <<Acc/binary, Quoted/binary>>);
+statement_text(<<$[, Rest/binary>>, _Previous, Acc) ->
+    {Skipped, Tail} = through(Rest, ~"]"),
+    statement_text(Tail, $], <<Acc/binary, $[, Skipped/binary>>);
+statement_text(<<"--", Rest/binary>>, _Previous, Acc) ->
+    {Skipped, Tail} = through(Rest, ~"\n"),
+    statement_text(Tail, $\n, <<Acc/binary, "--", Skipped/binary>>);
+statement_text(<<"/*", Rest/binary>>, _Previous, Acc) ->
+    {Skipped, Tail} = through(Rest, ~"*/"),
+    statement_text(Tail, $/, <<Acc/binary, "/*", Skipped/binary>>);
+statement_text(<<Byte, Rest/binary>>, _Previous, Acc) ->
+    statement_text(Rest, Byte, <<Acc/binary, Byte>>).
+
+%% Up to and including End. Text that never reaches it runs to the end, and
+%% SQLite refuses the statement, except for a comment, which may end there.
+-spec through(binary(), binary()) -> {binary(), binary()}.
+through(Text, End) ->
+    case binary:split(Text, End) of
+        [Skipped, Tail] -> {<<Skipped/binary, End/binary>>, Tail};
+        [Unterminated] -> {Unterminated, <<>>}
+    end.
+
+-spec identifier_byte(byte()) -> boolean().
+identifier_byte(Byte) ->
+    (Byte >= $a andalso Byte =< $z) orelse (Byte >= $A andalso Byte =< $Z) orelse
+        (Byte >= $0 andalso Byte =< $9) orelse Byte =:= $_ orelse Byte =:= $$ orelse Byte >= 128.

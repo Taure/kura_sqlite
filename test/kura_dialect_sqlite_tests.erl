@@ -22,6 +22,45 @@ swap_double_digit_placeholder_test() ->
         <<"SELECT ?12, ?34">>, kura_dialect_sqlite:swap_placeholders(<<"SELECT $12, $34">>)
     ).
 
+swap_keeps_the_number_of_a_repeated_or_out_of_order_placeholder_test() ->
+    ?assertEqual(
+        <<"SELECT ?2, ?1, ?2 WHERE a = ?10">>,
+        kura_dialect_sqlite:swap_placeholders(<<"SELECT $2, $1, $2 WHERE a = $10">>)
+    ).
+
+swap_leaves_text_that_is_not_a_placeholder_test_() ->
+    Unchanged = [
+        <<"SELECT '$1'">>,
+        <<"SELECT 'it''s $1'">>,
+        <<"SELECT \"a$1\"">>,
+        <<"SELECT \"a\"\"$1\"">>,
+        <<"SELECT `a$1`">>,
+        <<"SELECT [a$1]">>,
+        <<"SELECT 1 -- $1">>,
+        <<"SELECT 1 /* $1 */">>,
+        <<"SELECT 1 /* $1">>,
+        <<"SELECT price$1">>,
+        ~"SELECT _$1, å$1",
+        <<"SELECT $name, $, $$">>,
+        <<"SELECT 'unterminated $1">>,
+        <<"SELECT json_extract(a, '$.b[0]')">>
+    ],
+    [?_assertEqual(SQL, kura_dialect_sqlite:swap_placeholders(SQL)) || SQL <- Unchanged].
+
+swap_rewrites_a_placeholder_next_to_skipped_text_test_() ->
+    Cases = [
+        {<<"SELECT '$1', $1">>, <<"SELECT '$1', ?1">>},
+        {<<"SELECT '$1'$2">>, <<"SELECT '$1'?2">>},
+        {<<"SELECT \"a$1\" = $1">>, <<"SELECT \"a$1\" = ?1">>},
+        {<<"SELECT [a$1]$2">>, <<"SELECT [a$1]?2">>},
+        {<<"SELECT 1 -- $1\n, $2">>, <<"SELECT 1 -- $1\n, ?2">>},
+        {<<"SELECT 1 /* $1 */ + $2">>, <<"SELECT 1 /* $1 */ + ?2">>},
+        {<<"SELECT 1 /* a */ /* $1 */$2">>, <<"SELECT 1 /* a */ /* $1 */?2">>},
+        {<<"SELECT a-$1, ($2), $3||$4">>, <<"SELECT a-?1, (?2), ?3||?4">>},
+        {<<"$1">>, <<"?1">>}
+    ],
+    [?_assertEqual(Out, kura_dialect_sqlite:swap_placeholders(In)) || {In, Out} <- Cases].
+
 %%----------------------------------------------------------------------
 %% column_type/1: SQLite type mapping
 %%----------------------------------------------------------------------
