@@ -46,6 +46,8 @@ result it gives on PostgreSQL or is refused before a statement runs.
     encrypted_fields/1,
     renamed_byte_column/1,
     redacted_values_stay_out_of_telemetry/1,
+    constraint_errors_land_on_their_field/1,
+    constraint_errors_reach_telemetry_without_their_message/1,
     optimistic_locking/1,
     custom_and_absent_timestamps/1,
     attribute_tenant/1,
@@ -67,6 +69,7 @@ result it gives on PostgreSQL or is refused before a statement runs.
 -define(PLAN, kura_sqlite_orm_plan).
 -define(LIST, kura_sqlite_orm_list).
 -define(EVERY, kura_sqlite_orm_every_type).
+-define(MEMBER, kura_sqlite_orm_member).
 -define(SCHEMAS, [?AUTHOR, ?POST, ?TAG, ?SECRET, ?NOTE, ?PLAN, ?EVERY]).
 -define(UNSUPPORTED(Capability), {kura, {unsupported_capability, Capability, kura_pool_sqlite}}).
 -define(TELEMETRY, kura_sqlite_orm_telemetry).
@@ -109,6 +112,8 @@ all() ->
         encrypted_fields,
         renamed_byte_column,
         redacted_values_stay_out_of_telemetry,
+        constraint_errors_land_on_their_field,
+        constraint_errors_reach_telemetry_without_their_message,
         optimistic_locking,
         custom_and_absent_timestamps,
         attribute_tenant,
@@ -1015,6 +1020,155 @@ redacted_values_stay_out_of_telemetry(_Config) ->
         ?assertEqual(nomatch, binary:match(Seen, ~"tok-plain"))
     after
         telemetry:detach(?TELEMETRY)
+    end.
+
+%% SQLite names what a constraint refused in a message alone. The driver
+%% reads it, so kura reports the violation where it does on PostgreSQL.
+constraint_errors_land_on_their_field(_Config) ->
+    with_members(fun() ->
+        {ok, #{id := AuthorId}} = insert_author(#{name => ~"Ada", email => ~"ada@example.com"}),
+        Errors = fun({error, #kura_changeset{valid = false, errors = Errors}}) -> Errors end,
+        Member = fun(Params) -> kura_changeset:cast(?MEMBER, #{}, Params, maps:keys(Params)) end,
+        Insert = fun(Params) -> kura_repo_worker:insert(?REPO, Member(Params)) end,
+        First = #{org_id => 1, handle => ~"ada", slug => ~"a", level => 1, author_id => AuthorId},
+        {ok, #{id := Id}} = Insert(First),
+        {ok, Other} = Insert(#{org_id => 1, handle => ~"bob", slug => ~"b"}),
+
+        ?assertEqual(
+            [{email, ~"has already been taken"}],
+            Errors(insert_author(#{name => ~"Other", email => ~"ada@example.com"}))
+        ),
+        ?assertEqual([{name, ~"can't be blank"}], Errors(insert_author(#{age => 1}))),
+        ?assertEqual(
+            [{id, ~"has already been taken"}],
+            Errors(insert_author(#{id => AuthorId, name => ~"Again"}))
+        ),
+
+        ?assertEqual(
+            [{handle, ~"has already been taken"}],
+            Errors(Insert(#{org_id => 2, handle => ~"ada", slug => ~"c"}))
+        ),
+        ?assertEqual(
+            [{handle, ~"is in use"}],
+            Errors(
+                kura_repo_worker:insert(
+                    ?REPO,
+                    kura_changeset:unique_constraint(
+                        Member(#{org_id => 2, handle => ~"ada"}),
+                        handle,
+                        #{name => ~"team members_user handle_index", message => ~"is in use"}
+                    )
+                )
+            )
+        ),
+        ?assertEqual(
+            [{handle, ~"has already been taken"}],
+            Errors(
+                kura_repo_worker:update(
+                    ?REPO, kura_changeset:cast(?MEMBER, Other, #{handle => ~"ada"}, [handle])
+                )
+            )
+        ),
+        ?assertEqual(
+            [{handle, ~"can't be blank"}], Errors(Insert(#{org_id => 2, slug => ~"c"}))
+        ),
+        ?assertEqual(
+            [{id, ~"has already been taken"}],
+            Errors(Insert(#{id => Id, org_id => 2, handle => ~"cy"}))
+        ),
+        ?assertEqual(
+            [{org_id, ~"has already been taken"}],
+            Errors(Insert(#{org_id => 1, handle => ~"cy", slug => ~"a"}))
+        ),
+        ?assertEqual(
+            [{base, ~"has already been taken"}],
+            Errors(Insert(#{org_id => 1, handle => ~"cy", level => 1}))
+        ),
+        ?assertEqual(
+            [{base, ~"is invalid"}], Errors(Insert(#{org_id => 2, handle => ~"cy", level => 0}))
+        ),
+        ?assertEqual(
+            [{level, ~"must be positive"}],
+            Errors(
+                kura_repo_worker:insert(
+                    ?REPO,
+                    kura_changeset:check_constraint(
+                        Member(#{org_id => 2, handle => ~"cy", level => 0}),
+                        ~"level_is_positive",
+                        level,
+                        #{message => ~"must be positive"}
+                    )
+                )
+            )
+        ),
+        ?assertEqual(
+            [{base, ~"FOREIGN KEY constraint failed"}],
+            Errors(Insert(#{org_id => 2, handle => ~"cy", author_id => AuthorId + 1}))
+        ),
+        ?assertEqual(
+            {ok, 2}, kura_repo_worker:count(?REPO, kura_query:from(?MEMBER))
+        )
+    end).
+
+%% The message and the SQLite code stay with the caller: telemetry gets the
+%% code and the names, as it does for a PostgreSQL error.
+constraint_errors_reach_telemetry_without_their_message(_Config) ->
+    {ok, _} = insert_author(#{name => ~"Ada", email => ~"ada@example.com"}),
+    Collector = self(),
+    ok = telemetry:attach(
+        ?TELEMETRY,
+        [kura, repo, query],
+        fun(_Event, _Measurements, Metadata, _Handler) -> Collector ! {query, Metadata} end,
+        undefined
+    ),
+    try
+        {error, _} = insert_author(#{name => ~"Other", email => ~"ada@example.com"}),
+        ?assertMatch(
+            {error,
+                {pgsql_error, #{
+                    code := ~"23505",
+                    message := ~"UNIQUE constraint failed: authors.email_address",
+                    sqlite_code := 2067
+                }}},
+            kura_db:query(
+                ?REPO, ~"INSERT INTO authors (name, email_address) VALUES ('x', ?1)", [
+                    ~"ada@example.com"
+                ]
+            )
+        ),
+        Reported = #{
+            code => ~"23505", table => ~"authors", constraint => ~"authors_email_address_index"
+        },
+        ?assertEqual(
+            [{pgsql_error, Reported}, {pgsql_error, Reported}],
+            [Reason || #{result := error, error_reason := Reason} <- queries()]
+        )
+    after
+        telemetry:detach(?TELEMETRY)
+    end.
+
+with_members(Test) ->
+    #{} = kura_db:query(
+        ?REPO,
+        ~"""
+        CREATE TABLE "team members" (
+            id INTEGER PRIMARY KEY,
+            org_id INTEGER,
+            "user handle" TEXT NOT NULL,
+            slug TEXT,
+            level INTEGER CONSTRAINT level_is_positive CHECK (level > 0),
+            author_id INTEGER REFERENCES authors (id)
+        )
+        """,
+        []
+    ),
+    try
+        run_operation({create_index, ~"team members", ['user handle'], #{unique => true}}),
+        run_operation({create_index, ~"team members", [org_id, slug], #{unique => true}}),
+        run_operation({create_index, ~"team members", [org_id, level], #{unique => true}}),
+        Test()
+    after
+        #{} = kura_db:query(?REPO, ~"DROP TABLE \"team members\"", [])
     end.
 
 optimistic_locking(_Config) ->

@@ -639,7 +639,10 @@ reference_to_a_missing_row_is_refused_test() ->
     with_file_pool(pool_for_restrict, fun(Name) ->
         #{} = sql(Name, ~"CREATE TABLE parent (id INTEGER PRIMARY KEY)"),
         #{} = sql(Name, ~"CREATE TABLE child (parent_id INTEGER REFERENCES parent (id))"),
-        ?assertEqual({error, 787}, sql(Name, ~"INSERT INTO child VALUES (99)"))
+        ?assertMatch(
+            {error, {pgsql_error, #{code := ~"23503", sqlite_code := 787}}},
+            sql(Name, ~"INSERT INTO child VALUES (99)")
+        )
     end).
 
 replaced_connection_enforces_foreign_keys_test() ->

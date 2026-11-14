@@ -1447,3 +1447,145 @@ nesting_quotes_and_comments_inside_a_cte_body_are_skipped_test() ->
     after
         nested_teardown({Pool, Path})
     end.
+
+%%----------------------------------------------------------------------
+%% Constraint errors
+%%----------------------------------------------------------------------
+
+constraint_errors_name_what_failed_test_() ->
+    Cases = [
+        {~"INSERT INTO people (id, email, org, slug) VALUES (1, 'a', 9, 'x')", #{
+            code => ~"23505", table => ~"people", constraint => ~"people_pkey", sqlite_code => 1555
+        }},
+        {~"INSERT INTO people (email, org, slug) VALUES ('a', 9, 'x')", #{
+            code => ~"23505",
+            table => ~"people",
+            constraint => ~"people_email_key",
+            sqlite_code => 2067
+        }},
+        {~"INSERT INTO people (email, org, slug) VALUES ('b', 1, 's')", #{
+            code => ~"23505",
+            table => ~"people",
+            constraint => ~"people_by_org_slug",
+            sqlite_code => 2067
+        }},
+        {~"INSERT INTO people (email, org, slug, nick) VALUES ('b', 2, 's', 'n')", #{
+            code => ~"23505",
+            table => ~"people",
+            constraint => ~"people_nick_key",
+            sqlite_code => 2067
+        }},
+        {~"INSERT INTO people (email, org, slug, tag) VALUES ('b', 2, 's', 'T')", #{
+            code => ~"23505", constraint => ~"people_lower_tag", sqlite_code => 2067
+        }},
+        {~"INSERT INTO people (email, org, slug) VALUES ('b', NULL, 's')", #{
+            code => ~"23502", table => ~"people", column => ~"org", sqlite_code => 1299
+        }},
+        {~"INSERT INTO people (email, org, slug, age) VALUES ('b', 2, 's', -1)", #{
+            code => ~"23514", constraint => ~"people_age_check", sqlite_code => 275
+        }},
+        {~"INSERT INTO people (email, org, slug, boss) VALUES ('b', 2, 's', 99)", #{
+            code => ~"23503", sqlite_code => 787
+        }},
+        {~"INSERT INTO \"work log\" (\"first name\") VALUES ('a')", #{
+            code => ~"23505",
+            table => ~"work log",
+            constraint => ~"work log_first name_key",
+            sqlite_code => 2067
+        }},
+        {~"INSERT INTO rowless VALUES ('k')", #{
+            code => ~"23505",
+            table => ~"rowless",
+            constraint => ~"rowless_pkey",
+            sqlite_code => 1555
+        }}
+    ],
+    {setup, fun constrained/0, fun nested_teardown/1, fun({Pool, _Path}) ->
+        [
+            ?_test(begin
+                {error, {pgsql_error, Fields}} = sql(Pool, SQL),
+                ?assertEqual(Expected, maps:remove(message, Fields)),
+                ?assertMatch(#{message := <<_, _/binary>>}, Fields)
+            end)
+         || {SQL, Expected} <- Cases
+        ]
+    end}.
+
+%% Two partial indexes on one column: SQLite does not say which refused.
+constrained() ->
+    {Pool, Path} = nested_setup(file, 1),
+    [
+        #{} = sql(Pool, SQL)
+     || SQL <- [
+            ~"""
+            CREATE TABLE people (
+                id INTEGER PRIMARY KEY,
+                email TEXT UNIQUE,
+                org INTEGER NOT NULL,
+                slug TEXT,
+                nick TEXT,
+                tag TEXT,
+                age INTEGER CONSTRAINT people_age_check CHECK (age >= 0),
+                boss INTEGER REFERENCES people (id)
+            )
+            """,
+            ~"CREATE UNIQUE INDEX people_by_org_slug ON people (org, slug)",
+            ~"CREATE INDEX people_slug_org ON people (slug, org)",
+            ~"CREATE UNIQUE INDEX people_nick_short ON people (nick) WHERE length(nick) < 3",
+            ~"CREATE UNIQUE INDEX people_nick_long ON people (nick) WHERE length(nick) < 9",
+            ~"CREATE UNIQUE INDEX people_lower_tag ON people (lower(tag))",
+            ~"CREATE TABLE \"work log\" (\"first name\" TEXT UNIQUE)",
+            ~"CREATE TABLE rowless (k TEXT PRIMARY KEY) WITHOUT ROWID",
+            ~"INSERT INTO people (id, email, org, slug, nick, tag) VALUES (1, 'a', 1, 's', 'n', 't')",
+            ~"INSERT INTO \"work log\" VALUES ('a')",
+            ~"INSERT INTO rowless VALUES ('k')"
+        ]
+    ],
+    {Pool, Path}.
+
+%% The message names the table and the column and holds no value of the row.
+constraint_error_message_holds_no_row_value_test() ->
+    with_parent(fun(Pool) ->
+        #{} = sql(Pool, ~"CREATE TABLE secrets (word TEXT UNIQUE)"),
+        Insert = fun() ->
+            kura_driver_sqlite:query(
+                kura_pool_sqlite, Pool, ~"INSERT INTO secrets VALUES (?1)", [~"hunter2"], #{}
+            )
+        end,
+        #{} = Insert(),
+        {error, {pgsql_error, #{message := Message}}} = Insert(),
+        ?assertEqual(~"UNIQUE constraint failed: secrets.word", Message)
+    end).
+
+%% A failure that is no constraint's, and a constraint failure SQLite words
+%% in a way the driver does not read, keep the result code.
+other_failures_keep_the_result_code_test() ->
+    with_parent(fun(Pool) ->
+        #{} = sql(
+            Pool,
+            ~"""
+            CREATE TRIGGER no_twos BEFORE INSERT ON parent WHEN NEW.id = 2
+            BEGIN SELECT RAISE(ABORT, 'no twos'); END
+            """
+        ),
+        ?assertEqual({error, 1811}, sql(Pool, ~"INSERT INTO parent VALUES (2)")),
+        ?assertEqual({error, 1}, sql(Pool, ~"SELECT nothing FROM parent"))
+    end).
+
+%% The statement's own transaction is still usable after the lookup.
+constraint_error_leaves_the_transaction_open_test() ->
+    with_parent(fun(Pool) ->
+        #{} = sql(Pool, ~"CREATE UNIQUE INDEX parent_id_again ON parent (id)"),
+        Result = kura_driver_sqlite:transaction(
+            kura_pool_sqlite,
+            Pool,
+            fun() ->
+                Refused = sql(Pool, ~"INSERT INTO parent VALUES (1)"),
+                #{} = sql(Pool, ~"INSERT INTO parent VALUES (3)"),
+                Refused
+            end,
+            #{}
+        ),
+        ?assertMatch({error, {pgsql_error, #{constraint := ~"parent_pkey"}}}, Result),
+        ?assertMatch(#{rows := [#{id := 1}, #{id := 3}]}, sql(Pool, ~"SELECT id FROM parent"))
+    end).

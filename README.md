@@ -101,8 +101,13 @@ refuses a query that needs one with
   have: `kura_stream:stream/3,4` raises
   `{kura, {unsupported_capability, cursors, kura_pool_sqlite}}` before it
   runs a statement.
-- **Constraint errors** come back as the SQLite result code
-  (`{error, 2067}` for a unique violation), not as a changeset error.
+- **Constraint errors** become changeset errors, as on Postgres: a unique
+  or not-null violation lands on its field, a check on the field its
+  changeset declares it for. SQLite does not name the foreign key that
+  failed, so that one lands on `base`. A raw `kura_db:query/3` returns
+  `{error, {pgsql_error, #{code := ~"23505", ...}}}` with the PostgreSQL
+  code; see "Errors" in `kura_driver_sqlite`. Before, it returned the SQLite
+  result code (`{error, 2067}`), which other failures still do.
 - **Composite primary and foreign keys** work the same as on Postgres
   (SQLite supports `PRIMARY KEY (a, b)` and row-value `IN`).
 - **Foreign keys** are enforced. The pool turns `PRAGMA foreign_keys` on

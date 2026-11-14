@@ -49,6 +49,34 @@ A statement that fails returns `{error, Reason}`, `Reason` being the
 SQLite result code for most failures. A statement that waits out the
 connection's busy timeout returns `{error, busy}`.
 
+A statement a constraint refuses returns `{error, {pgsql_error, Fields}}`,
+the form `kura_repo_worker` turns into a changeset error. SQLite names
+what failed only in its message, so `Fields` is read from it:
+
+| SQLite message | `Fields` |
+| --- | --- |
+| `UNIQUE constraint failed: t.a, t.b` | `code => ~"23505"`, `table => ~"t"`, `constraint` as below |
+| `UNIQUE constraint failed: index 'i'` | `code => ~"23505"`, `constraint => ~"i"` |
+| `NOT NULL constraint failed: t.c` | `code => ~"23502"`, `table => ~"t"`, `column => ~"c"` |
+| `CHECK constraint failed: name` | `code => ~"23514"`, `constraint => ~"name"` |
+| `FOREIGN KEY constraint failed` | `code => ~"23503"` |
+
+`Fields` also holds `message`, SQLite's text, which names tables and
+columns and quotes no value, and `sqlite_code`, the extended result code.
+
+SQLite reports the columns of a unique violation, not the index. Its
+`constraint` is `t_pkey` for the primary key, and otherwise the name of the
+one index made with `CREATE UNIQUE INDEX` on exactly those columns, in that
+order. Where there is none, or more than one, as with two partial indexes
+on the same columns, it is the name PostgreSQL would generate for a
+`UNIQUE` constraint on them, `t_a_b_key`, and a changeset that declares
+the index under another name is not matched.
+
+A foreign key violation names neither table nor constraint, so kura
+reports it on `base`. A table whose name holds a dot is not told from its
+column, and such an error has no `table`. Any other constraint failure,
+such as a trigger's `RAISE`, returns its result code.
+
 ## Dropping a referenced table
 
 With foreign keys on, SQLite empties a table before it drops it, and that
@@ -170,6 +198,12 @@ the workload. esqlite sets 2 seconds by default.
 
 -define(IS_INT64(Int), (is_integer(Int) andalso Int >= -(1 bsl 63) andalso Int < 1 bsl 63)).
 -define(IS_INT32(Int), (is_integer(Int) andalso Int >= -(1 bsl 31) andalso Int < 1 bsl 31)).
+-define(SQLITE_CONSTRAINT, 19).
+-define(SQLITE_CONSTRAINT_CHECK, 275).
+-define(SQLITE_CONSTRAINT_FOREIGNKEY, 787).
+-define(SQLITE_CONSTRAINT_NOTNULL, 1299).
+-define(SQLITE_CONSTRAINT_PRIMARYKEY, 1555).
+-define(SQLITE_CONSTRAINT_ROWID, 2579).
 -define(NOTHING_DROPPED, [~"Init", ~"Transaction", ~"JournalMode", ~"Goto", ~"Halt"]).
 
 -define(REFERENCING,
@@ -494,8 +528,8 @@ run_prepared(Conn, Stmt, Params, Cmd) ->
         ok ->
             ColNames = esqlite3:column_names(Stmt),
             try collect_rows(Stmt, ColNames) of
-                {error, _} = Err ->
-                    Err;
+                {error, Reason} ->
+                    {error, violation(Conn, Reason)};
                 Rows when is_list(Rows) ->
                     #{rows => Rows, num_rows => num_rows(Conn, Cmd, ColNames, Rows), command => Cmd}
             after
@@ -503,6 +537,92 @@ run_prepared(Conn, Stmt, Params, Cmd) ->
             end;
         {error, _} = Err ->
             Err
+    end.
+
+%% The connection's error message is that of the statement that just
+%% failed, until the statement is reset.
+-spec violation(esqlite3:esqlite3(), term()) -> term().
+violation(Conn, Code) when is_integer(Code), Code band 16#ff =:= ?SQLITE_CONSTRAINT ->
+    #{errmsg := Message} = esqlite3:error_info(Conn),
+    case violated(Conn, Code, Message) of
+        unrecognised -> Code;
+        Fields -> {pgsql_error, Fields#{message => Message, sqlite_code => Code}}
+    end;
+violation(_Conn, Reason) ->
+    Reason.
+
+-spec violated(esqlite3:esqlite3(), integer(), binary()) -> map() | unrecognised.
+violated(_Conn, ?SQLITE_CONSTRAINT_NOTNULL, <<"NOT NULL constraint failed: ", Named/binary>>) ->
+    case table_columns(Named) of
+        {Table, [Column]} -> #{code => ~"23502", table => Table, column => Column};
+        _ -> #{code => ~"23502"}
+    end;
+violated(_Conn, _Code, <<"UNIQUE constraint failed: index '", Quoted/binary>>) ->
+    #{code => ~"23505", constraint => binary:part(Quoted, 0, max(0, byte_size(Quoted) - 1))};
+violated(Conn, Code, <<"UNIQUE constraint failed: ", Named/binary>>) ->
+    case table_columns(Named) of
+        {Table, Columns} ->
+            Name = unique_name(Conn, Code, Table, Columns),
+            #{code => ~"23505", table => Table, constraint => Name};
+        unrecognised ->
+            #{code => ~"23505"}
+    end;
+violated(_Conn, ?SQLITE_CONSTRAINT_CHECK, <<"CHECK constraint failed: ", Name/binary>>) ->
+    #{code => ~"23514", constraint => Name};
+violated(_Conn, ?SQLITE_CONSTRAINT_FOREIGNKEY, _Message) ->
+    #{code => ~"23503"};
+violated(_Conn, _Code, _Message) ->
+    unrecognised.
+
+%% The names PostgreSQL generates for the key of a table and for a unique
+%% constraint on columns, unless one created index is on those columns.
+-spec unique_name(esqlite3:esqlite3(), integer(), binary(), [binary()]) -> binary().
+unique_name(_Conn, Code, Table, _Columns) when
+    Code =:= ?SQLITE_CONSTRAINT_PRIMARYKEY; Code =:= ?SQLITE_CONSTRAINT_ROWID
+->
+    <<Table/binary, "_pkey">>;
+unique_name(Conn, _Code, Table, Columns) ->
+    Created = rows(
+        Conn,
+        ~"SELECT name FROM pragma_index_list(?1) WHERE \"unique\" = 1 AND origin = 'c'",
+        Table
+    ),
+    case [Index || [Index] <- Created, indexed(Conn, Index) =:= Columns] of
+        [Index] -> Index;
+        _ -> iolist_to_binary([Table, [[$_, Column] || Column <- Columns], ~"_key"])
+    end.
+
+-spec indexed(esqlite3:esqlite3(), binary()) -> [term()].
+indexed(Conn, Index) ->
+    [
+        Column
+     || [Column] <- rows(Conn, ~"SELECT name FROM pragma_index_info(?1) ORDER BY seqno", Index)
+    ].
+
+-spec rows(esqlite3:esqlite3(), binary(), binary()) -> [dynamic()].
+rows(Conn, SQL, Named) ->
+    case esqlite3:q(Conn, SQL, [Named]) of
+        Rows when is_list(Rows) -> Rows;
+        {error, _} -> []
+    end.
+
+%% `t.a, t.b`: every column is named with its table.
+-spec table_columns(binary()) -> {binary(), [binary()]} | unrecognised.
+table_columns(Named) ->
+    case binary:split(Named, ~".") of
+        [Table, _Rest] when Table =/= <<>> ->
+            columns(binary:split(Named, ~", ", [global]), Table);
+        _ ->
+            unrecognised
+    end.
+
+-spec columns([binary()], binary()) -> {binary(), [binary()]} | unrecognised.
+columns(Named, Table) ->
+    Size = byte_size(Table),
+    Columns = [Column || <<Prefix:Size/binary, $., Column/binary>> <- Named, Prefix =:= Table],
+    case length(Columns) =:= length(Named) andalso not lists:member(<<>>, Columns) of
+        true -> {Table, Columns};
+        false -> unrecognised
     end.
 
 %% Without RETURNING a write returns no rows, so its count is the rows it
