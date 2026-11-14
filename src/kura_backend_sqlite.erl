@@ -38,7 +38,10 @@ driver_module() -> kura_driver_sqlite.
 -spec dialect() -> module().
 dialect() -> kura_dialect_sqlite.
 
--doc "Forwards to `kura_pool_sqlite:capabilities/0` so consumers can query the backend's feature set without knowing the impl module names.".
+-doc """
+Forwards to `kura_pool_sqlite:capabilities/0` so consumers can query the
+backend's feature set without knowing the impl module names.
+""".
 -spec capabilities() -> kura_capabilities:capability_set().
 capabilities() -> kura_pool_sqlite:capabilities().
 

@@ -336,7 +336,7 @@ load_stored(boolean, 1) ->
     true;
 load_stored(boolean, 0) ->
     false;
-load_stored(Type, Text) when ?IS_TEMPORAL(Type), is_binary(Text) ->
+load_stored(Type, Text) when ?IS_TEMPORAL(Type) andalso is_binary(Text) ->
     case kura_types:cast(Type, Text) of
         {ok, Value} -> Value;
         {error, _} -> Text
@@ -388,19 +388,19 @@ dated_conditions(Types, Conditions) ->
 
 -spec dated_condition(field_types(), term()) -> term().
 dated_condition(Types, {Junction, Conditions}) when
-    (Junction =:= 'and' orelse Junction =:= 'or'), is_list(Conditions)
+    (Junction =:= 'and' orelse Junction =:= 'or') andalso is_list(Conditions)
 ->
     {Junction, dated_conditions(Types, Conditions)};
 dated_condition(Types, {'not', Condition}) ->
     {'not', dated_condition(Types, Condition)};
 dated_condition(_Types, {Exists, {subquery, #kura_query{} = Query}}) when
-    Exists =:= exists; Exists =:= not_exists
+    Exists =:= exists orelse Exists =:= not_exists
 ->
     {Exists, {subquery, convert_values(Query)}};
 dated_condition(_Types, {Field, Op, {subquery, #kura_query{} = Query}}) ->
     {Field, Op, {subquery, convert_values(Query)}};
 dated_condition(Types, {Field, Op, Values}) when
-    is_atom(Field), is_list(Values), (Op =:= in orelse Op =:= not_in)
+    is_atom(Field) andalso is_list(Values) andalso (Op =:= in orelse Op =:= not_in)
 ->
     case is_proper(Values) of
         true -> {Field, Op, [dated(Types, Field, Value) || Value <- Values]};
@@ -408,7 +408,7 @@ dated_condition(Types, {Field, Op, Values}) when
     end;
 dated_condition(Types, {Field, between, {Low, High}}) when is_atom(Field) ->
     {Field, between, {dated(Types, Field, Low), dated(Types, Field, High)}};
-dated_condition(Types, {Field, Op, Value}) when is_atom(Field), ?IS_COMPARISON(Op) ->
+dated_condition(Types, {Field, Op, Value}) when is_atom(Field) andalso ?IS_COMPARISON(Op) ->
     {Field, Op, dated(Types, Field, Value)};
 dated_condition(Types, {Field, Value}) when is_atom(Field) ->
     {Field, dated(Types, Field, Value)};
