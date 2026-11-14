@@ -558,7 +558,11 @@ violated(_Conn, ?SQLITE_CONSTRAINT_NOTNULL, <<"NOT NULL constraint failed: ", Na
         _ -> #{code => ~"23502"}
     end;
 violated(_Conn, _Code, <<"UNIQUE constraint failed: index '", Quoted/binary>>) ->
-    #{code => ~"23505", constraint => binary:part(Quoted, 0, max(0, byte_size(Quoted) - 1))};
+    Size = byte_size(Quoted) - 1,
+    case Quoted of
+        <<Index:Size/binary, $'>> -> #{code => ~"23505", constraint => Index};
+        _ -> #{code => ~"23505"}
+    end;
 violated(Conn, Code, <<"UNIQUE constraint failed: ", Named/binary>>) ->
     case table_columns(Named) of
         {Table, Columns} ->
