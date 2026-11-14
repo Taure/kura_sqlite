@@ -84,6 +84,9 @@ capabilities_are_what_the_bundled_sqlite_runs_test() ->
         lists:sort(kura_pool_sqlite:capabilities())
     ).
 
+the_model_is_one_kura_knows_test() ->
+    ?assertEqual(ok, kura_capabilities:validate(kura_pool_sqlite)).
+
 %% The model number lives in kura_pool_sqlite alone. Whatever it is, of the
 %% capabilities kura checks a query or a stream for, SQLite has window
 %% functions only.

@@ -328,11 +328,13 @@ capabilities() ->
 
 -doc """
 The revision of kura's capability checks that `capabilities/0` was written
-against. Under model 2 kura also refuses a query that needs `row_locks` or
-`distinct_on`, and `kura_stream` for want of `cursors`.
+against. Model 1 checks a query for `full_text_search`, `window_functions`,
+`vector`, `select_for_update_skip_locked`, `row_locks` and `distinct_on`,
+and `kura_stream` for `cursors`. SQLite has window functions only, so kura
+refuses the rest.
 """.
 -spec capability_model() -> pos_integer().
-capability_model() -> 2.
+capability_model() -> 1.
 
 %%----------------------------------------------------------------------
 %% gen_server

@@ -48,7 +48,7 @@ PG-only features (`advisory_locks`, `listen_notify`, `arrays`, `jsonb`,
 `select_for_update_skip_locked`, `row_locks`, `distinct_on`, `cursors`,
 `concurrent_indexes`, `full_text_search`, `vector`) are deliberately absent;
 `kura_pool_sqlite:capability_model/0` names the revision of kura's checks the
-list is written against. Consumers that require them refuse
+list is written against: model 1. Consumers that require them refuse
 to start on this backend via `kura_capabilities:require/2`, and kura
 refuses a query that needs one with
 `{kura, {unsupported_capability, Capability, kura_pool_sqlite}}`.
