@@ -14,6 +14,55 @@ kura_asks_the_dialect_for_its_placeholder_test() ->
     ?assertEqual(~"?7", iolist_to_binary(kura_dialect:placeholder(kura_dialect_sqlite, 7))).
 
 %%----------------------------------------------------------------------
+%% load_stored/2
+%%----------------------------------------------------------------------
+
+load_stored_reads_a_boolean_from_its_integer_test() ->
+    ?assertEqual(true, kura_dialect_sqlite:load_stored(boolean, 1)),
+    ?assertEqual(false, kura_dialect_sqlite:load_stored(boolean, 0)),
+    ?assertEqual(2, kura_dialect_sqlite:load_stored(boolean, 2)),
+    ?assertEqual(~"true", kura_dialect_sqlite:load_stored(boolean, ~"true")),
+    ?assertEqual(1, kura_dialect_sqlite:load_stored(integer, 1)).
+
+load_stored_reads_dates_and_times_from_their_text_test() ->
+    ?assertEqual({1990, 1, 2}, kura_dialect_sqlite:load_stored(date, ~"1990-01-02")),
+    ?assertEqual({12, 5, 6}, kura_dialect_sqlite:load_stored(date, ~"0012-05-06")),
+    ?assertEqual({12, 5, 6}, kura_dialect_sqlite:load_stored(time, ~"12:05:06")),
+    ?assertEqual(
+        {{2024, 1, 2}, {3, 4, 5}},
+        kura_dialect_sqlite:load_stored(utc_datetime, ~"2024-01-02 03:04:05")
+    ),
+    ?assertEqual(
+        {{2024, 1, 2}, {3, 4, 5}},
+        kura_dialect_sqlite:load_stored(naive_datetime, ~"2024-01-02 03:04:05")
+    ).
+
+load_stored_keeps_what_it_cannot_read_test() ->
+    ?assertEqual(~"yesterday", kura_dialect_sqlite:load_stored(date, ~"yesterday")),
+    ?assertEqual(~"12:05:06", kura_dialect_sqlite:load_stored(date, ~"12:05:06")),
+    ?assertEqual(20240102, kura_dialect_sqlite:load_stored(date, 20240102)).
+
+load_stored_leaves_every_other_type_alone_test() ->
+    [
+        ?assertEqual(Value, kura_dialect_sqlite:load_stored(Type, Value))
+     || {Type, Value} <- [
+            {string, ~"1990-01-02"},
+            {text, ~"12:05:06"},
+            {decimal, ~"12345678901234567.89"},
+            {decimal, 1.25},
+            {jsonb, ~"{\"a\":1}"},
+            {{enum, [a, b]}, ~"a"},
+            {uuid, ~"0190a6f8-7b3a-7c3e-8f0a-1b2c3d4e5f60"},
+            {{encrypted, date}, ~"1990-01-02"},
+            {{embed, embeds_one, kura_sqlite_orm_address}, ~"{}"},
+            {float, 1}
+        ]
+    ].
+
+kura_reads_a_row_through_the_dialect_test() ->
+    ?assert(kura_dialect:loads_stored(kura_dialect_sqlite)).
+
+%%----------------------------------------------------------------------
 %% swap_placeholders/1
 %%----------------------------------------------------------------------
 

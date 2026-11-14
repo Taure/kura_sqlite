@@ -178,6 +178,7 @@ reach SQLite.
     column_type/1,
     format_default/1,
     placeholder/1,
+    load_stored/2,
     swap_placeholders/1,
     blob_checks/1,
     blob_columns/1
@@ -215,6 +216,11 @@ reach SQLite.
 -define(IS_EXACT_MATCH(Op), (Op =:= contains orelse Op =:= starts_with orelse Op =:= ends_with)).
 -define(IS_FOLDED_MATCH(Op),
     (Op =:= icontains orelse Op =:= istarts_with orelse Op =:= iends_with)
+).
+
+-define(IS_TEMPORAL(Type),
+    (Type =:= date orelse Type =:= time orelse Type =:= utc_datetime orelse
+        Type =:= naive_datetime)
 ).
 
 -type schema_fields() :: {
@@ -314,6 +320,29 @@ bookkeeping.
 -spec placeholder(pos_integer()) -> iodata().
 placeholder(N) ->
     [$?, integer_to_binary(N)].
+
+-doc """
+A value as SQLite stores it, in the Erlang form `kura_types:load/2` reads.
+kura calls it on each non-null value of a row read through a schema.
+
+A `boolean` stored as `1` or `0` becomes `true` or `false`, and a `date`,
+`time`, `utc_datetime` or `naive_datetime` stored as ISO 8601 text becomes
+its tuple, as `kura_types:cast/2` reads the text. Text that is not one, and
+a value of any other type, is returned as it is: `jsonb` and an embed are
+JSON text kura decodes itself, and a `decimal` is the number SQLite holds.
+""".
+-spec load_stored(kura_types:kura_type(), term()) -> term().
+load_stored(boolean, 1) ->
+    true;
+load_stored(boolean, 0) ->
+    false;
+load_stored(Type, Text) when ?IS_TEMPORAL(Type), is_binary(Text) ->
+    case kura_types:cast(Type, Text) of
+        {ok, Value} -> Value;
+        {error, _} -> Text
+    end;
+load_stored(_Type, Value) ->
+    Value.
 
 %%----------------------------------------------------------------------
 %% DDL: column type + default value emit

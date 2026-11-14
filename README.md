@@ -72,9 +72,10 @@ refuses a query that needs one with
   datetime at `24:00:00` or on a leap second is stored as the next day
   or minute, as kura's cast reads it.
 - **Reads** through a schema return the values that were written: kura
-  2.31 loads a stored 0/1 as `false`/`true` and a stored date or datetime
-  as its tuple. A raw `kura_db:query/3`, which has no schema, returns the
-  stored forms.
+  2.31 asks `kura_dialect_sqlite:load_stored/2` for each value, which turns
+  a stored 0/1 into `false`/`true` and a stored date, time or datetime into
+  its tuple. Text in such a column that is not a date or time stays text. A
+  raw `kura_db:query/3`, which has no schema, returns the stored forms.
 - **JSON** values store as TEXT. JSONB operators (`->`, `->>`, `@>`)
   are not available; use Erlang map operations after decoding.
 - **Arrays** are unsupported. A migration declaring an `{array, Inner}`
