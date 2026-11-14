@@ -70,6 +70,20 @@ capabilities_excludes_pg_only_features_test() ->
     ?assert(lists:member(returning, Caps)),
     ?assert(lists:member(transactions, Caps)).
 
+capabilities_are_what_the_bundled_sqlite_runs_test() ->
+    ?assertEqual(
+        [
+            json,
+            partial_indexes,
+            prepared_statements,
+            returning,
+            savepoints,
+            transactions,
+            window_functions
+        ],
+        lists:sort(kura_pool_sqlite:capabilities())
+    ).
+
 require_advisory_locks_returns_missing_test() ->
     %% A consumer that needs PG-only features should refuse to boot
     %% on a SQLite backend.

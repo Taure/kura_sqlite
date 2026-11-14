@@ -303,9 +303,14 @@ give_away(_Token, _NotPid, _GiftData) ->
 %%----------------------------------------------------------------------
 
 -doc """
-SQLite 3.45 capability set as shipped by esqlite. Excludes PG-only
-features (advisory_locks, listen_notify, arrays). RETURNING is
-included since 3.35.
+What the SQLite esqlite builds (3.50) supports of kura's standard
+capabilities. kura refuses a query that needs one not listed here.
+
+Left out, since SQLite has no such thing: `jsonb` (`json` stands for the
+text JSON functions), `arrays`, `advisory_locks`, `listen_notify`,
+`select_for_update_skip_locked`, `concurrent_indexes`, `vector`. Also left
+out is `full_text_search`: SQLite has FTS5, but `{Field, matches, Query}`
+compiles to PostgreSQL's `to_tsvector`.
 """.
 -spec capabilities() -> kura_capabilities:capability_set().
 capabilities() ->
@@ -313,6 +318,7 @@ capabilities() ->
         returning,
         json,
         partial_indexes,
+        window_functions,
         transactions,
         savepoints,
         prepared_statements
