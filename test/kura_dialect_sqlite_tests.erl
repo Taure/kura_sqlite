@@ -80,8 +80,21 @@ an_early_date_compared_with_a_date_field_is_its_text_test_() ->
         Where
     end,
     [
-        ?_assertEqual({born, ?EARLY_TEXT}, Converted({born, ?EARLY})),
-        ?_assertEqual({born, '<', ?EARLY_TEXT}, Converted({born, '<', ?EARLY})),
+        ?_assertEqual({born, Op, ?EARLY_TEXT}, Converted({born, Op, ?EARLY}))
+     || Op <- ['=', '!=', '<', '>', '<=', '>=']
+    ] ++
+        [
+            ?_assertEqual({born, ?EARLY_TEXT}, Converted({born, ?EARLY})),
+            ?_assertEqual({born, not_in, [?EARLY_TEXT]}, Converted({born, not_in, [?EARLY]})),
+            ?_assertMatch(
+                {not_exists, {subquery, #kura_query{wheres = [{born, ?EARLY_TEXT}]}}},
+                Converted({not_exists, {subquery, Sub}})
+            )
+        ] ++ early_in_every_position(Converted, Sub).
+
+early_in_every_position(Converted, Sub) ->
+    Q = kura_query:from(?AUTHOR),
+    [
         ?_assertEqual(
             {born, in, [?EARLY_TEXT, {2024, 1, 2}, ~"0001-01-01"]},
             Converted({born, in, [?EARLY, {2024, 1, 2}, ~"0001-01-01"]})
@@ -127,7 +140,10 @@ only_an_early_date_on_a_date_field_is_converted_test_() ->
         {name, ?EARLY},
         {inserted_at, {?EARLY, {1, 2, 3}}},
         {{author, born}, ?EARLY},
-        {fragment, ~"born = ?", [?EARLY]}
+        {fragment, ~"born = ?", [?EARLY]},
+        {settings, [{born, ?EARLY}]},
+        {born, '=', [?EARLY]},
+        {born, like, ?EARLY}
     ],
     [
         ?_assertEqual(

@@ -1543,6 +1543,49 @@ constrained() ->
     ],
     {Pool, Path}.
 
+%% A rowid given twice is the key of a table that declares none.
+a_repeated_rowid_is_the_key_test() ->
+    with_parent(fun(Pool) ->
+        #{} = sql(Pool, ~"CREATE TABLE loose (word TEXT)"),
+        #{} = sql(Pool, ~"INSERT INTO loose (rowid, word) VALUES (1, 'a')"),
+        {error, {pgsql_error, Fields}} = sql(
+            Pool, ~"INSERT INTO loose (rowid, word) VALUES (1, 'b')"
+        ),
+        ?assertEqual(
+            #{
+                code => ~"23505",
+                table => ~"loose",
+                constraint => ~"loose_pkey",
+                sqlite_code => 2579
+            },
+            maps:remove(message, Fields)
+        )
+    end).
+
+%% SQLite does not quote the names in its message, so one that holds `, `
+%% or is empty cannot be told from the punctuation around it.
+a_message_that_cannot_be_split_names_no_table_test() ->
+    with_parent(fun(Pool) ->
+        [
+            #{} = sql(Pool, SQL)
+         || SQL <- [
+                ~"CREATE TABLE \"x, y\" (c TEXT UNIQUE)",
+                ~"CREATE TABLE blank (\"\" TEXT UNIQUE)",
+                ~"INSERT INTO \"x, y\" VALUES ('a')",
+                ~"INSERT INTO blank VALUES ('a')"
+            ]
+        ],
+        [
+            begin
+                {error, {pgsql_error, Fields}} = sql(Pool, SQL),
+                ?assertEqual(
+                    #{code => ~"23505", sqlite_code => 2067}, maps:remove(message, Fields)
+                )
+            end
+         || SQL <- [~"INSERT INTO \"x, y\" VALUES ('a')", ~"INSERT INTO blank VALUES ('a')"]
+        ]
+    end).
+
 %% The message names the table and the column and holds no value of the row.
 constraint_error_message_holds_no_row_value_test() ->
     with_parent(fun(Pool) ->
