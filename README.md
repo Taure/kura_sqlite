@@ -45,8 +45,10 @@ Not yet: `kura_sandbox` test fixtures, JSONB operators (`->`, `->>`,
 ```
 
 PG-only features (`advisory_locks`, `listen_notify`, `arrays`, `jsonb`,
-`select_for_update_skip_locked`, `concurrent_indexes`, `full_text_search`,
-`vector`) are deliberately absent; consumers that require them refuse
+`select_for_update_skip_locked`, `row_locks`, `distinct_on`, `cursors`,
+`concurrent_indexes`, `full_text_search`, `vector`) are deliberately absent;
+`kura_pool_sqlite:capability_model/0` names the revision of kura's checks the
+list is written against. Consumers that require them refuse
 to start on this backend via `kura_capabilities:require/2`, and kura
 refuses a query that needs one with
 `{kura, {unsupported_capability, Capability, kura_pool_sqlite}}`.
@@ -93,7 +95,9 @@ refuses a query that needs one with
   (`SQLITE_MAX_VARIABLE_NUMBER`). More raises
   `{kura, {too_many_parameters, Count, 32766}}`; split the list.
 - **`kura_stream`** declares a server-side cursor, which SQLite does not
-  have, and returns an error.
+  have: `kura_stream:stream/3,4` raises
+  `{kura, {unsupported_capability, cursors, kura_pool_sqlite}}` before it
+  runs a statement.
 - **Constraint errors** come back as the SQLite result code
   (`{error, 2067}` for a unique violation), not as a changeset error.
 - **Composite primary and foreign keys** work the same as on Postgres

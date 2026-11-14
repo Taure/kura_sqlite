@@ -1368,6 +1368,77 @@ unsupported_query_raises_test_() ->
             ?_assertMatch({_, []}, kura_dialect_sqlite:to_sql(kura_query:distinct(Q)))
         ].
 
+%% kura checks a query for a repo whose pool module is kura_pool_sqlite,
+%% whatever its dialect would compile: the PostgreSQL dialect has a lock
+%% clause and DISTINCT ON.
+kura_refuses_for_a_repo_on_the_sqlite_pool_test_() ->
+    Repo = kura_sqlite_checked_repo,
+    {setup,
+        fun() ->
+            compiler_repo(Repo, #{dialect => kura_dialect_pg, pool_module => kura_pool_sqlite})
+        end,
+        fun compiler_repo_gone/1, fun(_) -> refused_through_the_compiler(Repo) end}.
+
+%% A repo that names no pool module is not checked by kura, so there the
+%% dialect's own refusal is the only one.
+dialect_refuses_for_a_repo_kura_does_not_check_test_() ->
+    Repo = kura_sqlite_unchecked_repo,
+    {setup, fun() -> compiler_repo(Repo, #{dialect => kura_dialect_sqlite}) end,
+        fun compiler_repo_gone/1, fun(_) ->
+            [
+                ?_assertMatch(
+                    {_, []}, kura_query_compiler:to_sql(Repo, kura_query:from(?BLOB_SCHEMA))
+                )
+                | refused_through_the_compiler(Repo)
+            ]
+        end}.
+
+refused_through_the_compiler(Repo) ->
+    Q = kura_query:from(?BLOB_SCHEMA),
+    Locked = kura_query:lock(Q, for_update),
+    Distinct = kura_query:distinct(Q, [name]),
+    [
+        ?_assertError(?REFUSED(row_locks), kura_query_compiler:to_sql(Repo, Locked)),
+        ?_assertError(?REFUSED(row_locks), kura_query_compiler:to_sql_cached(Repo, Locked)),
+        ?_assertError(?REFUSED(row_locks), kura_query_compiler:to_sql_from(Repo, Locked, 1)),
+        ?_assertError(
+            ?REFUSED(row_locks),
+            kura_query_compiler:delete_all(Repo, kura_query:where(Locked, {id, 1}))
+        ),
+        ?_assertError(
+            ?REFUSED(row_locks),
+            kura_query_compiler:update_all(
+                Repo, kura_query:where(Locked, {id, 1}), #{name => ~"n"}
+            )
+        ),
+        ?_assertError(
+            ?REFUSED(select_for_update_skip_locked),
+            kura_query_compiler:to_sql(Repo, kura_query:lock(Q, {for_update, skip_locked}))
+        ),
+        ?_assertError(?REFUSED(distinct_on), kura_query_compiler:to_sql(Repo, Distinct)),
+        ?_assertError(?REFUSED(distinct_on), kura_query_compiler:to_sql_cached(Repo, Distinct)),
+        ?_assertError(
+            ?REFUSED(row_locks),
+            kura_query_compiler:to_sql(Repo, kura_query:where(Q, {id, in, {subquery, Locked}}))
+        ),
+        ?_assertError(
+            ?REFUSED(distinct_on),
+            kura_query_compiler:to_sql(Repo, kura_query:with_cte(Q, ~"firsts", Distinct))
+        ),
+        ?_assertError(
+            ?REFUSED(row_locks), kura_query_compiler:to_sql(Repo, kura_query:union(Q, Locked))
+        )
+    ].
+
+compiler_repo(Repo, Config) ->
+    application:set_env(kura, repos, #{Repo => Config}),
+    kura_query_cache:init(),
+    kura_query_cache:flush().
+
+compiler_repo_gone(_) ->
+    kura_query_cache:flush(),
+    application:unset_env(kura, repos).
+
 %%----------------------------------------------------------------------
 %% Bound values in one statement
 %%----------------------------------------------------------------------

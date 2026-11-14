@@ -37,7 +37,8 @@ does not find `Å`. The backslash is the escape character of `like` and
 
 Raised as `{kura, {unsupported_capability, Capability, kura_pool_sqlite}}`,
 the error `kura_capabilities:check_query/2` raises, before any SQL is
-emitted:
+emitted. kura raises it for a repo whose pool module is `kura_pool_sqlite`,
+and this module for any other caller:
 
 - `kura_query:lock/2`, as `row_locks`, or
   `select_for_update_skip_locked` for a `skip_locked` lock. SQLite locks the
@@ -185,8 +186,9 @@ reach SQLite.
 %% SQLITE_MAX_VARIABLE_NUMBER of the SQLite esqlite builds. esqlite has no
 %% sqlite3_limit/3 to ask a connection with.
 -define(MAX_BIND_PARAMETERS, 32766).
-%% The error kura_capabilities:check_query/2 raises, for what kura does not
-%% check or checks only from the release after 2.30.
+%% The error kura_capabilities:check_query/2 raises. kura checks a query it
+%% compiles for a repo whose pool module is kura_pool_sqlite; the dialect
+%% raises it for every other caller, such as a repo on another pool module.
 -define(UNSUPPORTED(Capability), {kura, {unsupported_capability, Capability, kura_pool_sqlite}}).
 %% A text match escapes its value in SQL, so the value is bound untouched.
 %% The patterns hold no `?`: char(63) stands for it, since a kura up to 2.30

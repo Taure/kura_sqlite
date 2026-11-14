@@ -173,7 +173,8 @@ connections nobody holds.
     checkout/2,
     checkin/2,
     give_away/3,
-    capabilities/0
+    capabilities/0,
+    capability_model/0
 ]).
 
 -export([start_link/4, dirty/2]).
@@ -308,9 +309,10 @@ capabilities. kura refuses a query that needs one not listed here.
 
 Left out, since SQLite has no such thing: `jsonb` (`json` stands for the
 text JSON functions), `arrays`, `advisory_locks`, `listen_notify`,
-`select_for_update_skip_locked`, `concurrent_indexes`, `vector`. Also left
-out is `full_text_search`: SQLite has FTS5, but `{Field, matches, Query}`
-compiles to PostgreSQL's `to_tsvector`.
+`select_for_update_skip_locked`, `row_locks`, `distinct_on`, `cursors`,
+`concurrent_indexes`, `vector`. Also left out is `full_text_search`: SQLite
+has FTS5, but `{Field, matches, Query}` compiles to PostgreSQL's
+`to_tsvector`.
 """.
 -spec capabilities() -> kura_capabilities:capability_set().
 capabilities() ->
@@ -323,6 +325,14 @@ capabilities() ->
         savepoints,
         prepared_statements
     ].
+
+-doc """
+The revision of kura's capability checks that `capabilities/0` was written
+against. Under model 2 kura also refuses a query that needs `row_locks` or
+`distinct_on`, and `kura_stream` for want of `cursors`.
+""".
+-spec capability_model() -> pos_integer().
+capability_model() -> 2.
 
 %%----------------------------------------------------------------------
 %% gen_server

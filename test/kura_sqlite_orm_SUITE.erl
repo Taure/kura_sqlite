@@ -800,22 +800,26 @@ pagination(_Config) ->
     ?assertEqual(lists:seq(11, 25), [Org || #{org_id := Org} <- maps:get(entries, Next)]),
     ?assertMatch(#{has_next := false}, Next).
 
-%% kura_stream declares a server-side cursor, which SQLite does not have.
+%% kura_stream declares a server-side cursor, which SQLite does not have, so
+%% kura refuses before it runs a statement.
 stream_needs_server_cursors(_Config) ->
     {ok, 3} = kura_repo_worker:insert_all(
         ?REPO, ?NOTE, [#{org_id => N, body => ~"n"} || N <- lists:seq(1, 3)]
     ),
     Collector = self(),
-    Result = kura_stream:stream(
-        ?REPO,
-        kura_query:from(?NOTE),
-        fun(Batch) ->
-            Collector ! {batch, Batch},
-            ok
-        end
+    ?assertError(
+        ?UNSUPPORTED(cursors),
+        kura_stream:stream(
+            ?REPO,
+            kura_query:from(?NOTE),
+            fun(Batch) ->
+                Collector ! {batch, Batch},
+                ok
+            end
+        )
     ),
-    ?assertMatch({error, _}, Result),
-    ?assertEqual([], batches()).
+    ?assertEqual([], batches()),
+    ?assertEqual({ok, 3}, kura_repo_worker:count(?REPO, kura_query:from(?NOTE))).
 
 %%----------------------------------------------------------------------
 %% Field kinds
@@ -1199,6 +1203,9 @@ undeclared_capabilities_are_refused(_Config) ->
         advisory_locks,
         listen_notify,
         select_for_update_skip_locked,
+        row_locks,
+        distinct_on,
+        cursors,
         concurrent_indexes,
         full_text_search,
         vector

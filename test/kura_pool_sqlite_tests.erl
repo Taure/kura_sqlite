@@ -84,6 +84,21 @@ capabilities_are_what_the_bundled_sqlite_runs_test() ->
         lists:sort(kura_pool_sqlite:capabilities())
     ).
 
+%% The model number lives in kura_pool_sqlite alone. Whatever it is, of the
+%% capabilities kura checks a query or a stream for, SQLite has window
+%% functions only.
+checked_capabilities_sqlite_lacks_are_left_out_test() ->
+    ?assert(is_integer(kura_pool_sqlite:capability_model())),
+    ?assertEqual(kura_pool_sqlite:capability_model(), kura_backend_sqlite:capability_model()),
+    Lacking = [
+        full_text_search, vector, select_for_update_skip_locked, row_locks, distinct_on, cursors
+    ],
+    ?assertEqual(
+        {error, {missing_capabilities, Lacking}},
+        kura_capabilities:require(kura_pool_sqlite, Lacking)
+    ),
+    ?assertEqual(ok, kura_capabilities:require(kura_pool_sqlite, [window_functions])).
+
 require_advisory_locks_returns_missing_test() ->
     %% A consumer that needs PG-only features should refuse to boot
     %% on a SQLite backend.
