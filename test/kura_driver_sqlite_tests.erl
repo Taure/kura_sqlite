@@ -1155,14 +1155,33 @@ unrecognised_blob_column_is_refused_test() ->
         end)
     ).
 
-%% A {H, M, S} time has the shape of a date, so a three-integer tuple that
-%% could be one is refused rather than bound as a date.
-params_that_may_be_a_time_or_are_out_of_range_are_refused_test_() ->
+%% A {H, M, S} time has the shape of a date. A three-integer tuple whose
+%% first element is 24 or less is never a date here, and binds as the time
+%% it is.
+times_bind_as_their_clock_test_() ->
+    Cases = [
+        {{12, 5, 6}, ~"12:05:06"},
+        {{7, 30, 0}, ~"07:30:00"},
+        {{0, 0, 0}, ~"00:00:00"},
+        {{23, 59, 59}, ~"23:59:59"},
+        {{23, 59, 60}, ~"23:59:60"},
+        {{24, 0, 0}, ~"24:00:00"}
+    ],
+    [
+        ?_assertMatch(#{rows := [#{t1 := ~"text", v1 := Text}]}, bound([Param, 1]))
+     || {Param, Text} <- Cases
+    ].
+
+params_that_are_no_date_or_time_are_refused_test_() ->
     [
         ?_assertEqual({error, {unsupported_param, 1}}, bound([Param, 1]))
      || Param <- [
-            {12, 5, 6},
             {24, 1, 1},
+            {24, 0, 1},
+            {12, 60, 0},
+            {12, 0, 61},
+            {-1, 0, 0},
+            {12, 5, 6.0},
             {2024, 13, 1},
             {2024, 1, 0},
             {10000, 1, 1},

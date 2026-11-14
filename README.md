@@ -60,8 +60,11 @@ refuses a query that needs one with
 - **Dates and datetimes** are written and filtered as TEXT: a
   `{{Y, M, D}, {H, Mi, S}}` datetime binds as `YYYY-MM-DD HH:MM:SS` (the
   form of SQLite's `datetime()` and `CURRENT_TIMESTAMP`) and a `{Y, M, D}`
-  date whose year is above 24 as `YYYY-MM-DD`. A smaller three-integer
-  tuple could be an `{H, M, S}` time and is refused; pass a time as text.
+  date whose year is above 24 as `YYYY-MM-DD`. Any other three-integer
+  tuple that is a time of day (`{H, M, S}` up to `{23, 59, 60}`, or
+  `{24, 0, 0}`) binds as `HH:MM:SS`, so a `time` field is written and
+  filtered as TEXT too. A date in the years 0 to 23 has that shape and
+  binds as a time: pass such a date as text.
   A binary datetime filter value is compared as text, so it matches only
   a row stored in the same form (`~"2024-01-02 01:00:00"`, not
   `~"2024-01-02T01:00:00Z"`). A day the month does not have

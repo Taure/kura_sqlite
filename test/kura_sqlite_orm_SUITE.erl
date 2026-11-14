@@ -14,6 +14,7 @@ result it gives on PostgreSQL or is refused before a statement runs.
     insert_writes_a_renamed_column/1,
     arrays_are_refused/1,
     other_scalar_types/1,
+    every_field_type_is_written_and_found/1,
     booleans_and_dates_read_back_as_written/1,
     get_get_by_and_reload/1,
     update_stamps_and_keeps_the_rest/1,
@@ -65,7 +66,8 @@ result it gives on PostgreSQL or is refused before a statement runs.
 -define(NOTE, kura_sqlite_orm_note).
 -define(PLAN, kura_sqlite_orm_plan).
 -define(LIST, kura_sqlite_orm_list).
--define(SCHEMAS, [?AUTHOR, ?POST, ?TAG, ?SECRET, ?NOTE, ?PLAN]).
+-define(EVERY, kura_sqlite_orm_every_type).
+-define(SCHEMAS, [?AUTHOR, ?POST, ?TAG, ?SECRET, ?NOTE, ?PLAN, ?EVERY]).
 -define(UNSUPPORTED(Capability), {kura, {unsupported_capability, Capability, kura_pool_sqlite}}).
 -define(TELEMETRY, kura_sqlite_orm_telemetry).
 
@@ -76,6 +78,7 @@ all() ->
         booleans_and_dates_read_back_as_written,
         arrays_are_refused,
         other_scalar_types,
+        every_field_type_is_written_and_found,
         get_get_by_and_reload,
         update_stamps_and_keeps_the_rest,
         delete_removes_the_row,
@@ -268,7 +271,7 @@ arrays_are_refused(_Config) ->
     end.
 
 %% Stored as the database stores them: a decimal as a number, a uuid as its
-%% text. A time has no parameter form, so a write of one is an error.
+%% text, a time as its clock.
 other_scalar_types(_Config) ->
     {ok, #{id := Id}} = insert_author(#{
         name => ~"Bob", balance => 1.25, ref => ~"0192e4a0-7b1a-7c3e-8f00-000000000001"
@@ -283,11 +286,97 @@ other_scalar_types(_Config) ->
             where(kura_query:from(?AUTHOR), {ref, ~"0192e4a0-7b1a-7c3e-8f00-000000000001"})
         )
     ),
+    {ok, #{id := Early}} = insert_author(#{name => ~"Early", wakes => {7, 30, 0}}),
     ?assertMatch(
-        {error, #kura_changeset{valid = false}},
-        insert_author(#{name => ~"Late", wakes => {7, 30, 0}})
+        #{rows := [#{wakes := ~"07:30:00"}]},
+        kura_db:query(?REPO, ~"SELECT wakes FROM authors WHERE id = ?1", [Early])
     ),
-    ?assertEqual([~"Bob"], names(kura_query:from(?AUTHOR))).
+    ?assertEqual([~"Early"], names(where(kura_query:from(?AUTHOR), {wakes, {7, 30, 0}}))),
+    ?assertEqual([~"Early"], names(where(kura_query:from(?AUTHOR), {wakes, '<', {12, 5, 6}}))),
+    ?assertEqual([], names(where(kura_query:from(?AUTHOR), {wakes, '>', {12, 5, 6}}))).
+
+%% One value of every type SQLite stores goes through kura's dump, the
+%% dialect and the driver's bind. Each is read back with a raw query, as
+%% SQLite stores it, and the row is found by a condition on each value that
+%% can be compared.
+every_field_type_is_written_and_found(_Config) ->
+    Written = #{
+        int => 42,
+        big => 9007199254740993,
+        small => -7,
+        ratio => 2.5,
+        amount => 7,
+        name => ~"Ada",
+        body => ~"a longer text",
+        bytes => <<0, 255, 1>>,
+        active => true,
+        day => {2024, 2, 29},
+        wakes => {7, 30, 0},
+        at => {{2024, 1, 2}, {3, 4, 5}},
+        local_at => {{2024, 6, 7}, {8, 9, 10}},
+        ref => ~"0192e4a0-7b1a-7c3e-8f00-000000000001",
+        doc => #{~"k" => [1, true]},
+        role => admin,
+        token => ~"hidden",
+        label => ~"custom text",
+        raw => <<1, 2, 0>>
+    },
+    Stored = #{
+        int => {~"integer", 42},
+        big => {~"integer", 9007199254740993},
+        small => {~"integer", -7},
+        ratio => {~"real", 2.5},
+        amount => {~"integer", 7},
+        name => {~"text", ~"Ada"},
+        body => {~"text", ~"a longer text"},
+        bytes => {~"blob", <<0, 255, 1>>},
+        active => {~"integer", 1},
+        day => {~"text", ~"2024-02-29"},
+        wakes => {~"text", ~"07:30:00"},
+        at => {~"text", ~"2024-01-02 03:04:05"},
+        local_at => {~"text", ~"2024-06-07 08:09:10"},
+        ref => {~"text", ~"0192e4a0-7b1a-7c3e-8f00-000000000001"},
+        doc => {~"text", ~"{\"k\":[1,true]}"},
+        role => {~"text", ~"admin"},
+        label => {~"text", ~"custom text"},
+        raw => {~"blob", <<1, 2, 0>>}
+    },
+    ?assertEqual(
+        lists:sort([id | maps:keys(Written)]),
+        lists:sort(maps:keys(kura_schema:field_types(?EVERY)))
+    ),
+    {ok, #{id := Id}} = kura_repo_worker:insert(
+        ?REPO, kura_changeset:cast(?EVERY, #{}, Written, maps:keys(Written))
+    ),
+    [
+        ?assertEqual({Field, {Class, Value}}, {Field, stored(Field, Id)})
+     || Field := {Class, Value} <- Stored
+    ],
+    ?assertMatch({~"blob", <<_/binary>>}, stored(token, Id)),
+    ?assertNotEqual({~"blob", ~"hidden"}, stored(token, Id)),
+    Compared = maps:without([doc, token], Written),
+    [
+        ?assertEqual(
+            {Field, [#{id => Id}]},
+            {Field, all(kura_query:select(where(kura_query:from(?EVERY), {Field, Value}), [id]))}
+        )
+     || Field := Value <- Compared
+    ],
+    {ok, 1} = kura_repo_worker:update_all(
+        ?REPO, where(kura_query:from(?EVERY), {id, Id}), #{
+            wakes => {23, 59, 60}, day => {1999, 12, 31}, active => false
+        }
+    ),
+    ?assertEqual({~"text", ~"23:59:60"}, stored(wakes, Id)),
+    ?assertEqual({~"text", ~"1999-12-31"}, stored(day, Id)),
+    ?assertEqual({~"integer", 0}, stored(active, Id)),
+    {ok, 1} = kura_repo_worker:insert_all(?REPO, ?EVERY, [maps:without([token], Written)]),
+    ?assertEqual(
+        {ok, 2},
+        kura_repo_worker:count(
+            ?REPO, where(kura_query:from(?EVERY), {wakes, in, [{7, 30, 0}, {23, 59, 60}]})
+        )
+    ).
 
 get_get_by_and_reload(_Config) ->
     {ok, #{id := Id} = Author} = insert_author(#{name => ~"Ada", email => ~"ada@example.com"}),
@@ -1279,6 +1368,22 @@ create_table(Schema) ->
      || #kura_embed{name = Name, type = Type, schema = Embedded} <- kura_schema:embeds(Schema)
     ],
     run_operation({create_table, Schema:table(), Columns ++ Embeds}).
+
+%% A column of `every_type` as SQLite holds it: its storage class and value.
+stored(Field, Id) ->
+    Column = atom_to_binary(Field),
+    #{rows := [#{class := Class, value := Value}]} = kura_db:query(
+        ?REPO,
+        [
+            ~"SELECT typeof(\"",
+            Column,
+            ~"\") AS class, \"",
+            Column,
+            ~"\" AS value FROM every_type WHERE id = ?1"
+        ],
+        [Id]
+    ),
+    {Class, Value}.
 
 run_operation(Operation) ->
     #{} = kura_db:query(?REPO, kura_migrator:compile_operation(?REPO, Operation), []),

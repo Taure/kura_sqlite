@@ -145,11 +145,13 @@ the workload. esqlite sets 2 seconds by default.
   `~"1"`. A `{{Y, M, D}, {H, Mi, S}}` datetime binds as the text
   `YYYY-MM-DD HH:MM:SS`, the form SQLite's `datetime()` and
   `CURRENT_TIMESTAMP` produce, and a `{Y, M, D}` date whose year is above
-  24 binds as `YYYY-MM-DD`. A three-integer tuple whose first element is
-  24 or less could be a `{H, M, S}` time, so it is refused as
-  `{error, {unsupported_param, N}}`; pass a time as text. Other atoms bind
-  as their name. Results are not normalized: a boolean reads back as 0/1
-  and a date as its text.
+  24 binds as `YYYY-MM-DD`. Any other three-integer tuple that is a time of
+  day, `{H, M, S}` up to `{23, 59, 60}` or `{24, 0, 0}`, binds as
+  `HH:MM:SS`, its clock unchanged. A date in the years 0 to 23 therefore
+  binds as a time: pass such a date as text. A tuple that is neither is
+  refused as `{error, {unsupported_param, N}}`. Other atoms bind as their
+  name. The driver returns a row as SQLite stores it: a boolean as 0/1, a
+  date or a time as its text.
 - `query/5` always opens a fresh checkout when not in a transaction;
   there is no per-query optimization yet.
 """.
@@ -574,9 +576,10 @@ boolean_int(true) -> 1;
 boolean_int(false) -> 0.
 
 %% A date tuple is told from a {H, M, S} time by its year, so years up to 24
-%% do not bind as dates. A datetime goes through gregorian seconds, so
+%% do not bind as dates, and a three-integer tuple that is not a date binds
+%% as a time when it is one. A datetime goes through gregorian seconds, so
 %% 24:00:00 and a leap second are stored as the instant they name, the way
-%% kura's cast reads them.
+%% kura's cast reads them. A time keeps its clock, as kura's cast does.
 -spec date_param(tuple()) -> {ok, binary()} | error.
 date_param({{Y, Mo, D} = Date, {H, Mi, S}}) when
     is_integer(Y), is_integer(Mo), is_integer(D), is_integer(H), is_integer(Mi), is_integer(S)
@@ -591,10 +594,17 @@ date_param({{Y, Mo, D} = Date, {H, Mi, S}}) when
 date_param({Y, Mo, D} = Date) when is_integer(Y), is_integer(Mo), is_integer(D) ->
     case Y > 24 andalso Y =< 9999 andalso calendar:valid_date(Date) of
         true -> {ok, date_text(Date)};
-        false -> error
+        false -> time_param(Date)
     end;
 date_param(_) ->
     error.
+
+-spec time_param({integer(), integer(), integer()}) -> {ok, binary()} | error.
+time_param({H, Mi, S}) ->
+    case valid_time(H, Mi, S) of
+        true -> {ok, iolist_to_binary(io_lib:format("~2..0B:~2..0B:~2..0B", [H, Mi, S]))};
+        false -> error
+    end.
 
 -spec valid_time(integer(), integer(), integer()) -> boolean().
 valid_time(24, 0, 0) ->
