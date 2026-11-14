@@ -166,11 +166,19 @@ init_per_testcase(_Case, Config) ->
     ],
     Config.
 
-end_per_testcase(_Case, _Config) ->
+end_per_testcase(require_tenant, _Config) ->
     _ = kura_tenant:clear_tenant(),
     application:unset_env(kura, require_tenant),
-    kura_tenant:reload_settings(),
+    restarted();
+end_per_testcase(_Case, _Config) ->
+    _ = kura_tenant:clear_tenant(),
     ok.
+
+%% A repo takes require_tenant from the application environment when its
+%% pool starts.
+restarted() ->
+    ok = kura_db:stop_pool(?REPO),
+    ok = kura_db:start_pool(?REPO).
 
 %%----------------------------------------------------------------------
 %% Rows
@@ -1213,7 +1221,10 @@ custom_and_absent_timestamps(_Config) ->
     {ok, Tag} = kura_repo_worker:insert(
         ?REPO, kura_changeset:cast(?TAG, #{}, #{name => ~"erlang"}, [name])
     ),
-    ?assertMatch(#{inserted_at := undefined, updated_at := undefined}, Tag).
+    %% Until kura 3.0 an empty timestamps/0 keeps these two stamped.
+    ?assertMatch(
+        #{inserted_at := {{_, _, _}, {_, _, _}}, updated_at := {{_, _, _}, {_, _, _}}}, Tag
+    ).
 
 %%----------------------------------------------------------------------
 %% Tenants
@@ -1259,7 +1270,7 @@ require_tenant(_Config) ->
     {ok, 1} = kura_repo_worker:insert_all(?REPO, ?NOTE, [#{org_id => 1, body => ~"one"}]),
     {ok, 1} = kura_repo_worker:insert_all(?REPO, ?PLAN, [#{name => ~"free"}]),
     application:set_env(kura, require_tenant, true),
-    kura_tenant:reload_settings(),
+    ok = restarted(),
     ?assertError({kura, {tenant_required, _}}, kura_repo_worker:all(?REPO, kura_query:from(?NOTE))),
     ?assertMatch({ok, [#{name := ~"free"}]}, kura_repo_worker:all(?REPO, kura_query:from(?PLAN))),
     kura_tenant:with_tenant({attribute, {org_id, 1}}, fun() ->
