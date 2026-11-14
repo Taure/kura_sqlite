@@ -92,7 +92,8 @@ refuses a query that needs one with
   only.
 - **Row locks**: SQLite locks the whole database, so `kura_query:lock/2`
   raises `{kura, {unsupported_capability, row_locks, kura_pool_sqlite}}`
-  (`select_for_update_skip_locked` for a `skip_locked` lock).
+  (`select_for_update_skip_locked` for a lock that skips locked rows),
+  whichever form the lock is given in: a term, a map, a list or text.
   `kura_query:distinct/2` with fields (`DISTINCT ON`) raises the same
   error with `distinct_on`, and `{Field, matches, Query}` with
   `full_text_search`.

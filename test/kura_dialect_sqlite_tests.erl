@@ -1428,6 +1428,48 @@ unsupported_query_raises_test_() ->
             ?_assertMatch({_, []}, kura_dialect_sqlite:to_sql(kura_query:distinct(Q)))
         ].
 
+%% Every form kura_query:lock_clause/1 reads is refused as the lock it stands
+%% for. A fragment is not read, so it is a row lock whatever its text says.
+every_lock_form_is_refused_as_what_it_stands_for_test_() ->
+    Q = kura_query:from(?BLOB_SCHEMA),
+    Skipping = [
+        {for_update, skip_locked},
+        {for_update, #{wait => skip_locked}},
+        {for_share, #{tables => [vault], wait => skip_locked}},
+        [for_share, {for_update, skip_locked}],
+        [{for_update, #{tables => [vault]}}, {for_share, #{wait => skip_locked}}],
+        ~"for update skip locked",
+        ~"FOR SHARE OF vault SKIP LOCKED"
+    ],
+    Waiting = [
+        for_key_share,
+        {for_update, nowait},
+        {for_update, #{tables => [vault]}},
+        {for_update, #{tables => [vault], wait => nowait}},
+        [for_update, {for_share, nowait}],
+        ~"FOR NO KEY UPDATE",
+        {fragment, ~"FOR UPDATE SKIP LOCKED"}
+    ],
+    [
+        ?_assertError(
+            ?REFUSED(select_for_update_skip_locked),
+            kura_dialect_sqlite:to_sql(Q#kura_query{lock = Lock})
+        )
+     || Lock <- Skipping
+    ] ++
+        [
+            ?_assertError(
+                ?REFUSED(row_locks), kura_dialect_sqlite:to_sql(Q#kura_query{lock = Lock})
+            )
+         || Lock <- Waiting
+        ] ++
+        [
+            ?_assertError(
+                {kura, {invalid_lock, {for_update, forever}}},
+                kura_dialect_sqlite:to_sql(Q#kura_query{lock = {for_update, forever}})
+            )
+        ].
+
 %% kura checks a query for a repo whose pool module is kura_pool_sqlite,
 %% whatever its dialect would compile: the PostgreSQL dialect has a lock
 %% clause and DISTINCT ON.

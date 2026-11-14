@@ -655,11 +655,22 @@ refuse_distance({distance, _Field, _Metric, _Vector}) -> error({unsupported, vec
 refuse_distance(_Expr) -> ok.
 
 %% SQLite locks the database, never a row. A transaction that has to keep
-%% other writers out takes the write lock with its first write.
+%% other writers out takes the write lock with its first write. The lock is
+%% read as kura reads it, so every form of one is refused alike.
 -spec refuse_lock(term()) -> ok.
-refuse_lock(undefined) -> ok;
-refuse_lock({_Strength, skip_locked}) -> error(?UNSUPPORTED(select_for_update_skip_locked));
-refuse_lock(_Lock) -> error(?UNSUPPORTED(row_locks)).
+refuse_lock(undefined) ->
+    ok;
+refuse_lock(Lock) ->
+    case skips_locked(kura_query:lock_clause(Lock)) of
+        true -> error(?UNSUPPORTED(select_for_update_skip_locked));
+        false -> error(?UNSUPPORTED(row_locks))
+    end.
+
+-spec skips_locked(kura_query:lock() | kura_query:row_lock()) -> boolean().
+skips_locked([_ | _] = Clauses) -> lists:any(fun skips_locked/1, Clauses);
+skips_locked({_Strength, skip_locked}) -> true;
+skips_locked({_Strength, #{wait := skip_locked}}) -> true;
+skips_locked(_Clause) -> false.
 
 -spec refuse_distinct_on(term()) -> ok.
 refuse_distinct_on(Fields) when is_list(Fields) -> error(?UNSUPPORTED(distinct_on));
