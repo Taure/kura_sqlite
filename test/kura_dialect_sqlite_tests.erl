@@ -77,8 +77,7 @@ column_type_basics_test_() ->
         ?_assertEqual(~"TEXT", kura_dialect_sqlite:column_type(jsonb)),
         ?_assertEqual(~"TEXT", kura_dialect_sqlite:column_type(utc_datetime)),
         ?_assertMatch(<<"BLOB", _/binary>>, kura_dialect_sqlite:column_type(binary)),
-        ?_assertEqual(~"TEXT", kura_dialect_sqlite:column_type({enum, [a, b]})),
-        ?_assertEqual(~"TEXT", kura_dialect_sqlite:column_type({array, integer}))
+        ?_assertEqual(~"TEXT", kura_dialect_sqlite:column_type({enum, [a, b]}))
     ].
 
 %%----------------------------------------------------------------------
@@ -742,7 +741,6 @@ encrypted_forms_are_blob_columns_test_() ->
     Blob = kura_dialect_sqlite:column_type(binary),
     [
         ?_assertEqual(Blob, kura_dialect_sqlite:column_type({encrypted, string})),
-        ?_assertEqual(~"TEXT", kura_dialect_sqlite:column_type({array, string})),
         ?_assertError(
             {kura_crypto, unsupported_encrypted_type},
             kura_dialect_sqlite:column_type(?LOOKUP_SCHEMA:encrypted(string, not_options))
@@ -760,6 +758,8 @@ encrypted_forms_are_blob_columns_test_() ->
                 {kura_sqlite, {unsupported_type, Type}}, kura_dialect_sqlite:column_type(Type)
             )
          || Type <- [
+                {array, integer},
+                {array, string},
                 {array, {encrypted, string}},
                 {array, {array, {encrypted, string}}},
                 {array, ?DETERMINISTIC}

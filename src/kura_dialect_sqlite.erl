@@ -106,9 +106,11 @@ type that kura reports `unsupported` raises
 `{kura_crypto, unsupported_encrypted_type}` in `column_type/1`, as kura's
 PG dialect does, so a migration declaring one fails. A type with no
 SQLite storage raises `{kura_sqlite, {unsupported_type, Type}}`, and so
-does an array of an encrypted type: in `column_type/1`, and when a list is
+does an array (`{array, Inner}`): in `column_type/1`, and when a list is
 written to such a field by `insert`, `update`, `delete`, `insert_all` or
-the `SET` of `update_all`. A condition on an encrypted field, an array
+the `SET` of `update_all`. SQLite has no array type, and
+`kura_driver_sqlite` binds a list as one TEXT value, its elements run
+together. A condition on an encrypted field, an array
 of an encrypted type among them, other than `is_nil`, `is_not_nil` or a
 deterministic lookup raises
 `{kura_sqlite, {encrypted_field_in_where, Field}}`, in a where or a
@@ -348,8 +350,7 @@ storage_type(jsonb) ->
 storage_type({enum, _}) ->
     ~"TEXT";
 storage_type({array, _} = Type) ->
-    ok = supported_array(Type),
-    ~"TEXT";
+    erlang:error({kura_sqlite, {unsupported_type, Type}});
 storage_type({embed, _, _}) ->
     ~"TEXT";
 storage_type({custom, Mod}) ->
@@ -363,15 +364,6 @@ storage_type(Type) ->
         {ok, _Spec} -> ~"BLOB";
         unsupported -> erlang:error({kura_crypto, unsupported_encrypted_type});
         none -> erlang:error({kura_sqlite, {unsupported_type, Type}})
-    end.
-
-%% kura_driver_sqlite binds a list as one TEXT value, which would corrupt
-%% ciphertexts, so an array of an encrypted type is refused.
--spec supported_array({array, kura_types:kura_type()}) -> ok.
-supported_array({array, Inner} = Type) ->
-    case kura_types:encryption(Inner) of
-        none -> ok;
-        _ -> erlang:error({kura_sqlite, {unsupported_type, Type}})
     end.
 
 %% A default is whatever the schema declares.
@@ -663,12 +655,10 @@ blob_keys(Table, KeyClauses) ->
 blob_value(Field, Value, {_Types, Blobs}) when is_binary(Value), is_map_key(Field, Blobs) ->
     {blob, Value};
 blob_value(Field, Value, {Types, _Blobs}) when is_list(Value) ->
-    ok =
-        case Types of
-            #{Field := {array, _} = Type} -> supported_array(Type);
-            #{} -> ok
-        end,
-    Value;
+    case Types of
+        #{Field := {array, _} = Type} -> erlang:error({kura_sqlite, {unsupported_type, Type}});
+        #{} -> Value
+    end;
 blob_value(_Field, Value, _Fields) ->
     Value.
 
