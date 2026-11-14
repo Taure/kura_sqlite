@@ -169,13 +169,19 @@ convert_values_is_idempotent_and_never_raises_test_() ->
     Q = kura_query:from(?AUTHOR),
     Once = kura_dialect_sqlite:convert_values(kura_query:where(Q, {born, ?EARLY})),
     Malformed = [
-        Q#kura_query{wheres = [{born, ?EARLY} | improper]},
-        Q#kura_query{wheres = [{born, in, [?EARLY | improper]}]},
-        Q#kura_query{wheres = [{'and', [{born, ?EARLY} | improper]}]},
-        Q#kura_query{ctes = improper, combinations = [improper]}
+        Q#kura_query{wheres = improper([{born, ?EARLY}])},
+        Q#kura_query{wheres = [{born, in, improper([?EARLY])}]},
+        Q#kura_query{wheres = [{'and', improper([{born, ?EARLY}])}]},
+        Q#kura_query{ctes = improper([]), combinations = improper([{union, Q}])}
     ],
     [?_assertEqual(Once, kura_dialect_sqlite:convert_values(Once))] ++
         [?_assertEqual(Query, kura_dialect_sqlite:convert_values(Query)) || Query <- Malformed].
+
+%% `List` ending in an atom, as only a hand-built query holds one. No type
+%% describes it, and eqwalizer refuses to see one written out.
+-spec improper([term()]) -> dynamic().
+improper(List) ->
+    apply(erlang, '++', [List, improper]).
 
 an_early_date_written_to_a_date_field_is_its_text_test_() ->
     Values = #{born => ?EARLY, wakes => ?EARLY, name => ~"Ada"},
@@ -200,7 +206,7 @@ an_early_date_written_to_a_date_field_is_its_text_test_() ->
             kura_dialect_sqlite:update_all(kura_query:from(?AUTHOR), #{born => ?EARLY})
         ),
         ?_assertMatch(
-            {_, [?EARLY]}, kura_dialect_sqlite:insert(~"authors", [born], #{born => ?EARLY})
+            {_, [?EARLY]}, kura_dialect_sqlite:insert(authors, [born], #{born => ?EARLY})
         )
     ].
 
@@ -1604,13 +1610,18 @@ every_lock_form_is_refused_as_what_it_stands_for_test_() ->
                 ?REFUSED(row_locks), kura_dialect_sqlite:to_sql(Q#kura_query{lock = Lock})
             )
          || Lock <- Waiting
-        ] ++
-        [
-            ?_assertError(
-                {kura, {invalid_lock, {for_update, forever}}},
-                kura_dialect_sqlite:to_sql(Q#kura_query{lock = {for_update, forever}})
-            )
         ].
+
+%% Text kura cannot read as a lock is refused by kura under strict_locks.
+a_lock_kura_cannot_read_is_kuras_to_refuse_test_() ->
+    {setup, fun() -> application:set_env(kura, strict_locks, true) end,
+        fun(_) -> application:unset_env(kura, strict_locks) end, fun(_) ->
+            Q = kura_query:from(?BLOB_SCHEMA),
+            ?_assertError(
+                {kura, {invalid_lock, ~"FOR EVER"}},
+                kura_dialect_sqlite:to_sql(Q#kura_query{lock = ~"FOR EVER"})
+            )
+        end}.
 
 %% kura checks a query for a repo whose pool module is kura_pool_sqlite,
 %% whatever its dialect would compile: the PostgreSQL dialect has a lock

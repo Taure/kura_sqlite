@@ -760,7 +760,7 @@ refuse_lock(Lock) ->
         false -> error(?UNSUPPORTED(row_locks))
     end.
 
--spec skips_locked(kura_query:lock() | kura_query:row_lock()) -> boolean().
+-spec skips_locked(term()) -> boolean().
 skips_locked([_ | _] = Clauses) -> lists:any(fun skips_locked/1, Clauses);
 skips_locked({_Strength, skip_locked}) -> true;
 skips_locked({_Strength, #{wait := skip_locked}}) -> true;
