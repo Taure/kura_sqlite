@@ -63,8 +63,12 @@ refuses a query that needs one with
   date whose year is above 24 as `YYYY-MM-DD`. Any other three-integer
   tuple that is a time of day (`{H, M, S}` up to `{23, 59, 60}`, or
   `{24, 0, 0}`) binds as `HH:MM:SS`, so a `time` field is written and
-  filtered as TEXT too. A date in the years 0 to 23 has that shape and
-  binds as a time: pass such a date as text.
+  filtered as TEXT too. A date in the years 0 to 23 has that shape, and
+  the driver binds it as a time. Through a schema it stays a date: a date
+  of the years 0 to 24 written to a `date` field, or compared with one of
+  the query's `from` schema, is bound as `YYYY-MM-DD`. In a raw statement,
+  a having or a condition on a joined schema's field, pass such a date as
+  text.
   A binary datetime filter value is compared as text, so it matches only
   a row stored in the same form (`~"2024-01-02 01:00:00"`, not
   `~"2024-01-02T01:00:00Z"`). A day the month does not have

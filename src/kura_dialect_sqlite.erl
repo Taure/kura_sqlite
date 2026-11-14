@@ -179,6 +179,7 @@ reach SQLite.
     format_default/1,
     placeholder/1,
     load_stored/2,
+    convert_values/1,
     swap_placeholders/1,
     blob_checks/1,
     blob_columns/1
@@ -223,9 +224,8 @@ reach SQLite.
         Type =:= naive_datetime)
 ).
 
--type schema_fields() :: {
-    Types :: #{atom() => kura_types:kura_type()}, Blobs :: #{atom() => kura_types:kura_type()}
-}.
+-type field_types() :: #{atom() => kura_types:kura_type()}.
+-type schema_fields() :: {Types :: field_types(), Blobs :: field_types()}.
 
 %% How a where-field is written when not as its own quoted name: under
 %% another column name, qualified with the from table, or both.
@@ -342,6 +342,100 @@ load_stored(Type, Text) when ?IS_TEMPORAL(Type), is_binary(Text) ->
         {error, _} -> Text
     end;
 load_stored(_Type, Value) ->
+    Value.
+
+-doc """
+Writes a date of the years 0 to 24 as its text, `YYYY-MM-DD`, where a query
+compares it with a `date` field of its `from` schema.
+
+The driver binds a tuple by its shape, and `{12, 5, 6}` has the shape of a
+time of day. The field's type says it is a date. This covers `=`, `!=`,
+`<`, `>`, `<=`, `>=`, `in`, `not_in` and `between`, under `and`, `or` and
+`not`, in the query and in every CTE, combined query and subquery it holds.
+A having, a field of a joined schema and a fragment bind what they are
+given.
+""".
+-spec convert_values(#kura_query{}) -> #kura_query{}.
+convert_values(
+    #kura_query{from = From, wheres = Wheres, ctes = Ctes, combinations = Combinations} = Query
+) ->
+    {Types, _Blobs} = schema_fields(From),
+    Query#kura_query{
+        wheres = dated_conditions(Types, Wheres),
+        ctes = dated_queries(Ctes),
+        combinations = dated_queries(Combinations)
+    }.
+
+%% A hand-built query can hold an improper list. It is left as it is: kura
+%% refuses it later, and a crash here would carry the query's values.
+-spec dated_queries(dynamic()) -> dynamic().
+dated_queries(Named) ->
+    case is_proper(Named) of
+        true -> [dated_query(Entry) || Entry <- Named];
+        false -> Named
+    end.
+
+-spec dated_query(term()) -> term().
+dated_query({Name, #kura_query{} = Query}) -> {Name, convert_values(Query)};
+dated_query(Entry) -> Entry.
+
+-spec dated_conditions(field_types(), dynamic()) -> dynamic().
+dated_conditions(Types, Conditions) ->
+    case is_proper(Conditions) of
+        true -> [dated_condition(Types, Condition) || Condition <- Conditions];
+        false -> Conditions
+    end.
+
+-spec dated_condition(field_types(), term()) -> term().
+dated_condition(Types, {Junction, Conditions}) when
+    (Junction =:= 'and' orelse Junction =:= 'or'), is_list(Conditions)
+->
+    {Junction, dated_conditions(Types, Conditions)};
+dated_condition(Types, {'not', Condition}) ->
+    {'not', dated_condition(Types, Condition)};
+dated_condition(_Types, {Exists, {subquery, #kura_query{} = Query}}) when
+    Exists =:= exists; Exists =:= not_exists
+->
+    {Exists, {subquery, convert_values(Query)}};
+dated_condition(_Types, {Field, Op, {subquery, #kura_query{} = Query}}) ->
+    {Field, Op, {subquery, convert_values(Query)}};
+dated_condition(Types, {Field, Op, Values}) when
+    is_atom(Field), is_list(Values), (Op =:= in orelse Op =:= not_in)
+->
+    case is_proper(Values) of
+        true -> {Field, Op, [dated(Types, Field, Value) || Value <- Values]};
+        false -> {Field, Op, Values}
+    end;
+dated_condition(Types, {Field, between, {Low, High}}) when is_atom(Field) ->
+    {Field, between, {dated(Types, Field, Low), dated(Types, Field, High)}};
+dated_condition(Types, {Field, Op, Value}) when is_atom(Field), ?IS_COMPARISON(Op) ->
+    {Field, Op, dated(Types, Field, Value)};
+dated_condition(Types, {Field, Value}) when is_atom(Field) ->
+    {Field, dated(Types, Field, Value)};
+dated_condition(_Types, Condition) ->
+    Condition.
+
+-spec is_proper(term()) -> boolean().
+is_proper([]) -> true;
+is_proper([_ | Rest]) -> is_proper(Rest);
+is_proper(_) -> false.
+
+%% The years the driver takes for a time of day. Any other date it writes
+%% as this text itself.
+-spec dated(field_types(), atom(), term()) -> term().
+dated(Types, Field, {Y, M, D} = Date) when
+    is_integer(Y), is_integer(M), is_integer(D), Y >= 0, Y =< 24
+->
+    case Types of
+        #{Field := date} ->
+            case calendar:valid_date(Date) of
+                true -> iolist_to_binary(io_lib:format("~4..0B-~2..0B-~2..0B", [Y, M, D]));
+                false -> Date
+            end;
+        #{} ->
+            Date
+    end;
+dated(_Types, _Field, Value) ->
     Value.
 
 %%----------------------------------------------------------------------
@@ -711,8 +805,8 @@ blob_value(Field, Value, {Types, _Blobs}) when is_list(Value) ->
         #{Field := {array, _} = Type} -> erlang:error({kura_sqlite, {unsupported_type, Type}});
         #{} -> Value
     end;
-blob_value(_Field, Value, _Fields) ->
-    Value.
+blob_value(Field, Value, {Types, _Blobs}) ->
+    dated(Types, Field, Value).
 
 -spec blob_fields(term()) -> #{atom() => kura_types:kura_type()}.
 blob_fields(Table) ->

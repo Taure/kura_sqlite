@@ -15,6 +15,7 @@ result it gives on PostgreSQL or is refused before a statement runs.
     arrays_are_refused/1,
     other_scalar_types/1,
     a_decimal_is_the_number_sqlite_holds/1,
+    an_early_date_is_a_date_on_a_date_field/1,
     every_field_type_is_written_and_found/1,
     booleans_and_dates_read_back_as_written/1,
     get_get_by_and_reload/1,
@@ -83,6 +84,7 @@ all() ->
         arrays_are_refused,
         other_scalar_types,
         a_decimal_is_the_number_sqlite_holds,
+        an_early_date_is_a_date_on_a_date_field,
         every_field_type_is_written_and_found,
         get_get_by_and_reload,
         update_stamps_and_keeps_the_rest,
@@ -337,6 +339,31 @@ a_decimal_is_the_number_sqlite_holds(_Config) ->
             ?REPO, ~"SELECT typeof(balance) AS kind FROM authors WHERE name = 'long'", []
         )
     ).
+
+%% A date of the years 0 to 24 has the shape of a time of day, which is what
+%% the driver binds it as. Written to a date field, or compared with one, it
+%% is a date; on a time field the same tuple is a time.
+an_early_date_is_a_date_on_a_date_field(_Config) ->
+    Early = {12, 5, 6},
+    {ok, #{id := Id}} = insert_author(#{name => ~"Old", born => Early, wakes => Early}),
+    Stored = fun() ->
+        kura_db:query(?REPO, ~"SELECT born, wakes FROM authors WHERE id = ?1", [Id])
+    end,
+    ?assertMatch(#{rows := [#{born := ~"0012-05-06", wakes := ~"12:05:06"}]}, Stored()),
+    ?assertMatch(
+        {ok, #{born := Early, wakes := Early}}, kura_repo_worker:get(?REPO, ?AUTHOR, Id)
+    ),
+    Born = fun(Condition) -> names(where(kura_query:from(?AUTHOR), Condition)) end,
+    ?assertEqual([~"Old"], Born({born, Early})),
+    ?assertEqual([], Born({born, {13, 5, 6}})),
+    ?assertEqual([~"Old"], Born({born, '<', {24, 12, 31}})),
+    ?assertEqual([~"Old"], Born({born, in, [{1, 1, 1}, Early]})),
+    ?assertEqual([~"Old"], Born({born, between, {{0, 1, 1}, {23, 1, 1}}})),
+    ?assertEqual([~"Old"], Born({wakes, Early})),
+    {ok, 1} = kura_repo_worker:update_all(
+        ?REPO, where(kura_query:from(?AUTHOR), {born, Early}), #{born => {3, 2, 1}}
+    ),
+    ?assertMatch(#{rows := [#{born := ~"0003-02-01"}]}, Stored()).
 
 %% One value of every type SQLite stores goes through kura's dump, the
 %% dialect and the driver's bind. Each is read back with a raw query, as

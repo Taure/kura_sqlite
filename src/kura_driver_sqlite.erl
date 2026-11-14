@@ -176,9 +176,10 @@ the workload. esqlite sets 2 seconds by default.
   24 binds as `YYYY-MM-DD`. Any other three-integer tuple that is a time of
   day, `{H, M, S}` up to `{23, 59, 60}` or `{24, 0, 0}`, binds as
   `HH:MM:SS`, its clock unchanged. A date in the years 0 to 23 therefore
-  binds as a time: pass such a date as text. A tuple that is neither is
-  refused as `{error, {unsupported_param, N}}`. Other atoms bind as their
-  name. The driver returns a row as SQLite stores it: a boolean as 0/1, a
+  binds as a time: pass such a date as text. `m:kura_dialect_sqlite` does
+  so for one written to a `date` field of a schema or compared with one. A
+  tuple that is neither is refused as `{error, {unsupported_param, N}}`.
+  Other atoms bind as their name. The driver returns a row as SQLite stores it: a boolean as 0/1, a
   date or a time as its text.
 - `query/5` always opens a fresh checkout when not in a transaction;
   there is no per-query optimization yet.

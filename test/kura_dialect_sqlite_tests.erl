@@ -63,6 +63,132 @@ kura_reads_a_row_through_the_dialect_test() ->
     ?assert(kura_dialect:loads_stored(kura_dialect_sqlite)).
 
 %%----------------------------------------------------------------------
+%% A date of the years 0 to 24
+%%----------------------------------------------------------------------
+
+-define(AUTHOR, kura_sqlite_orm_author).
+-define(EARLY, {12, 5, 6}).
+-define(EARLY_TEXT, ~"0012-05-06").
+
+an_early_date_compared_with_a_date_field_is_its_text_test_() ->
+    Q = kura_query:from(?AUTHOR),
+    Sub = kura_query:where(Q, {born, ?EARLY}),
+    Converted = fun(Condition) ->
+        #kura_query{wheres = [Where]} = kura_dialect_sqlite:convert_values(
+            Q#kura_query{wheres = [Condition]}
+        ),
+        Where
+    end,
+    [
+        ?_assertEqual({born, ?EARLY_TEXT}, Converted({born, ?EARLY})),
+        ?_assertEqual({born, '<', ?EARLY_TEXT}, Converted({born, '<', ?EARLY})),
+        ?_assertEqual(
+            {born, in, [?EARLY_TEXT, {2024, 1, 2}, ~"0001-01-01"]},
+            Converted({born, in, [?EARLY, {2024, 1, 2}, ~"0001-01-01"]})
+        ),
+        ?_assertEqual(
+            {born, between, {~"0000-01-01", ?EARLY_TEXT}},
+            Converted({born, between, {{0, 1, 1}, ?EARLY}})
+        ),
+        ?_assertEqual(
+            {'or', [{'not', {born, ?EARLY_TEXT}}, {'and', [{born, '>=', ~"0024-12-31"}]}]},
+            Converted({'or', [{'not', {born, ?EARLY}}, {'and', [{born, '>=', {24, 12, 31}}]}]})
+        ),
+        ?_assertMatch(
+            {id, in, {subquery, #kura_query{wheres = [{born, ?EARLY_TEXT}]}}},
+            Converted({id, in, {subquery, Sub}})
+        ),
+        ?_assertMatch(
+            {exists, {subquery, #kura_query{wheres = [{born, ?EARLY_TEXT}]}}},
+            Converted({exists, {subquery, Sub}})
+        ),
+        ?_assertMatch(
+            #kura_query{
+                ctes = [{~"early", #kura_query{wheres = [{born, ?EARLY_TEXT}]}}],
+                combinations = [{union, #kura_query{wheres = [{born, ?EARLY_TEXT}]}}]
+            },
+            kura_dialect_sqlite:convert_values(
+                kura_query:union(kura_query:with_cte(Q, ~"early", Sub), Sub)
+            )
+        )
+    ].
+
+only_an_early_date_on_a_date_field_is_converted_test_() ->
+    Q = kura_query:from(?AUTHOR),
+    Kept = [
+        {wakes, ?EARLY},
+        {wakes, '<', ?EARLY},
+        {born, {2024, 1, 2}},
+        {born, {25, 1, 1}},
+        {born, {12, 13, 40}},
+        {born, {-1, 5, 6}},
+        {born, ?EARLY_TEXT},
+        {born, is_nil},
+        {name, ?EARLY},
+        {inserted_at, {?EARLY, {1, 2, 3}}},
+        {{author, born}, ?EARLY},
+        {fragment, ~"born = ?", [?EARLY]}
+    ],
+    [
+        ?_assertEqual(
+            Q#kura_query{wheres = [Condition]},
+            kura_dialect_sqlite:convert_values(Q#kura_query{wheres = [Condition]})
+        )
+     || Condition <- Kept
+    ] ++
+        [
+            ?_assertEqual(
+                #kura_query{from = ~"authors", wheres = [{born, ?EARLY}]},
+                kura_dialect_sqlite:convert_values(
+                    #kura_query{from = ~"authors", wheres = [{born, ?EARLY}]}
+                )
+            ),
+            ?_assertEqual(
+                Q#kura_query{havings = [{born, ?EARLY}]},
+                kura_dialect_sqlite:convert_values(Q#kura_query{havings = [{born, ?EARLY}]})
+            )
+        ].
+
+convert_values_is_idempotent_and_never_raises_test_() ->
+    Q = kura_query:from(?AUTHOR),
+    Once = kura_dialect_sqlite:convert_values(kura_query:where(Q, {born, ?EARLY})),
+    Malformed = [
+        Q#kura_query{wheres = [{born, ?EARLY} | improper]},
+        Q#kura_query{wheres = [{born, in, [?EARLY | improper]}]},
+        Q#kura_query{wheres = [{'and', [{born, ?EARLY} | improper]}]},
+        Q#kura_query{ctes = improper, combinations = [improper]}
+    ],
+    [?_assertEqual(Once, kura_dialect_sqlite:convert_values(Once))] ++
+        [?_assertEqual(Query, kura_dialect_sqlite:convert_values(Query)) || Query <- Malformed].
+
+an_early_date_written_to_a_date_field_is_its_text_test_() ->
+    Values = #{born => ?EARLY, wakes => ?EARLY, name => ~"Ada"},
+    Fields = [born, wakes, name],
+    Written = [?EARLY_TEXT, ?EARLY, ~"Ada"],
+    [
+        ?_assertMatch({_, Written}, kura_dialect_sqlite:insert(?AUTHOR, Fields, Values)),
+        ?_assertMatch({_, Written}, kura_dialect_sqlite:insert(?AUTHOR, Fields, Values, #{})),
+        ?_assertMatch(
+            {_, [?EARLY_TEXT, ?EARLY, ~"Ada", ?EARLY_TEXT]},
+            kura_dialect_sqlite:update(?AUTHOR, Fields, Values, [{born, ?EARLY}])
+        ),
+        ?_assertMatch({_, [?EARLY_TEXT]}, kura_dialect_sqlite:delete(?AUTHOR, [{born, ?EARLY}])),
+        ?_assertMatch(
+            {_, [?EARLY_TEXT, ?EARLY, ~"Ada", {2024, 1, 2}, ?EARLY, ~"Bob"]},
+            kura_dialect_sqlite:insert_all(?AUTHOR, Fields, [
+                Values, #{born => {2024, 1, 2}, wakes => ?EARLY, name => ~"Bob"}
+            ])
+        ),
+        ?_assertMatch(
+            {_, [?EARLY_TEXT]},
+            kura_dialect_sqlite:update_all(kura_query:from(?AUTHOR), #{born => ?EARLY})
+        ),
+        ?_assertMatch(
+            {_, [?EARLY]}, kura_dialect_sqlite:insert(~"authors", [born], #{born => ?EARLY})
+        )
+    ].
+
+%%----------------------------------------------------------------------
 %% swap_placeholders/1
 %%----------------------------------------------------------------------
 
