@@ -14,7 +14,7 @@ result it gives on PostgreSQL or is refused before a statement runs.
     insert_writes_a_renamed_column/1,
     arrays_are_refused/1,
     other_scalar_types/1,
-    booleans_and_dates_read_back_as_stored/1,
+    booleans_and_dates_read_back_as_written/1,
     get_get_by_and_reload/1,
     update_stamps_and_keeps_the_rest/1,
     delete_removes_the_row/1,
@@ -73,7 +73,7 @@ all() ->
     [
         insert_returns_the_row,
         insert_writes_a_renamed_column,
-        booleans_and_dates_read_back_as_stored,
+        booleans_and_dates_read_back_as_written,
         arrays_are_refused,
         other_scalar_types,
         get_get_by_and_reload,
@@ -207,18 +207,21 @@ insert_writes_a_renamed_column(_Config) ->
     Selected = kura_query:select(kura_query:from(?AUTHOR), [email]),
     ?assertEqual({ok, [#{email => ~"ada@example.com"}]}, kura_repo_worker:all(?REPO, Selected)).
 
-%% kura_types:load/2 has no clause for the form SQLite stores a boolean, a
-%% date or a datetime in, and kura_db:load_row/2 keeps a value it cannot
-%% load. Conditions take the Erlang values.
-booleans_and_dates_read_back_as_stored(_Config) ->
+%% SQLite stores a boolean as 0 or 1 and a date or a datetime as text. kura
+%% loads them back as the values that were written.
+booleans_and_dates_read_back_as_written(_Config) ->
     {ok, #{id := Id} = Author} = insert_author(#{
         name => ~"Bob", active => false, born => {1990, 1, 2}
     }),
     ?assertMatch(
-        #{active := 0, born := ~"1990-01-02", inserted_at := <<_:19/binary>>}, Author
+        #{active := false, born := {1990, 1, 2}, inserted_at := {{_, _, _}, {_, _, _}}}, Author
+    ),
+    ?assertMatch(
+        #{rows := [#{active := 0, born := ~"1990-01-02", inserted_at := <<_:19/binary>>}]},
+        kura_db:query(?REPO, ~"SELECT active, born, inserted_at FROM authors WHERE id = ?1", [Id])
     ),
     {ok, Read} = kura_repo_worker:get(?REPO, ?AUTHOR, Id),
-    ?assertMatch(#{active := 0, born := ~"1990-01-02", inserted_at := <<_:19/binary>>}, Read),
+    ?assertEqual(maps:without([posts, address], Author), maps:without([posts, address], Read)),
     Q = kura_query:from(?AUTHOR),
     ?assertEqual([~"Bob"], names(where(Q, {active, false}))),
     ?assertEqual([~"Bob"], names(where(Q, {born, {1990, 1, 2}}))),
@@ -313,11 +316,11 @@ update_stamps_and_keeps_the_rest(_Config) ->
         #{
             name := ~"Ada",
             email := ~"countess@example.com",
-            inserted_at := ~"2000-01-01 00:00:00"
+            inserted_at := {{2000, 1, 1}, {0, 0, 0}}
         },
         Updated
     ),
-    ?assertNotEqual(~"2000-01-01 00:00:00", maps:get(updated_at, Updated)),
+    ?assertNotEqual({{2000, 1, 1}, {0, 0, 0}}, maps:get(updated_at, Updated)),
     ?assertEqual(maps:get(lock_version, Author), maps:get(lock_version, Updated)),
     ?assertMatch(
         #{rows := [#{email_address := ~"countess@example.com"}]},
@@ -508,7 +511,7 @@ joins(_Config) ->
         all(kura_query:select(where(Inner, {name, ~"Bob"}), [id, title]))
     ),
     Selected = kura_query:select(where(Inner, {modified_at, is_not_nil}), [title, modified_at]),
-    ?assertMatch([#{title := _, modified_at := <<_/binary>>} | _], all(Selected)).
+    ?assertMatch([#{title := _, modified_at := {{_, _, _}, {_, _, _}}} | _], all(Selected)).
 
 preloads(_Config) ->
     {#{id := AdaId}, #{id := BobId}} = seed_posts(),
@@ -580,7 +583,7 @@ group_by_and_having(_Config) ->
     Having = kura_query:having(Grouped, {fragment, ~"count(*) > ?", [1]}),
     ?assertMatch([#{members := 2}], all(Having)),
     ?assertEqual(
-        [#{active => 0}, #{active => 1}],
+        [#{active => false}, #{active => true}],
         all(
             kura_query:order_by(
                 kura_query:distinct(kura_query:select(kura_query:from(?AUTHOR), [active])),
@@ -938,7 +941,9 @@ optimistic_locking(_Config) ->
 
 custom_and_absent_timestamps(_Config) ->
     {ok, #{id := Id} = Post} = insert_post(#{title => ~"first"}),
-    ?assertMatch(#{created_at := <<_/binary>>, modified_at := <<_/binary>>}, Post),
+    ?assertMatch(
+        #{created_at := {{_, _, _}, {_, _, _}}, modified_at := {{_, _, _}, {_, _, _}}}, Post
+    ),
     #{} = kura_db:query(
         ?REPO,
         ~"UPDATE posts SET changed_at = '2000-01-01 00:00:00', created_at = '2000-01-01 00:00:00'",
@@ -948,8 +953,8 @@ custom_and_absent_timestamps(_Config) ->
     {ok, Updated} = kura_repo_worker:update(
         ?REPO, kura_changeset:cast(?POST, Old, #{title => ~"edited"}, [title])
     ),
-    ?assertMatch(#{created_at := ~"2000-01-01 00:00:00"}, Updated),
-    ?assertNotEqual(~"2000-01-01 00:00:00", maps:get(modified_at, Updated)),
+    ?assertMatch(#{created_at := {{2000, 1, 1}, {0, 0, 0}}}, Updated),
+    ?assertNotEqual({{2000, 1, 1}, {0, 0, 0}}, maps:get(modified_at, Updated)),
     ?assertMatch(
         #{rows := [#{n := 1}]},
         kura_db:query(
