@@ -13,8 +13,10 @@ that asobi-CT covers for Postgres but no app exercises for SQLite.
     migrate_creates_table/1,
     migrate_records_version_in_schema_migrations/1,
     rollback_of_a_referenced_table_is_refused/1,
-    rollback_drops_table/1
+    rollback_drops_table/1,
+    version_statements_use_the_sqlite_placeholder/1
 ]).
+-export([told/4]).
 
 -define(REPO, kura_sqlite_e2e_test_repo).
 -define(APP, kura_sqlite_e2e_test_app).
@@ -25,7 +27,8 @@ all() ->
         migrate_creates_table,
         migrate_records_version_in_schema_migrations,
         rollback_of_a_referenced_table_is_refused,
-        rollback_drops_table
+        rollback_drops_table,
+        version_statements_use_the_sqlite_placeholder
     ].
 
 init_per_suite(Config) ->
@@ -107,3 +110,30 @@ rollback_drops_table(_Config) ->
         []
     ),
     ?assertMatch(#{rows := []}, Result).
+
+%% The migrator writes its version bookkeeping with the dialect's
+%% placeholder/1, not with PostgreSQL's `$1`.
+version_statements_use_the_sqlite_placeholder(_Config) ->
+    ok = telemetry:attach(?MODULE, [kura, repo, query], fun ?MODULE:told/4, self()),
+    try
+        {ok, [?VERSION]} = kura_migrator:migrate(?REPO),
+        {ok, [?VERSION]} = kura_migrator:rollback(?REPO)
+    after
+        telemetry:detach(?MODULE)
+    end,
+    Queries = told(),
+    ?assert(
+        lists:member(~"INSERT INTO schema_migrations (version) VALUES (?1)", Queries), Queries
+    ),
+    ?assert(lists:member(~"DELETE FROM schema_migrations WHERE version = ?1", Queries), Queries),
+    ?assertEqual([], [Query || Query <- Queries, binary:match(Query, ~"$") =/= nomatch]).
+
+told(_Event, _Measurements, #{query := Query}, Collector) ->
+    Collector ! {query, Query},
+    ok.
+
+told() ->
+    receive
+        {query, Query} -> [Query | told()]
+    after 0 -> []
+    end.

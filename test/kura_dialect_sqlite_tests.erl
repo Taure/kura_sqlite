@@ -3,6 +3,17 @@
 -include_lib("kura/include/kura.hrl").
 
 %%----------------------------------------------------------------------
+%% placeholder/1
+%%----------------------------------------------------------------------
+
+placeholder_is_a_numbered_question_mark_test() ->
+    ?assertEqual(~"?1", iolist_to_binary(kura_dialect_sqlite:placeholder(1))),
+    ?assertEqual(~"?32766", iolist_to_binary(kura_dialect_sqlite:placeholder(32766))).
+
+kura_asks_the_dialect_for_its_placeholder_test() ->
+    ?assertEqual(~"?7", iolist_to_binary(kura_dialect:placeholder(kura_dialect_sqlite, 7))).
+
+%%----------------------------------------------------------------------
 %% swap_placeholders/1
 %%----------------------------------------------------------------------
 

@@ -177,6 +177,7 @@ reach SQLite.
     insert_all/4,
     column_type/1,
     format_default/1,
+    placeholder/1,
     swap_placeholders/1,
     blob_checks/1,
     blob_columns/1
@@ -304,6 +305,15 @@ insert_all(SchemaOrTable, Fields, Rows, Opts) ->
 check_parameter_count(Count) when Count =< ?MAX_BIND_PARAMETERS -> ok;
 check_parameter_count(Count) ->
     erlang:error({kura, {too_many_parameters, Count, ?MAX_BIND_PARAMETERS}}).
+
+-doc """
+The text of the `N`th bind parameter, `?N`. kura writes the statements it
+does not build from a query with it, such as the migrator's version
+bookkeeping.
+""".
+-spec placeholder(pos_integer()) -> iodata().
+placeholder(N) ->
+    [$?, integer_to_binary(N)].
 
 %%----------------------------------------------------------------------
 %% DDL: column type + default value emit
