@@ -558,16 +558,23 @@ where_unsupported_operator_on_byte_field_raises_test_() ->
         )
     ].
 
-where_unsupported_operator_on_text_field_is_untouched_test() ->
-    ?assertEqual({<<"\"name\" LIKE ?1">>, [~"n%"]}, where_sql({name, like, ~"n%"})).
+where_like_on_text_field_names_the_escape_test() ->
+    ?assertEqual(
+        {<<"\"name\" LIKE ?1 ESCAPE '\\'">>, [~"n%"]}, where_sql({name, like, ~"n%"})
+    ).
 
-where_left_alone_on_byte_field_test_() ->
+%% SQLite has no ILIKE, and `IN ()` is not SQL.
+where_uncast_on_byte_field_test_() ->
     [
-        ?_assertEqual({<<"\"data\" LIKE ?1">>, [~"d%"]}, where_sql({data, like, ~"d%"})),
-        ?_assertEqual({<<"\"data\" ILIKE ?1">>, [~"d%"]}, where_sql({data, ilike, ~"d%"})),
+        ?_assertEqual(
+            {<<"\"data\" LIKE ?1 ESCAPE '\\'">>, [~"d%"]}, where_sql({data, like, ~"d%"})
+        ),
+        ?_assertEqual(
+            {<<"\"data\" LIKE ?1 ESCAPE '\\'">>, [~"d%"]}, where_sql({data, ilike, ~"d%"})
+        ),
         ?_assertEqual({<<"\"data\" IS NOT NULL">>, []}, where_sql({data, is_not_nil})),
-        ?_assertEqual({<<"\"data\" IN ()">>, []}, where_sql({data, in, []})),
-        ?_assertEqual({<<"\"data\" NOT IN ()">>, []}, where_sql({data, not_in, []}))
+        ?_assertEqual({<<"1 = 0">>, []}, where_sql({data, in, []})),
+        ?_assertEqual({<<"1 = 1">>, []}, where_sql({data, not_in, []}))
     ].
 
 %% Ciphertext under a fresh nonce never equals another, so a condition on an
@@ -975,7 +982,7 @@ lookup_tests() ->
             encrypted_not_in,
             {<<"\"token\" NOT IN (CAST(?1 AS BLOB), CAST(?2 AS BLOB))">>, [~"f1", ~"f2"]}
         },
-        {where, Q, {token, encrypted_in, []}, encrypted_in, {<<"\"token\" IN ()">>, []}},
+        {where, Q, {token, encrypted_in, []}, encrypted_in, {<<"1 = 0">>, []}},
         {
             where,
             Q,
@@ -1244,3 +1251,83 @@ distance_query_through_the_compiler_raises_test_() ->
                 end)
             ]
         end}.
+
+%%----------------------------------------------------------------------
+%% Text matches
+%%----------------------------------------------------------------------
+
+text_match_test_() ->
+    Glob =
+        <<"replace(replace(replace(?1, '[', '[[]'), '*', '[*]'), char(63), '[' || char(63) || ']')">>,
+    Like = <<"replace(replace(replace(?1, '!', '!!'), '%', '!%'), '_', '!_')">>,
+    Cases = [
+        {contains, <<"\"name\" GLOB '*' || ", Glob/binary, " || '*'">>},
+        {starts_with, <<"\"name\" GLOB ", Glob/binary, " || '*'">>},
+        {ends_with, <<"\"name\" GLOB '*' || ", Glob/binary>>},
+        {icontains, <<"\"name\" LIKE '%' || ", Like/binary, " || '%' ESCAPE '!'">>},
+        {istarts_with, <<"\"name\" LIKE ", Like/binary, " || '%' ESCAPE '!'">>},
+        {iends_with, <<"\"name\" LIKE '%' || ", Like/binary, " ESCAPE '!'">>},
+        {like, <<"\"name\" LIKE ?1 ESCAPE '\\'">>},
+        {ilike, <<"\"name\" LIKE ?1 ESCAPE '\\'">>}
+    ],
+    [?_assertEqual({Where, [~"n"]}, where_sql({name, Op, ~"n"})) || {Op, Where} <- Cases].
+
+text_match_under_and_or_not_and_having_test_() ->
+    Q = kura_query:from(?BLOB_SCHEMA),
+    [
+        ?_assertMatch(
+            {<<"(\"name\" LIKE ?1 ESCAPE '\\' OR NOT (\"name\" GLOB ", _/binary>>, [~"a", ~"b"]},
+            where_sql({'or', [{name, ilike, ~"a"}, {'not', {name, starts_with, ~"b"}}]})
+        ),
+        ?_assertMatch(
+            {match, _},
+            re:run(
+                element(
+                    1,
+                    kura_dialect_sqlite:to_sql(
+                        kura_query:having(kura_query:group_by(Q, [name]), {name, ilike, ~"a"})
+                    )
+                ),
+                ~"HAVING \"name\" LIKE \\?1 ESCAPE"
+            )
+        )
+    ].
+
+%%----------------------------------------------------------------------
+%% A column named differently from its field
+%%----------------------------------------------------------------------
+
+renamed_column_in_rewritten_conditions_test_() ->
+    Secret = kura_query:from(kura_sqlite_orm_secret),
+    Author = kura_query:from(kura_sqlite_orm_author),
+    Joined = kura_query:join(Author, inner, kura_sqlite_orm_post, {id, author_id}),
+    Cases = [
+        {Secret, {raw, ~"r"}, <<"\"raw_bytes\" = CAST(?1 AS BLOB)">>},
+        {Secret, {raw, in, [~"r"]}, <<"\"raw_bytes\" IN (CAST(?1 AS BLOB))">>},
+        {
+            Secret,
+            {[id, raw], in, [{1, ~"r"}]},
+            <<"(\"id\", \"raw_bytes\") IN ((?1, CAST(?2 AS BLOB)))">>
+        },
+        {Author, {email, like, ~"r"}, <<"\"email_address\" LIKE ?1 ESCAPE '\\'">>},
+        {Joined, {email, ilike, ~"r"}, <<"\"authors\".\"email_address\" LIKE ?1 ESCAPE '\\'">>},
+        {Joined, {name, like, ~"r"}, <<"\"authors\".\"name\" LIKE ?1 ESCAPE '\\'">>},
+        {Joined, {title, like, ~"r"}, <<"\"title\" LIKE ?1 ESCAPE '\\'">>}
+    ],
+    [
+        ?_assertMatch({Where, _}, where_sql(Query, Condition))
+     || {Query, Condition, Where} <- Cases
+    ] ++
+        [
+            ?_assertMatch(
+                {<<"\"email_address\" GLOB ", _/binary>>, [~"r"]},
+                where_sql(Author, {email, contains, ~"r"})
+            ),
+            ?_assertEqual(
+                {<<"DELETE FROM \"secrets\" WHERE \"raw_bytes\" = CAST(?1 AS BLOB)">>, [~"r"]},
+                kura_dialect_sqlite:delete_all(kura_query:where(Secret, {raw, ~"r"}))
+            ),
+            ?_assertEqual(
+                [raw, token, ssn], kura_dialect_sqlite:blob_columns(kura_sqlite_orm_secret)
+            )
+        ].
