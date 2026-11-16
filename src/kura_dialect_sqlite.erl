@@ -505,17 +505,19 @@ storage_type(Type) ->
 -spec format_default(dynamic()) -> binary().
 format_default(Val) when is_integer(Val) -> integer_to_binary(Val);
 format_default(Val) when is_float(Val) -> float_to_binary(Val);
-format_default(Val) when is_binary(Val) -> <<"'", Val/binary, "'">>;
+format_default(Val) when is_binary(Val) -> text_literal(Val);
 format_default(true) ->
     ~"1";
 format_default(false) ->
     ~"0";
 format_default(Val) when is_map(Val) ->
-    Json = iolist_to_binary(json:encode(Val)),
-    <<"'", Json/binary, "'">>;
+    text_literal(iolist_to_binary(json:encode(Val)));
 format_default(Val) when is_list(Val) ->
-    Json = iolist_to_binary(json:encode(Val)),
-    <<"'", Json/binary, "'">>.
+    text_literal(iolist_to_binary(json:encode(Val))).
+
+-spec text_literal(binary()) -> binary().
+text_literal(Text) ->
+    <<"'", (binary:replace(Text, ~"'", ~"''", [global]))/binary, "'">>.
 
 -doc """
 Add `CHECK (typeof(col) IN ('blob', 'null'))` to every byte column a
