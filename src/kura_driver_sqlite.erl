@@ -73,8 +73,8 @@ on the same columns, it is the name PostgreSQL would generate for a
 the index under another name is not matched.
 
 A foreign key violation names neither table nor constraint, so kura
-reports it on `base`. A table whose name holds a dot is not told from its
-column, and such an error has no `table`. Any other constraint failure,
+reports it on `base`. A table or column whose name holds a dot is not
+told apart, and such an error has no `table`. Any other constraint failure,
 such as a trigger's `RAISE`, returns its result code.
 
 ## Dropping a referenced table
@@ -625,7 +625,8 @@ table_columns(Named) ->
 columns(Named, Table) ->
     Size = byte_size(Table),
     Columns = [Column || <<Prefix:Size/binary, $., Column/binary>> <- Named, Prefix =:= Table],
-    case length(Columns) =:= length(Named) andalso not lists:member(<<>>, Columns) of
+    Plain = [Column || Column <- Columns, Column =/= <<>>, binary:match(Column, ~".") =:= nomatch],
+    case length(Plain) =:= length(Named) of
         true -> {Table, Columns};
         false -> unrecognised
     end.

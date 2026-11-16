@@ -1563,7 +1563,7 @@ a_repeated_rowid_is_the_key_test() ->
     end).
 
 %% SQLite does not quote the names in its message, so one that holds `, `
-%% or is empty cannot be told from the punctuation around it.
+%% or a dot, or is empty, cannot be told from the punctuation around it.
 a_message_that_cannot_be_split_names_no_table_test() ->
     with_parent(fun(Pool) ->
         [
@@ -1571,8 +1571,12 @@ a_message_that_cannot_be_split_names_no_table_test() ->
          || SQL <- [
                 ~"CREATE TABLE \"x, y\" (c TEXT UNIQUE)",
                 ~"CREATE TABLE blank (\"\" TEXT UNIQUE)",
+                ~"CREATE TABLE \"a.b\" (c TEXT UNIQUE, d TEXT NOT NULL)",
+                ~"CREATE TABLE dotted (\"e.f\" TEXT UNIQUE)",
                 ~"INSERT INTO \"x, y\" VALUES ('a')",
-                ~"INSERT INTO blank VALUES ('a')"
+                ~"INSERT INTO blank VALUES ('a')",
+                ~"INSERT INTO \"a.b\" VALUES ('a', 'd')",
+                ~"INSERT INTO dotted VALUES ('a')"
             ]
         ],
         [
@@ -1582,8 +1586,15 @@ a_message_that_cannot_be_split_names_no_table_test() ->
                     #{code => ~"23505", sqlite_code => 2067}, maps:remove(message, Fields)
                 )
             end
-         || SQL <- [~"INSERT INTO \"x, y\" VALUES ('a')", ~"INSERT INTO blank VALUES ('a')"]
-        ]
+         || SQL <- [
+                ~"INSERT INTO \"x, y\" VALUES ('a')",
+                ~"INSERT INTO blank VALUES ('a')",
+                ~"INSERT INTO \"a.b\" VALUES ('a', 'd')",
+                ~"INSERT INTO dotted VALUES ('a')"
+            ]
+        ],
+        {error, {pgsql_error, NotNull}} = sql(Pool, ~"INSERT INTO \"a.b\" VALUES ('z', NULL)"),
+        ?assertEqual(#{code => ~"23502", sqlite_code => 1299}, maps:remove(message, NotNull))
     end).
 
 %% The message names the table and the column and holds no value of the row.
