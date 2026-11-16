@@ -195,8 +195,7 @@ reach SQLite.
 %% raises it for every other caller, such as a repo on another pool module.
 -define(UNSUPPORTED(Capability), {kura, {unsupported_capability, Capability, kura_pool_sqlite}}).
 %% A text match escapes its value in SQL, so the value is bound untouched.
-%% The patterns hold no `?`: char(63) stands for it, since a kura up to 2.30
-%% reads a `?` inside a literal of a fragment as a placeholder.
+%% char(63) stands for `?`, so the only `?` in a pattern is the bound value.
 -define(LIKE_TEXT, ~"replace(replace(replace(?, '!', '!!'), '%', '!%'), '_', '!_')").
 -define(GLOB_TEXT,
     ~"replace(replace(replace(?, '[', '[[]'), '*', '[*]'), char(63), '[' || char(63) || ']')"

@@ -232,40 +232,40 @@ swap_double_digit_placeholder_test() ->
 
 swap_keeps_the_number_of_a_repeated_or_out_of_order_placeholder_test() ->
     ?assertEqual(
-        <<"SELECT ?2, ?1, ?2 WHERE a = ?10">>,
-        kura_dialect_sqlite:swap_placeholders(<<"SELECT $2, $1, $2 WHERE a = $10">>)
+        ~"SELECT ?2, ?1, ?2 WHERE a = ?10",
+        kura_dialect_sqlite:swap_placeholders(~"SELECT $2, $1, $2 WHERE a = $10")
     ).
 
 swap_leaves_text_that_is_not_a_placeholder_test_() ->
     Unchanged = [
-        <<"SELECT '$1'">>,
-        <<"SELECT 'it''s $1'">>,
-        <<"SELECT \"a$1\"">>,
-        <<"SELECT \"a\"\"$1\"">>,
-        <<"SELECT `a$1`">>,
-        <<"SELECT [a$1]">>,
-        <<"SELECT 1 -- $1">>,
-        <<"SELECT 1 /* $1 */">>,
-        <<"SELECT 1 /* $1">>,
-        <<"SELECT price$1">>,
+        ~"SELECT '$1'",
+        ~"SELECT 'it''s $1'",
+        ~"SELECT \"a$1\"",
+        ~"SELECT \"a\"\"$1\"",
+        ~"SELECT `a$1`",
+        ~"SELECT [a$1]",
+        ~"SELECT 1 -- $1",
+        ~"SELECT 1 /* $1 */",
+        ~"SELECT 1 /* $1",
+        ~"SELECT price$1",
         ~"SELECT _$1, å$1",
-        <<"SELECT $name, $, $$">>,
-        <<"SELECT 'unterminated $1">>,
-        <<"SELECT json_extract(a, '$.b[0]')">>
+        ~"SELECT $name, $, $$",
+        ~"SELECT 'unterminated $1",
+        ~"SELECT json_extract(a, '$.b[0]')"
     ],
     [?_assertEqual(SQL, kura_dialect_sqlite:swap_placeholders(SQL)) || SQL <- Unchanged].
 
 swap_rewrites_a_placeholder_next_to_skipped_text_test_() ->
     Cases = [
-        {<<"SELECT '$1', $1">>, <<"SELECT '$1', ?1">>},
-        {<<"SELECT '$1'$2">>, <<"SELECT '$1'?2">>},
-        {<<"SELECT \"a$1\" = $1">>, <<"SELECT \"a$1\" = ?1">>},
-        {<<"SELECT [a$1]$2">>, <<"SELECT [a$1]?2">>},
-        {<<"SELECT 1 -- $1\n, $2">>, <<"SELECT 1 -- $1\n, ?2">>},
-        {<<"SELECT 1 /* $1 */ + $2">>, <<"SELECT 1 /* $1 */ + ?2">>},
-        {<<"SELECT 1 /* a */ /* $1 */$2">>, <<"SELECT 1 /* a */ /* $1 */?2">>},
-        {<<"SELECT a-$1, ($2), $3||$4">>, <<"SELECT a-?1, (?2), ?3||?4">>},
-        {<<"$1">>, <<"?1">>}
+        {~"SELECT '$1', $1", ~"SELECT '$1', ?1"},
+        {~"SELECT '$1'$2", ~"SELECT '$1'?2"},
+        {~"SELECT \"a$1\" = $1", ~"SELECT \"a$1\" = ?1"},
+        {~"SELECT [a$1]$2", ~"SELECT [a$1]?2"},
+        {~"SELECT 1 -- $1\n, $2", ~"SELECT 1 -- $1\n, ?2"},
+        {~"SELECT 1 /* $1 */ + $2", ~"SELECT 1 /* $1 */ + ?2"},
+        {~"SELECT 1 /* a */ /* $1 */$2", ~"SELECT 1 /* a */ /* $1 */?2"},
+        {~"SELECT a-$1, ($2), $3||$4", ~"SELECT a-?1, (?2), ?3||?4"},
+        {~"$1", ~"?1"}
     ],
     [?_assertEqual(Out, kura_dialect_sqlite:swap_placeholders(In)) || {In, Out} <- Cases].
 
@@ -425,32 +425,32 @@ update_all_wraps_set_values_test() ->
 
 where_on_byte_field_casts_placeholder_test_() ->
     Cases = [
-        {{data, ~"d"}, <<"(\"data\" = CAST(?1 AS BLOB)\n)">>, [~"d"]},
-        {{data, '=', ~"d"}, <<"(\"data\" = CAST(?1 AS BLOB)\n)">>, [~"d"]},
-        {{data, '!=', ~"d"}, <<"(\"data\" != CAST(?1 AS BLOB)\n)">>, [~"d"]},
-        {{data, '>=', ~"d"}, <<"(\"data\" >= CAST(?1 AS BLOB)\n)">>, [~"d"]},
-        {{data, in, [~"a", ~"b"]}, <<"(\"data\" IN (CAST(?1 AS BLOB), CAST(?2 AS BLOB))\n)">>, [
+        {{data, ~"d"}, ~"(\"data\" = CAST(?1 AS BLOB)\n)", [~"d"]},
+        {{data, '=', ~"d"}, ~"(\"data\" = CAST(?1 AS BLOB)\n)", [~"d"]},
+        {{data, '!=', ~"d"}, ~"(\"data\" != CAST(?1 AS BLOB)\n)", [~"d"]},
+        {{data, '>=', ~"d"}, ~"(\"data\" >= CAST(?1 AS BLOB)\n)", [~"d"]},
+        {{data, in, [~"a", ~"b"]}, ~"(\"data\" IN (CAST(?1 AS BLOB), CAST(?2 AS BLOB))\n)", [
             ~"a", ~"b"
         ]},
-        {{data, not_in, [~"a"]}, <<"(\"data\" NOT IN (CAST(?1 AS BLOB))\n)">>, [~"a"]},
+        {{data, not_in, [~"a"]}, ~"(\"data\" NOT IN (CAST(?1 AS BLOB))\n)", [~"a"]},
         {
             {data, between, {~"a", ~"b"}},
-            <<"(\"data\" BETWEEN CAST(?1 AS BLOB) AND CAST(?2 AS BLOB)\n)">>,
+            ~"(\"data\" BETWEEN CAST(?1 AS BLOB) AND CAST(?2 AS BLOB)\n)",
             [~"a", ~"b"]
         },
         {
             {[id, data], in, [{1, ~"a"}, {2, ~"b"}]},
-            <<"((\"id\", \"data\") IN ((?1, CAST(?2 AS BLOB)), (?3, CAST(?4 AS BLOB)))\n)">>,
+            ~"((\"id\", \"data\") IN ((?1, CAST(?2 AS BLOB)), (?3, CAST(?4 AS BLOB)))\n)",
             [
                 1, ~"a", 2, ~"b"
             ]
         },
         {
             {'or', [{data, ~"a"}, {name, ~"n"}]},
-            <<"((\"data\" = CAST(?1 AS BLOB)\n) OR \"name\" = ?2)">>,
+            ~"((\"data\" = CAST(?1 AS BLOB)\n) OR \"name\" = ?2)",
             [~"a", ~"n"]
         },
-        {{'not', {data, ~"a"}}, <<"NOT ((\"data\" = CAST(?1 AS BLOB)\n))">>, [~"a"]}
+        {{'not', {data, ~"a"}}, ~"NOT ((\"data\" = CAST(?1 AS BLOB)\n))", [~"a"]}
     ],
     [
         ?_assertEqual({Where, Params}, where_sql(Condition))
@@ -462,9 +462,9 @@ where_on_joined_byte_field_casts_placeholder_test_() ->
         kura_query:from(kura_sqlite_owner_schema), inner, ?BLOB_SCHEMA, {owner_id, id}
     ),
     Cases = [
-        {{data, '!=', ~"d"}, <<"(\"data\" != CAST(?1 AS BLOB)\n)">>},
-        {{data, not_in, [~"d"]}, <<"(\"data\" NOT IN (CAST(?1 AS BLOB))\n)">>},
-        {{'not', {data, ~"d"}}, <<"NOT ((\"data\" = CAST(?1 AS BLOB)\n))">>},
+        {{data, '!=', ~"d"}, ~"(\"data\" != CAST(?1 AS BLOB)\n)"},
+        {{data, not_in, [~"d"]}, ~"(\"data\" NOT IN (CAST(?1 AS BLOB))\n)"},
+        {{'not', {data, ~"d"}}, ~"NOT ((\"data\" = CAST(?1 AS BLOB)\n))"},
         {{label, ~"d"}, <<"\"owners\".\"label\" = ?1">>}
     ],
     [
@@ -477,15 +477,15 @@ where_on_from_byte_field_under_join_casts_qualified_column_test_() ->
         kura_query:from(kura_sqlite_owner_bytes_schema), inner, ?BLOB_SCHEMA, {owner_id, id}
     ),
     Cases = [
-        {{key, ~"k"}, <<"(\"owners\".\"key\" = CAST(?1 AS BLOB)\n)">>},
-        {{key, in, [~"k"]}, <<"(\"owners\".\"key\" IN (CAST(?1 AS BLOB))\n)">>},
+        {{key, ~"k"}, ~"(\"owners\".\"key\" = CAST(?1 AS BLOB)\n)"},
+        {{key, in, [~"k"]}, ~"(\"owners\".\"key\" IN (CAST(?1 AS BLOB))\n)"},
         {
             {key, between, {~"k", ~"k"}},
-            <<"(\"owners\".\"key\" BETWEEN CAST(?1 AS BLOB) AND CAST(?2 AS BLOB)\n)">>
+            ~"(\"owners\".\"key\" BETWEEN CAST(?1 AS BLOB) AND CAST(?2 AS BLOB)\n)"
         },
         {
             {[owner_id, key], in, [{1, ~"k"}]},
-            <<"((\"owners\".\"owner_id\", \"owners\".\"key\") IN ((?1, CAST(?2 AS BLOB)))\n)">>
+            ~"((\"owners\".\"owner_id\", \"owners\".\"key\") IN ((?1, CAST(?2 AS BLOB)))\n)"
         }
     ],
     [
@@ -528,7 +528,7 @@ where_in_subquery_casts_inner_query_test() ->
 delete_all_casts_where_test() ->
     Q = kura_query:where(kura_query:from(?BLOB_SCHEMA), {data, ~"d"}),
     ?assertEqual(
-        {<<"DELETE FROM \"vault\" WHERE (\"data\" = CAST(?1 AS BLOB)\n)">>, [~"d"]},
+        {~"DELETE FROM \"vault\" WHERE (\"data\" = CAST(?1 AS BLOB)\n)", [~"d"]},
         kura_dialect_sqlite:delete_all(Q)
     ).
 
@@ -582,7 +582,7 @@ insert_all_with_opts_wraps_every_row_test() ->
 
 where_and_on_byte_field_casts_test() ->
     ?assertEqual(
-        {<<"((\"data\" = CAST(?1 AS BLOB)\n) AND \"name\" = ?2)">>, [~"a", ~"n"]},
+        {~"((\"data\" = CAST(?1 AS BLOB)\n) AND \"name\" = ?2)", [~"a", ~"n"]},
         where_sql({'and', [{data, ~"a"}, {name, ~"n"}]})
     ).
 
@@ -767,21 +767,21 @@ where_unsupported_operator_on_byte_field_raises_test_() ->
 
 where_like_on_text_field_names_the_escape_test() ->
     ?assertEqual(
-        {<<"(\"name\" LIKE ?1 ESCAPE '\\'\n)">>, [~"n%"]}, where_sql({name, like, ~"n%"})
+        {~"(\"name\" LIKE ?1 ESCAPE '\\'\n)", [~"n%"]}, where_sql({name, like, ~"n%"})
     ).
 
 %% SQLite has no ILIKE, and `IN ()` is not SQL.
 where_uncast_on_byte_field_test_() ->
     [
         ?_assertEqual(
-            {<<"(\"data\" LIKE ?1 ESCAPE '\\'\n)">>, [~"d%"]}, where_sql({data, like, ~"d%"})
+            {~"(\"data\" LIKE ?1 ESCAPE '\\'\n)", [~"d%"]}, where_sql({data, like, ~"d%"})
         ),
         ?_assertEqual(
-            {<<"(\"data\" LIKE ?1 ESCAPE '\\'\n)">>, [~"d%"]}, where_sql({data, ilike, ~"d%"})
+            {~"(\"data\" LIKE ?1 ESCAPE '\\'\n)", [~"d%"]}, where_sql({data, ilike, ~"d%"})
         ),
         ?_assertEqual({<<"\"data\" IS NOT NULL">>, []}, where_sql({data, is_not_nil})),
-        ?_assertEqual({<<"(1 = 0\n)">>, []}, where_sql({data, in, []})),
-        ?_assertEqual({<<"(1 = 1\n)">>, []}, where_sql({data, not_in, []}))
+        ?_assertEqual({~"(1 = 0\n)", []}, where_sql({data, in, []})),
+        ?_assertEqual({~"(1 = 1\n)", []}, where_sql({data, not_in, []}))
     ].
 
 %% Ciphertext under a fresh nonce never equals another, so a condition on an
@@ -886,11 +886,11 @@ where_unary_on_encrypted_field_is_untouched_test_() ->
     ].
 
 where_atom_value_on_byte_field_binds_test() ->
-    ?assertEqual({<<"(\"data\" = CAST(?1 AS BLOB)\n)">>, [nil]}, where_sql({data, nil})).
+    ?assertEqual({~"(\"data\" = CAST(?1 AS BLOB)\n)", [nil]}, where_sql({data, nil})).
 
 where_fragment_is_untouched_test() ->
     ?assertEqual(
-        {<<"(length(data) > ?1\n)">>, [3]}, where_sql({fragment, ~"length(data) > ?", [3]})
+        {~"(length(data) > ?1\n)", [3]}, where_sql({fragment, ~"length(data) > ?", [3]})
     ).
 
 byte_fields_are_cached_per_schema_test() ->
@@ -1181,36 +1181,36 @@ lookup_tests() ->
             Q,
             {token, encrypted_in, [~"f1", ~"f2"]},
             encrypted_in,
-            {<<"(\"token\" IN (CAST(?1 AS BLOB), CAST(?2 AS BLOB))\n)">>, [~"f1", ~"f2"]}
+            {~"(\"token\" IN (CAST(?1 AS BLOB), CAST(?2 AS BLOB))\n)", [~"f1", ~"f2"]}
         },
         {
             where,
             Q,
             {token, encrypted_not_in, [~"f1", ~"f2"]},
             encrypted_not_in,
-            {<<"(\"token\" NOT IN (CAST(?1 AS BLOB), CAST(?2 AS BLOB))\n)">>, [~"f1", ~"f2"]}
+            {~"(\"token\" NOT IN (CAST(?1 AS BLOB), CAST(?2 AS BLOB))\n)", [~"f1", ~"f2"]}
         },
-        {where, Q, {token, encrypted_in, []}, encrypted_in, {<<"(1 = 0\n)">>, []}},
+        {where, Q, {token, encrypted_in, []}, encrypted_in, {~"(1 = 0\n)", []}},
         {
             where,
             Q,
             {'and', [{name, ~"n"}, {'or', [{'not', {token, encrypted_in, [~"f1"]}}]}]},
             encrypted_in,
-            {<<"(\"name\" = ?1 AND (NOT ((\"token\" IN (CAST(?2 AS BLOB))\n))))">>, [~"n", ~"f1"]}
+            {~"(\"name\" = ?1 AND (NOT ((\"token\" IN (CAST(?2 AS BLOB))\n))))", [~"n", ~"f1"]}
         },
         {
             where,
             Joined,
             {token, encrypted_not_in, [~"f1"]},
             encrypted_not_in,
-            {<<"(\"token\" NOT IN (CAST(?1 AS BLOB))\n)">>, [~"f1"]}
+            {~"(\"token\" NOT IN (CAST(?1 AS BLOB))\n)", [~"f1"]}
         },
         {
             having,
             Having,
             {token, encrypted_in, [~"f1"]},
             encrypted_in,
-            {<<"(\"token\" IN (CAST(?1 AS BLOB))\n)">>, [~"f1"]}
+            {~"(\"token\" IN (CAST(?1 AS BLOB))\n)", [~"f1"]}
         }
     ],
     [
@@ -1223,7 +1223,7 @@ lookup_tests() ->
                 hd(plain_secret_joins()),
                 {secret, encrypted_in, [~"f1"]},
                 {secret, encrypted_in},
-                {<<"(\"lookups\".\"secret\" IN (CAST(?1 AS BLOB))\n)">>, [~"f1"]}
+                {~"(\"lookups\".\"secret\" IN (CAST(?1 AS BLOB))\n)", [~"f1"]}
             ),
             ?_assertError(
                 {kura_sqlite, {unsupported_blob_condition, secret, encrypted_in}},
@@ -1466,8 +1466,8 @@ distance_query_through_the_compiler_raises_test_() ->
 
 text_match_test_() ->
     Glob =
-        <<"replace(replace(replace(?1, '[', '[[]'), '*', '[*]'), char(63), '[' || char(63) || ']')">>,
-    Like = <<"replace(replace(replace(?1, '!', '!!'), '%', '!%'), '_', '!_')">>,
+        ~"replace(replace(replace(?1, '[', '[[]'), '*', '[*]'), char(63), '[' || char(63) || ']')",
+    Like = ~"replace(replace(replace(?1, '!', '!!'), '%', '!%'), '_', '!_')",
     Cases = [
         {contains, <<"(\"name\" GLOB '*' || ", Glob/binary, " || '*'\n)">>},
         {starts_with, <<"(\"name\" GLOB ", Glob/binary, " || '*'\n)">>},
@@ -1475,8 +1475,8 @@ text_match_test_() ->
         {icontains, <<"(\"name\" LIKE '%' || ", Like/binary, " || '%' ESCAPE '!'\n)">>},
         {istarts_with, <<"(\"name\" LIKE ", Like/binary, " || '%' ESCAPE '!'\n)">>},
         {iends_with, <<"(\"name\" LIKE '%' || ", Like/binary, " ESCAPE '!'\n)">>},
-        {like, <<"(\"name\" LIKE ?1 ESCAPE '\\'\n)">>},
-        {ilike, <<"(\"name\" LIKE ?1 ESCAPE '\\'\n)">>}
+        {like, ~"(\"name\" LIKE ?1 ESCAPE '\\'\n)"},
+        {ilike, ~"(\"name\" LIKE ?1 ESCAPE '\\'\n)"}
     ],
     [?_assertEqual({Where, [~"n"]}, where_sql({name, Op, ~"n"})) || {Op, Where} <- Cases].
 
@@ -1510,17 +1510,17 @@ renamed_column_in_rewritten_conditions_test_() ->
     Author = kura_query:from(kura_sqlite_orm_author),
     Joined = kura_query:join(Author, inner, kura_sqlite_orm_post, {id, author_id}),
     Cases = [
-        {Secret, {raw, ~"r"}, <<"(\"raw_bytes\" = CAST(?1 AS BLOB)\n)">>},
-        {Secret, {raw, in, [~"r"]}, <<"(\"raw_bytes\" IN (CAST(?1 AS BLOB))\n)">>},
+        {Secret, {raw, ~"r"}, ~"(\"raw_bytes\" = CAST(?1 AS BLOB)\n)"},
+        {Secret, {raw, in, [~"r"]}, ~"(\"raw_bytes\" IN (CAST(?1 AS BLOB))\n)"},
         {
             Secret,
             {[id, raw], in, [{1, ~"r"}]},
-            <<"((\"id\", \"raw_bytes\") IN ((?1, CAST(?2 AS BLOB)))\n)">>
+            ~"((\"id\", \"raw_bytes\") IN ((?1, CAST(?2 AS BLOB)))\n)"
         },
-        {Author, {email, like, ~"r"}, <<"(\"email_address\" LIKE ?1 ESCAPE '\\'\n)">>},
-        {Joined, {email, ilike, ~"r"}, <<"(\"authors\".\"email_address\" LIKE ?1 ESCAPE '\\'\n)">>},
-        {Joined, {name, like, ~"r"}, <<"(\"authors\".\"name\" LIKE ?1 ESCAPE '\\'\n)">>},
-        {Joined, {title, like, ~"r"}, <<"(\"title\" LIKE ?1 ESCAPE '\\'\n)">>}
+        {Author, {email, like, ~"r"}, ~"(\"email_address\" LIKE ?1 ESCAPE '\\'\n)"},
+        {Joined, {email, ilike, ~"r"}, ~"(\"authors\".\"email_address\" LIKE ?1 ESCAPE '\\'\n)"},
+        {Joined, {name, like, ~"r"}, ~"(\"authors\".\"name\" LIKE ?1 ESCAPE '\\'\n)"},
+        {Joined, {title, like, ~"r"}, ~"(\"title\" LIKE ?1 ESCAPE '\\'\n)"}
     ],
     [
         ?_assertMatch({Where, _}, where_sql(Query, Condition))
@@ -1532,7 +1532,7 @@ renamed_column_in_rewritten_conditions_test_() ->
                 where_sql(Author, {email, contains, ~"r"})
             ),
             ?_assertEqual(
-                {<<"DELETE FROM \"secrets\" WHERE (\"raw_bytes\" = CAST(?1 AS BLOB)\n)">>, [~"r"]},
+                {~"DELETE FROM \"secrets\" WHERE (\"raw_bytes\" = CAST(?1 AS BLOB)\n)", [~"r"]},
                 kura_dialect_sqlite:delete_all(kura_query:where(Secret, {raw, ~"r"}))
             ),
             ?_assertEqual(
