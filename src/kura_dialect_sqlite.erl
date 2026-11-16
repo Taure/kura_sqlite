@@ -107,12 +107,11 @@ type that kura reports `unsupported` raises
 `{kura_crypto, unsupported_encrypted_type}` in `column_type/1`, as kura's
 PG dialect does, so a migration declaring one fails. A type with no
 SQLite storage raises `{kura_sqlite, {unsupported_type, Type}}`, and so
-does a list written to an array field (`{array, Inner}`) by `insert`,
-`update`, `delete`, `insert_all` or the `SET` of `update_all`. SQLite has
-no array type, and `kura_driver_sqlite` binds a list as one TEXT value,
-its elements run together. `column_type/1` still gives a plain array
-`TEXT`, as it did before lists were refused, so a migration that declares
-one runs; it raises for an array of an encrypted type. A condition on an encrypted field, an array
+does an array (`{array, Inner}`): in `column_type/1`, and when a list is
+written to such a field by `insert`, `update`, `delete`, `insert_all` or
+the `SET` of `update_all`. SQLite has no array type, and
+`kura_driver_sqlite` binds a list as one TEXT value, its elements run
+together. A condition on an encrypted field, an array
 of an encrypted type among them, other than `is_nil`, `is_not_nil` or a
 deterministic lookup raises
 `{kura_sqlite, {encrypted_field_in_where, Field}}`, in a where or a
@@ -484,11 +483,8 @@ storage_type(jsonb) ->
     ~"TEXT";
 storage_type({enum, _}) ->
     ~"TEXT";
-storage_type({array, Inner} = Type) ->
-    case holds_encrypted(Inner) of
-        true -> erlang:error({kura_sqlite, {unsupported_type, Type}});
-        false -> ~"TEXT"
-    end;
+storage_type({array, _} = Type) ->
+    erlang:error({kura_sqlite, {unsupported_type, Type}});
 storage_type({embed, _, _}) ->
     ~"TEXT";
 storage_type({custom, Mod}) ->
@@ -503,13 +499,6 @@ storage_type(Type) ->
         unsupported -> erlang:error({kura_crypto, unsupported_encrypted_type});
         none -> erlang:error({kura_sqlite, {unsupported_type, Type}})
     end.
-
-%% A plain array column is created as TEXT, as 1.3 created it, so a
-%% migration that declares one still runs. Nothing can be written to it:
-%% blob_value/3 refuses the list.
--spec holds_encrypted(kura_types:kura_type()) -> boolean().
-holds_encrypted({array, Inner}) -> holds_encrypted(Inner);
-holds_encrypted(Type) -> kura_types:encryption(Type) =/= none.
 
 %% A default is whatever the schema declares.
 -spec format_default(dynamic()) -> binary().

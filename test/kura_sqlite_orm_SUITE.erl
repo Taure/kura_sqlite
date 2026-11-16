@@ -272,13 +272,11 @@ arrays_are_refused(_Config) ->
             {kura_sqlite, {unsupported_type, {array, integer}}},
             kura_repo_worker:update_all(?REPO, kura_query:from(?LIST), #{scores => [1]})
         ),
-        ?assertEqual(
-            ~"CREATE TABLE \"lists\" (\n  \"items\" TEXT\n)",
-            iolist_to_binary(
-                kura_migrator:compile_operation(
-                    ?REPO,
-                    {create_table, ~"lists", [#kura_column{name = items, type = {array, string}}]}
-                )
+        ?assertError(
+            {kura_sqlite, {unsupported_type, {array, string}}},
+            kura_migrator:compile_operation(
+                ?REPO,
+                {create_table, ~"lists", [#kura_column{name = items, type = {array, string}}]}
             )
         ),
         ?assertMatch(
