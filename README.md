@@ -9,8 +9,8 @@ SQLite backend for [kura](https://github.com/Taure/kura). Provides
 
 ```erlang
 {deps, [
-    {kura, "~> 2.4"},
-    {kura_sqlite, "~> 0.2"}
+    {kura, "~> 2.31"},
+    {kura_sqlite, "~> 2.0"}
 ]}.
 ```
 
@@ -40,12 +40,18 @@ Not yet: `kura_sandbox` test fixtures, JSONB operators (`->`, `->>`,
 `kura_pool_sqlite:capabilities/0`:
 
 ```
-[returning, json, partial_indexes, transactions, savepoints, prepared_statements]
+[returning, json, partial_indexes, window_functions, transactions, savepoints,
+ prepared_statements]
 ```
 
-PG-only features (`advisory_locks`, `listen_notify`, `arrays`,
-`jsonb`) are deliberately absent; consumers that require them refuse
-to start on this backend via `kura_capabilities:require/2`.
+PG-only features (`advisory_locks`, `listen_notify`, `arrays`, `jsonb`,
+`select_for_update_skip_locked`, `row_locks`, `distinct_on`, `cursors`,
+`concurrent_indexes`, `full_text_search`, `vector`) are deliberately absent;
+`kura_pool_sqlite:capability_model/0` names the revision of kura's checks the
+list is written against: model 1. Consumers that require them refuse
+to start on this backend via `kura_capabilities:require/2`, and kura
+refuses a query that needs one with
+`{kura, {unsupported_capability, Capability, kura_pool_sqlite}}`.
 
 ## Caveats
 
@@ -54,20 +60,67 @@ to start on this backend via `kura_capabilities:require/2`.
 - **Dates and datetimes** are written and filtered as TEXT: a
   `{{Y, M, D}, {H, Mi, S}}` datetime binds as `YYYY-MM-DD HH:MM:SS` (the
   form of SQLite's `datetime()` and `CURRENT_TIMESTAMP`) and a `{Y, M, D}`
-  date whose year is above 24 as `YYYY-MM-DD`. A smaller three-integer
-  tuple could be an `{H, M, S}` time and is refused; pass a time as text.
+  date whose year is above 24 as `YYYY-MM-DD`. Any other three-integer
+  tuple that is a time of day (`{H, M, S}` up to `{23, 59, 60}`, or
+  `{24, 0, 0}`) binds as `HH:MM:SS`, so a `time` field is written and
+  filtered as TEXT too. A date in the years 0 to 23 has that shape, and
+  the driver binds it as a time. Through a schema it stays a date: a date
+  of the years 0 to 24 written to a `date` field, or compared with one of
+  the query's `from` schema, is bound as `YYYY-MM-DD`. In a raw statement,
+  a having or a condition on a joined schema's field, pass such a date as
+  text.
   A binary datetime filter value is compared as text, so it matches only
   a row stored in the same form (`~"2024-01-02 01:00:00"`, not
   `~"2024-01-02T01:00:00Z"`). A day the month does not have
   (`{2024, 2, 30}`), a minute over 59 or a second over 60 is refused; a
   datetime at `24:00:00` or on a leap second is stored as the next day
   or minute, as kura's cast reads it.
-- **Reads return raw values.** A boolean reads back as 1/0 and a date or
-  datetime as its text; they are not converted to `true`/`false` or
-  tuples yet. Normalising them on read is planned.
+- **Reads** through a schema return the values that were written: kura
+  2.31 asks `kura_dialect_sqlite:load_stored/2` for each value, which turns
+  a stored 0/1 into `false`/`true` and a stored date, time or datetime into
+  its tuple. Text in such a column that is not a date or time stays text. A
+  raw `kura_db:query/3`, which has no schema, returns the stored forms.
+- **Decimals** are not exact. A `decimal` column is `NUMERIC`, which holds
+  an integer or a 64-bit float: `1.25` reads back as `1.25`, `2.0` as the
+  integer `2`, and a value of more than 15 significant digits is rounded
+  when it is stored, also when it is written as text
+  (`'12345678901234567.89'` is held as `12345678901234568`). Keep an exact
+  amount in an `integer` field of its smallest unit.
 - **JSON** values store as TEXT. JSONB operators (`->`, `->>`, `@>`)
   are not available; use Erlang map operations after decoding.
-- **Arrays** are unsupported.
+- **Arrays** are unsupported. A migration declaring an `{array, Inner}`
+  column, and a write of a list to an array field, raise
+  `{kura_sqlite, {unsupported_type, {array, Inner}}}`.
+- **`like` and `ilike`** both compile to `LIKE ? ESCAPE '\'`. SQLite's
+  `LIKE` ignores the case of ASCII letters, so `like` matches what `ilike`
+  does, and neither folds a letter outside ASCII (`å` does not match `Å`).
+  The backslash escapes `%` and `_`, as on Postgres, so
+  `kura_query:escape_like/1` works.
+- **Literal text matches**: `contains`, `starts_with` and `ends_with`
+  compile to `GLOB` and match case exactly. `icontains`, `istarts_with`
+  and `iends_with` compile to `LIKE` and ignore the case of ASCII letters
+  only.
+- **Row locks**: SQLite locks the whole database, so `kura_query:lock/2`
+  raises `{kura, {unsupported_capability, row_locks, kura_pool_sqlite}}`
+  (`select_for_update_skip_locked` for a lock that skips locked rows),
+  whichever form the lock is given in: a term, a map, a list or text.
+  `kura_query:distinct/2` with fields (`DISTINCT ON`) raises the same
+  error with `distinct_on`, and `{Field, matches, Query}` with
+  `full_text_search`.
+- **`insert_all`** binds at most 32766 values in one statement
+  (`SQLITE_MAX_VARIABLE_NUMBER`). More raises
+  `{kura, {too_many_parameters, Count, 32766}}`; split the list.
+- **`kura_stream`** declares a server-side cursor, which SQLite does not
+  have: `kura_stream:stream/3,4` raises
+  `{kura, {unsupported_capability, cursors, kura_pool_sqlite}}` before it
+  runs a statement.
+- **Constraint errors** become changeset errors, as on Postgres: a unique
+  or not-null violation lands on its field, a check on the field its
+  changeset declares it for. SQLite does not name the foreign key that
+  failed, so that one lands on `base`. A raw `kura_db:query/3` returns
+  `{error, {pgsql_error, #{code := ~"23505", ...}}}` with the PostgreSQL
+  code; see "Errors" in `kura_driver_sqlite`. Before, it returned the SQLite
+  result code (`{error, 2067}`), which other failures still do.
 - **Composite primary and foreign keys** work the same as on Postgres
   (SQLite supports `PRIMARY KEY (a, b)` and row-value `IN`).
 - **Foreign keys** are enforced. The pool turns `PRAGMA foreign_keys` on

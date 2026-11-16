@@ -11,11 +11,47 @@ The main wire-protocol difference vs PG is the placeholder syntax: PG
 uses `$N`, SQLite uses `?N`.
 
 This dialect delegates the AST-to-SQL emission to `kura_dialect_pg` and
-post-processes the SQL string to swap `$N` for `?N`. The number of
-placeholders and their positions are unchanged. Edge cases where SQL
-bytes between dialects truly diverge (`JSONB` operators, advisory
-locks, partial-index expressions, etc.) are out of scope for this
-phase 2 skeleton and will be addressed by capability flags in phase 3.
+rewrites each `$N` placeholder of the result to `?N` (see
+`swap_placeholders/1`). The number of placeholders and their positions are
+unchanged. Where the SQL of the two backends diverges, the query node is
+replaced before it reaches `kura_dialect_pg`, or refused.
+
+## Text matches
+
+SQLite's `LIKE` ignores the case of the 26 ASCII letters and of nothing
+else, and has no escape character unless the statement names one.
+
+| Condition | SQL | Case |
+| --- | --- | --- |
+| `like`, `ilike` | `LIKE ? ESCAPE '\'` | ASCII letters ignored |
+| `contains`, `starts_with`, `ends_with` | `GLOB`, the value escaped | exact |
+| `icontains`, `istarts_with`, `iends_with` | `LIKE ... ESCAPE '!'`, the value escaped | ASCII letters ignored |
+
+So `like` matches what `ilike` does, which is more than PostgreSQL's `like`
+matches, and no form folds a letter outside ASCII: `icontains` with `~"å"`
+does not find `Å`. The backslash is the escape character of `like` and
+`ilike`, as on PostgreSQL, so a pattern built with
+`kura_query:escape_like/1` matches the text it was built from.
+
+## Not supported
+
+Raised as `{kura, {unsupported_capability, Capability, kura_pool_sqlite}}`,
+the error `kura_capabilities:check_query/2` raises, before any SQL is
+emitted. kura raises it for a repo whose pool module is `kura_pool_sqlite`,
+and this module for any other caller:
+
+- `kura_query:lock/2`, as `row_locks`, or
+  `select_for_update_skip_locked` for a `skip_locked` lock. SQLite locks the
+  whole database and has no lock clause.
+- `kura_query:distinct/2` with a list of fields (`DISTINCT ON`), as
+  `distinct_on`.
+- `{Field, matches, Query}`, as `full_text_search`.
+
+`insert_all` with more values than SQLite binds in one statement, 32766,
+raises `{kura, {too_many_parameters, Count, 32766}}`.
+
+An empty `in` list compiles to `1 = 0` and an empty `not_in` list to
+`1 = 1`.
 
 ## Byte fields
 
@@ -71,9 +107,11 @@ type that kura reports `unsupported` raises
 `{kura_crypto, unsupported_encrypted_type}` in `column_type/1`, as kura's
 PG dialect does, so a migration declaring one fails. A type with no
 SQLite storage raises `{kura_sqlite, {unsupported_type, Type}}`, and so
-does an array of an encrypted type: in `column_type/1`, and when a list is
+does an array (`{array, Inner}`): in `column_type/1`, and when a list is
 written to such a field by `insert`, `update`, `delete`, `insert_all` or
-the `SET` of `update_all`. A condition on an encrypted field, an array
+the `SET` of `update_all`. SQLite has no array type, and
+`kura_driver_sqlite` binds a list as one TEXT value, its elements run
+together. A condition on an encrypted field, an array
 of an encrypted type among them, other than `is_nil`, `is_not_nil` or a
 deterministic lookup raises
 `{kura_sqlite, {encrypted_field_in_where, Field}}`, in a where or a
@@ -95,8 +133,12 @@ field that is not deterministic the frames would be plaintext, and
 
 A condition on a byte field with an operator the rewrite cannot cast
 raises `{kura_sqlite, {unsupported_blob_condition, Field, Op}}`. `like`,
-`ilike`, `is_nil`, `is_not_nil` and an empty `in` or `not_in` list are
-passed through unchanged.
+`ilike`, `is_nil`, `is_not_nil` and an empty `in` or `not_in` list compile
+as they do for any other field.
+
+A field stored under another column name (`#kura_field.column`) is written
+as that column in every condition this module rewrites, as
+`kura_dialect_pg` writes it everywhere else.
 
 ## Vector distance
 
@@ -135,12 +177,28 @@ reach SQLite.
     insert_all/4,
     column_type/1,
     format_default/1,
+    placeholder/1,
+    load_stored/2,
+    convert_values/1,
     swap_placeholders/1,
     blob_checks/1,
     blob_columns/1
 ]).
 
 -define(CAST, ~"CAST(? AS BLOB)").
+%% SQLITE_MAX_VARIABLE_NUMBER of the SQLite esqlite builds. esqlite has no
+%% sqlite3_limit/3 to ask a connection with.
+-define(MAX_BIND_PARAMETERS, 32766).
+%% The error kura_capabilities:check_query/2 raises. kura checks a query it
+%% compiles for a repo whose pool module is kura_pool_sqlite; the dialect
+%% raises it for every other caller, such as a repo on another pool module.
+-define(UNSUPPORTED(Capability), {kura, {unsupported_capability, Capability, kura_pool_sqlite}}).
+%% A text match escapes its value in SQL, so the value is bound untouched.
+%% char(63) stands for `?`, so the only `?` in a pattern is the bound value.
+-define(LIKE_TEXT, ~"replace(replace(replace(?, '!', '!!'), '%', '!%'), '_', '!_')").
+-define(GLOB_TEXT,
+    ~"replace(replace(replace(?, '[', '[[]'), '*', '[*]'), char(63), '[' || char(63) || ']')"
+).
 %% column_type/1 of a byte column. The comment is the marker blob_checks/1
 %% replaces, since a column's CHECK names it and column_type/1 is not given
 %% the name.
@@ -154,10 +212,23 @@ reach SQLite.
     (Op =:= '=' orelse Op =:= '!=' orelse Op =:= '<' orelse Op =:= '>' orelse Op =:= '<=' orelse
         Op =:= '>=')
 ).
+%% kura's ?KURA_IS_TEXT_MATCH_OP, split by whether the match ignores case.
+-define(IS_EXACT_MATCH(Op), (Op =:= contains orelse Op =:= starts_with orelse Op =:= ends_with)).
+-define(IS_FOLDED_MATCH(Op),
+    (Op =:= icontains orelse Op =:= istarts_with orelse Op =:= iends_with)
+).
 
--type schema_fields() :: {
-    Types :: #{atom() => kura_types:kura_type()}, Blobs :: #{atom() => kura_types:kura_type()}
-}.
+-define(IS_TEMPORAL(Type),
+    (Type =:= date orelse Type =:= time orelse Type =:= utc_datetime orelse
+        Type =:= naive_datetime)
+).
+
+-type field_types() :: #{atom() => kura_types:kura_type()}.
+-type schema_fields() :: {Types :: field_types(), Blobs :: field_types()}.
+
+%% How a where-field is written when not as its own quoted name: under
+%% another column name, qualified with the from table, or both.
+-type idents() :: #{atom() => binary()}.
 -type where_fields() :: {
     Types :: #{atom() => kura_types:kura_type()},
     Blobs :: #{atom() => kura_types:kura_type()},
@@ -170,13 +241,13 @@ reach SQLite.
 
 -spec to_sql(#kura_query{}) -> {iodata(), [term()]}.
 to_sql(Query) ->
-    ok = refuse_distances(Query),
+    ok = refuse_unsupported(Query),
     {SQL, Params} = kura_dialect_pg:to_sql(blob_query(Query)),
     {swap_placeholders(SQL), Params}.
 
 -spec to_sql_from(#kura_query{}, pos_integer()) -> {iodata(), [term()], pos_integer()}.
 to_sql_from(Query, StartCounter) ->
-    ok = refuse_distances(Query),
+    ok = refuse_unsupported(Query),
     {SQL, Params, NextCounter} = kura_dialect_pg:to_sql_from(blob_query(Query), StartCounter),
     {swap_placeholders(SQL), Params, NextCounter}.
 
@@ -209,29 +280,162 @@ delete(SchemaOrTable, KeyClauses) ->
 
 -spec update_all(#kura_query{}, map()) -> {iodata(), [term()]}.
 update_all(#kura_query{from = From} = Query, SetMap) ->
-    ok = refuse_distances(Query),
+    ok = refuse_unsupported(Query),
     {SQL, Params} = kura_dialect_pg:update_all(blob_query(Query), blob_values(From, SetMap)),
     {swap_placeholders(SQL), Params}.
 
 -spec delete_all(#kura_query{}) -> {iodata(), [term()]}.
 delete_all(Query) ->
-    ok = refuse_distances(Query),
+    ok = refuse_unsupported(Query),
     {SQL, Params} = kura_dialect_pg:delete_all(blob_query(Query)),
     {swap_placeholders(SQL), Params}.
 
 -spec insert_all(atom() | module(), [atom()], [map()]) -> {iodata(), [term()]}.
 insert_all(SchemaOrTable, Fields, Rows) ->
+    ok = check_parameter_count(length(Rows) * length(Fields)),
     {SQL, Params} = kura_dialect_pg:insert_all(
-        SchemaOrTable, Fields, [blob_values(SchemaOrTable, Row) || Row <- Rows]
+        SchemaOrTable, Fields, blob_rows(SchemaOrTable, Rows)
     ),
     {swap_placeholders(SQL), Params}.
 
 -spec insert_all(atom() | module(), [atom()], [map()], map()) -> {iodata(), [term()]}.
 insert_all(SchemaOrTable, Fields, Rows, Opts) ->
+    ok = check_parameter_count(length(Rows) * length(Fields)),
     {SQL, Params} = kura_dialect_pg:insert_all(
-        SchemaOrTable, Fields, [blob_values(SchemaOrTable, Row) || Row <- Rows], Opts
+        SchemaOrTable, Fields, blob_rows(SchemaOrTable, Rows), Opts
     ),
     {swap_placeholders(SQL), Params}.
+
+-spec check_parameter_count(non_neg_integer()) -> ok.
+check_parameter_count(Count) when Count =< ?MAX_BIND_PARAMETERS -> ok;
+check_parameter_count(Count) ->
+    erlang:error({kura, {too_many_parameters, Count, ?MAX_BIND_PARAMETERS}}).
+
+-doc """
+The text of the `N`th bind parameter, `?N`. kura writes the statements it
+does not build from a query with it, such as the migrator's version
+bookkeeping.
+""".
+-spec placeholder(pos_integer()) -> iodata().
+placeholder(N) ->
+    [$?, integer_to_binary(N)].
+
+-doc """
+A value as SQLite stores it, in the Erlang form `kura_types:load/2` reads.
+kura calls it on each non-null value of a row read through a schema.
+
+A `boolean` stored as `1` or `0` becomes `true` or `false`, and a `date`,
+`time`, `utc_datetime` or `naive_datetime` stored as ISO 8601 text becomes
+its tuple, as `kura_types:cast/2` reads the text. Text that is not one, and
+a value of any other type, is returned as it is: `jsonb` and an embed are
+JSON text kura decodes itself, and a `decimal` is the number SQLite holds.
+""".
+-spec load_stored(kura_types:kura_type(), term()) -> term().
+load_stored(boolean, 1) ->
+    true;
+load_stored(boolean, 0) ->
+    false;
+load_stored(Type, Text) when ?IS_TEMPORAL(Type) andalso is_binary(Text) ->
+    case kura_types:cast(Type, Text) of
+        {ok, Value} -> Value;
+        {error, _} -> Text
+    end;
+load_stored(_Type, Value) ->
+    Value.
+
+-doc """
+Writes a date of the years 0 to 24 as its text, `YYYY-MM-DD`, where a query
+compares it with a `date` field of its `from` schema.
+
+The driver binds a tuple by its shape, and `{12, 5, 6}` has the shape of a
+time of day. The field's type says it is a date. This covers `=`, `!=`,
+`<`, `>`, `<=`, `>=`, `in`, `not_in` and `between`, under `and`, `or` and
+`not`, in the query and in every CTE, combined query and subquery it holds.
+A having, a field of a joined schema and a fragment bind what they are
+given.
+""".
+-spec convert_values(#kura_query{}) -> #kura_query{}.
+convert_values(
+    #kura_query{from = From, wheres = Wheres, ctes = Ctes, combinations = Combinations} = Query
+) ->
+    {Types, _Blobs} = schema_fields(From),
+    Query#kura_query{
+        wheres = dated_conditions(Types, Wheres),
+        ctes = dated_queries(Ctes),
+        combinations = dated_queries(Combinations)
+    }.
+
+%% A hand-built query can hold an improper list. It is left as it is: kura
+%% refuses it later, and a crash here would carry the query's values.
+-spec dated_queries(dynamic()) -> dynamic().
+dated_queries(Named) ->
+    case is_proper(Named) of
+        true -> [dated_query(Entry) || Entry <- Named];
+        false -> Named
+    end.
+
+-spec dated_query(term()) -> term().
+dated_query({Name, #kura_query{} = Query}) -> {Name, convert_values(Query)};
+dated_query(Entry) -> Entry.
+
+-spec dated_conditions(field_types(), dynamic()) -> dynamic().
+dated_conditions(Types, Conditions) ->
+    case is_proper(Conditions) of
+        true -> [dated_condition(Types, Condition) || Condition <- Conditions];
+        false -> Conditions
+    end.
+
+-spec dated_condition(field_types(), term()) -> term().
+dated_condition(Types, {Junction, Conditions}) when
+    (Junction =:= 'and' orelse Junction =:= 'or') andalso is_list(Conditions)
+->
+    {Junction, dated_conditions(Types, Conditions)};
+dated_condition(Types, {'not', Condition}) ->
+    {'not', dated_condition(Types, Condition)};
+dated_condition(_Types, {Exists, {subquery, #kura_query{} = Query}}) when
+    Exists =:= exists orelse Exists =:= not_exists
+->
+    {Exists, {subquery, convert_values(Query)}};
+dated_condition(_Types, {Field, Op, {subquery, #kura_query{} = Query}}) ->
+    {Field, Op, {subquery, convert_values(Query)}};
+dated_condition(Types, {Field, Op, Values}) when
+    is_atom(Field) andalso is_list(Values) andalso (Op =:= in orelse Op =:= not_in)
+->
+    case is_proper(Values) of
+        true -> {Field, Op, [dated(Types, Field, Value) || Value <- Values]};
+        false -> {Field, Op, Values}
+    end;
+dated_condition(Types, {Field, between, {Low, High}}) when is_atom(Field) ->
+    {Field, between, {dated(Types, Field, Low), dated(Types, Field, High)}};
+dated_condition(Types, {Field, Op, Value}) when is_atom(Field) andalso ?IS_COMPARISON(Op) ->
+    {Field, Op, dated(Types, Field, Value)};
+dated_condition(Types, {Field, Value}) when is_atom(Field) ->
+    {Field, dated(Types, Field, Value)};
+dated_condition(_Types, Condition) ->
+    Condition.
+
+-spec is_proper(term()) -> boolean().
+is_proper([]) -> true;
+is_proper([_ | Rest]) -> is_proper(Rest);
+is_proper(_) -> false.
+
+%% The years the driver takes for a time of day. Any other date it writes
+%% as this text itself.
+-spec dated(field_types(), atom(), term()) -> term().
+dated(Types, Field, {Y, M, D} = Date) when
+    is_integer(Y), is_integer(M), is_integer(D), Y >= 0, Y =< 24
+->
+    case Types of
+        #{Field := date} ->
+            case calendar:valid_date(Date) of
+                true -> iolist_to_binary(io_lib:format("~4..0B-~2..0B-~2..0B", [Y, M, D]));
+                false -> Date
+            end;
+        #{} ->
+            Date
+    end;
+dated(_Types, _Field, Value) ->
+    Value.
 
 %%----------------------------------------------------------------------
 %% DDL: column type + default value emit
@@ -280,8 +484,7 @@ storage_type(jsonb) ->
 storage_type({enum, _}) ->
     ~"TEXT";
 storage_type({array, _} = Type) ->
-    ok = supported_array(Type),
-    ~"TEXT";
+    erlang:error({kura_sqlite, {unsupported_type, Type}});
 storage_type({embed, _, _}) ->
     ~"TEXT";
 storage_type({custom, Mod}) ->
@@ -297,30 +500,23 @@ storage_type(Type) ->
         none -> erlang:error({kura_sqlite, {unsupported_type, Type}})
     end.
 
-%% kura_driver_sqlite binds a list as one TEXT value, which would corrupt
-%% ciphertexts, so an array of an encrypted type is refused.
--spec supported_array({array, kura_types:kura_type()}) -> ok.
-supported_array({array, Inner} = Type) ->
-    case kura_types:encryption(Inner) of
-        none -> ok;
-        _ -> erlang:error({kura_sqlite, {unsupported_type, Type}})
-    end.
-
 %% A default is whatever the schema declares.
 -spec format_default(dynamic()) -> binary().
 format_default(Val) when is_integer(Val) -> integer_to_binary(Val);
 format_default(Val) when is_float(Val) -> float_to_binary(Val);
-format_default(Val) when is_binary(Val) -> <<"'", Val/binary, "'">>;
+format_default(Val) when is_binary(Val) -> text_literal(Val);
 format_default(true) ->
     ~"1";
 format_default(false) ->
     ~"0";
 format_default(Val) when is_map(Val) ->
-    Json = iolist_to_binary(json:encode(Val)),
-    <<"'", Json/binary, "'">>;
+    text_literal(iolist_to_binary(json:encode(Val)));
 format_default(Val) when is_list(Val) ->
-    Json = iolist_to_binary(json:encode(Val)),
-    <<"'", Json/binary, "'">>.
+    text_literal(iolist_to_binary(json:encode(Val))).
+
+-spec text_literal(binary()) -> binary().
+text_literal(Text) ->
+    <<"'", (binary:replace(Text, ~"'", ~"''", [global]))/binary, "'">>.
 
 -doc """
 Add `CHECK (typeof(col) IN ('blob', 'null'))` to every byte column a
@@ -462,91 +658,118 @@ blob_columns(Schema) ->
     [Field || Field <- kura_schema:non_virtual_fields(Schema), is_map_key(Field, Blobs)].
 
 %%----------------------------------------------------------------------
-%% Vector distance
+%% What SQLite cannot run
 %%----------------------------------------------------------------------
 
-%% kura_dialect_pg would emit pgvector's operators, which SQLite does not
-%% have. Every position it compiles a distance in is checked: a select
-%% expression, an order_by and the left side of a condition, in the query
-%% and in its CTEs, combinations and condition subqueries.
--spec refuse_distances(term()) -> ok.
-refuse_distances(#kura_query{
+%% kura_dialect_pg would emit a row lock clause, DISTINCT ON and pgvector's
+%% operators, none of which SQLite has. A distance is looked for in every
+%% position it is compiled in: a select expression, an order_by and the left
+%% side of a condition. The query's CTEs, combinations and condition
+%% subqueries are checked too.
+-spec refuse_unsupported(term()) -> ok.
+refuse_unsupported(#kura_query{
     select = Select,
     wheres = Wheres,
     havings = Havings,
     order_bys = Orders,
+    lock = Lock,
+    distinct = Distinct,
     ctes = Ctes,
     combinations = Combinations
 }) ->
-    ok = refuse_select_distances(Select),
-    ok = refuse_condition_distances(Wheres),
-    ok = refuse_condition_distances(Havings),
-    ok = refuse_order_distances(Orders),
-    ok = refuse_named_distances(Ctes),
-    refuse_named_distances(Combinations);
-refuse_distances(_Query) ->
+    ok = refuse_lock(Lock),
+    ok = refuse_distinct_on(Distinct),
+    ok = refuse_select(Select),
+    ok = refuse_conditions(Wheres),
+    ok = refuse_conditions(Havings),
+    ok = refuse_orders(Orders),
+    ok = refuse_named(Ctes),
+    refuse_named(Combinations);
+refuse_unsupported(_Query) ->
     ok.
 
--spec refuse_select_distances(term()) -> ok.
-refuse_select_distances({exprs, Exprs}) ->
-    refuse_expr_distances(Exprs);
-refuse_select_distances(_Select) ->
+-spec refuse_select(term()) -> ok.
+refuse_select({exprs, Exprs}) ->
+    refuse_exprs(Exprs);
+refuse_select(_Select) ->
     ok.
 
--spec refuse_expr_distances(term()) -> ok.
-refuse_expr_distances([{_Alias, Expr} | Rest]) ->
+-spec refuse_exprs(term()) -> ok.
+refuse_exprs([{_Alias, Expr} | Rest]) ->
     ok = refuse_distance(Expr),
-    refuse_expr_distances(Rest);
-refuse_expr_distances([_ | Rest]) ->
-    refuse_expr_distances(Rest);
-refuse_expr_distances(_Exprs) ->
+    refuse_exprs(Rest);
+refuse_exprs([_ | Rest]) ->
+    refuse_exprs(Rest);
+refuse_exprs(_Exprs) ->
     ok.
 
--spec refuse_order_distances(term()) -> ok.
-refuse_order_distances([{Expr, _Dir} | Rest]) ->
+-spec refuse_orders(term()) -> ok.
+refuse_orders([{Expr, _Dir} | Rest]) ->
     ok = refuse_distance(Expr),
-    refuse_order_distances(Rest);
-refuse_order_distances([_ | Rest]) ->
-    refuse_order_distances(Rest);
-refuse_order_distances(_Orders) ->
+    refuse_orders(Rest);
+refuse_orders([_ | Rest]) ->
+    refuse_orders(Rest);
+refuse_orders(_Orders) ->
     ok.
 
--spec refuse_condition_distances(term()) -> ok.
-refuse_condition_distances([Condition | Rest]) ->
-    ok = refuse_condition_distance(Condition),
-    refuse_condition_distances(Rest);
-refuse_condition_distances(_Conditions) ->
+-spec refuse_conditions(term()) -> ok.
+refuse_conditions([Condition | Rest]) ->
+    ok = refuse_condition(Condition),
+    refuse_conditions(Rest);
+refuse_conditions(_Conditions) ->
     ok.
 
--spec refuse_condition_distance(term()) -> ok.
-refuse_condition_distance({Op, Conditions}) when Op =:= 'and'; Op =:= 'or' ->
-    refuse_condition_distances(Conditions);
-refuse_condition_distance({'not', Condition}) ->
-    refuse_condition_distance(Condition);
-refuse_condition_distance({Exists, {subquery, Sub}}) when
+-spec refuse_condition(term()) -> ok.
+refuse_condition({Op, Conditions}) when Op =:= 'and'; Op =:= 'or' ->
+    refuse_conditions(Conditions);
+refuse_condition({'not', Condition}) ->
+    refuse_condition(Condition);
+refuse_condition({Exists, {subquery, Sub}}) when
     Exists =:= exists; Exists =:= not_exists
 ->
-    refuse_distances(Sub);
-refuse_condition_distance({Field, in, {subquery, Sub}}) ->
+    refuse_unsupported(Sub);
+refuse_condition({Field, in, {subquery, Sub}}) ->
     ok = refuse_distance(Field),
-    refuse_distances(Sub);
-refuse_condition_distance({Field, _Op, _Value}) ->
+    refuse_unsupported(Sub);
+refuse_condition({Field, _Op, _Value}) ->
     refuse_distance(Field);
-refuse_condition_distance({Field, _Value}) ->
+refuse_condition({Field, _Value}) ->
     refuse_distance(Field);
-refuse_condition_distance(_Condition) ->
+refuse_condition(_Condition) ->
     ok.
 
--spec refuse_named_distances(term()) -> ok.
-refuse_named_distances([{_Name, Query} | Rest]) ->
-    ok = refuse_distances(Query),
-    refuse_named_distances(Rest);
-refuse_named_distances(_Queries) ->
+-spec refuse_named(term()) -> ok.
+refuse_named([{_Name, Query} | Rest]) ->
+    ok = refuse_unsupported(Query),
+    refuse_named(Rest);
+refuse_named(_Queries) ->
     ok.
 
 -spec refuse_distance(term()) -> ok.
 refuse_distance({distance, _Field, _Metric, _Vector}) -> error({unsupported, vector_distance});
 refuse_distance(_Expr) -> ok.
+
+%% SQLite locks the database, never a row. A transaction that has to keep
+%% other writers out takes the write lock with its first write. The lock is
+%% read as kura reads it, so every form of one is refused alike.
+-spec refuse_lock(term()) -> ok.
+refuse_lock(undefined) ->
+    ok;
+refuse_lock(Lock) ->
+    case skips_locked(kura_query:lock_clause(Lock)) of
+        true -> error(?UNSUPPORTED(select_for_update_skip_locked));
+        false -> error(?UNSUPPORTED(row_locks))
+    end.
+
+-spec skips_locked(term()) -> boolean().
+skips_locked([_ | _] = Clauses) -> lists:any(fun skips_locked/1, Clauses);
+skips_locked({_Strength, skip_locked}) -> true;
+skips_locked({_Strength, #{wait := skip_locked}}) -> true;
+skips_locked(_Clause) -> false.
+
+-spec refuse_distinct_on(term()) -> ok.
+refuse_distinct_on(Fields) when is_list(Fields) -> error(?UNSUPPORTED(distinct_on));
+refuse_distinct_on(_Distinct) -> ok.
 
 %%----------------------------------------------------------------------
 %% Byte fields
@@ -554,7 +777,17 @@ refuse_distance(_Expr) -> ok.
 
 -spec blob_values(term(), map()) -> map().
 blob_values(Table, Values) ->
-    {Types, _Blobs} = Fields = schema_fields(Table),
+    typed_values(schema_fields(Table), Values).
+
+%% The table's fields are looked up once for all the rows: for a table that
+%% is not a schema module the lookup is not cached.
+-spec blob_rows(term(), [map()]) -> [map()].
+blob_rows(Table, Rows) ->
+    Fields = schema_fields(Table),
+    [typed_values(Fields, Row) || Row <- Rows].
+
+-spec typed_values(schema_fields(), map()) -> map().
+typed_values({Types, _Blobs} = Fields, Values) ->
     case map_size(Types) of
         0 -> Values;
         _ -> maps:map(fun(Field, Value) -> blob_value(Field, Value, Fields) end, Values)
@@ -569,14 +802,12 @@ blob_keys(Table, KeyClauses) ->
 blob_value(Field, Value, {_Types, Blobs}) when is_binary(Value), is_map_key(Field, Blobs) ->
     {blob, Value};
 blob_value(Field, Value, {Types, _Blobs}) when is_list(Value) ->
-    ok =
-        case Types of
-            #{Field := {array, _} = Type} -> supported_array(Type);
-            #{} -> ok
-        end,
-    Value;
-blob_value(_Field, Value, _Fields) ->
-    Value.
+    case Types of
+        #{Field := {array, _} = Type} -> erlang:error({kura_sqlite, {unsupported_type, Type}});
+        #{} -> Value
+    end;
+blob_value(Field, Value, {Types, _Blobs}) ->
+    dated(Types, Field, Value).
 
 -spec blob_fields(term()) -> #{atom() => kura_types:kura_type()}.
 blob_fields(Table) ->
@@ -653,10 +884,10 @@ blob_type(_Type) -> false.
 %% into the SQL rather than into the parameters.
 -spec blob_query(#kura_query{}) -> #kura_query{}.
 blob_query(#kura_query{wheres = Wheres, havings = Havings} = Query) ->
-    {Fields, Quals} = query_blob_fields(Query),
+    {Fields, Idents} = query_blob_fields(Query),
     Query#kura_query{
-        wheres = blob_conditions(Wheres, Fields, Quals),
-        havings = blob_conditions(Havings, Fields, Quals),
+        wheres = blob_conditions(Wheres, Fields, Idents),
+        havings = blob_conditions(Havings, Fields, Idents),
         ctes = blob_named(Query#kura_query.ctes),
         combinations = blob_named(Query#kura_query.combinations)
     }.
@@ -670,20 +901,45 @@ blob_query(#kura_query{wheres = Wheres, havings = Havings} = Query) ->
 %% restrictive, so a plain or deterministic field never hides a randomized
 %% one. A lookup on a qualified field must also be deterministic in the
 %% `from` schema itself, since that is the column it is compared with.
--spec query_blob_fields(#kura_query{}) -> {where_fields(), #{atom() => binary()}}.
+-spec query_blob_fields(#kura_query{}) -> {where_fields(), idents()}.
 query_blob_fields(#kura_query{from = From, joins = Joins} = Query) ->
     {Types, AllBlobs} = joined_fields([From | [Table || {_Type, Table, _On, _As} <- Joins]]),
+    Renamed = #{Field => quote(Column) || Field := Column <- renamed_columns(From)},
     case kura_dialect:qualified_columns(Query) of
         undefined ->
-            {{Types, AllBlobs, Types}, #{}};
+            {{Types, AllBlobs, Types}, Renamed};
         {Table, FromFields} ->
             Qualified = maps:keys(FromFields),
             Blobs = maps:merge(
                 maps:without(Qualified, AllBlobs), maps:with(Qualified, blob_fields(From))
             ),
             FromTypes = maps:merge(Types, FromFields),
-            {{Types, Blobs, FromTypes}, maps:from_keys(Qualified, quote(Table))}
+            Qualifier = quote(Table),
+            Idents =
+                #{
+                    Field => <<Qualifier/binary, ".", (ident(Field, Renamed))/binary>>
+                 || Field <- Qualified
+                },
+            {{Types, Blobs, FromTypes}, maps:merge(Renamed, Idents)}
     end.
+
+%% The fields of a schema stored in a column of another name
+%% (`#kura_field.column`), which is what kura_dialect_pg writes for a field
+%% of the `from` schema.
+-spec renamed_columns(term()) -> #{atom() => binary()}.
+renamed_columns(Mod) when is_atom(Mod), Mod =/= undefined ->
+    case is_schema(Mod) of
+        true ->
+            #{
+                Field => Column
+             || Field := Column <- kura_schema:column_map(Mod),
+                Column =/= atom_to_binary(Field, utf8)
+            };
+        false ->
+            #{}
+    end;
+renamed_columns(_Table) ->
+    #{}.
 
 -spec joined_fields([term()]) -> schema_fields().
 joined_fields([]) ->
@@ -720,37 +976,37 @@ blob_named(Queries) ->
 blob_subquery(#kura_query{} = Query) -> blob_query(Query);
 blob_subquery(Other) -> Other.
 
--spec blob_conditions([term()], where_fields(), #{atom() => binary()}) -> [term()].
-blob_conditions(Conditions, Fields, Quals) ->
-    [blob_condition(Condition, Fields, Quals) || Condition <- Conditions].
+-spec blob_conditions([term()], where_fields(), idents()) -> [term()].
+blob_conditions(Conditions, Fields, Idents) ->
+    [blob_condition(Condition, Fields, Idents) || Condition <- Conditions].
 
--spec blob_condition(term(), where_fields(), #{atom() => binary()}) -> term().
-blob_condition({Op, Conditions}, Fields, Quals) when
+-spec blob_condition(term(), where_fields(), idents()) -> term().
+blob_condition({Op, Conditions}, Fields, Idents) when
     (Op =:= 'and' orelse Op =:= 'or'), is_list(Conditions)
 ->
-    {Op, blob_conditions(Conditions, Fields, Quals)};
-blob_condition({fragment, _SQL, _Params} = Condition, _Fields, _Quals) ->
+    {Op, blob_conditions(Conditions, Fields, Idents)};
+blob_condition({fragment, _SQL, _Params} = Condition, _Fields, _Idents) ->
     Condition;
-blob_condition({'not', Condition}, Fields, Quals) ->
-    {'not', blob_condition(Condition, Fields, Quals)};
-blob_condition({Exists, {subquery, Sub}}, _Fields, _Quals) when
+blob_condition({'not', Condition}, Fields, Idents) ->
+    {'not', blob_condition(Condition, Fields, Idents)};
+blob_condition({Exists, {subquery, Sub}}, _Fields, _Idents) when
     Exists =:= exists; Exists =:= not_exists
 ->
     {Exists, {subquery, blob_subquery(Sub)}};
-blob_condition({Field, Op, Frames}, {Types, Blobs, FromTypes}, Quals) when
+blob_condition({Field, Op, Frames}, {Types, Blobs, FromTypes}, Idents) when
     is_atom(Field), ?IS_LOOKUP_OP(Op), is_list(Frames)
 ->
     case
         deterministic_field(Field, Types) andalso deterministic_field(Field, FromTypes) andalso
             is_map_key(Field, Blobs)
     of
-        true -> cast_condition({Field, lookup_in(Op), Frames}, Blobs, Quals);
+        true -> cast_condition({Field, lookup_in(Op), Frames}, Blobs, Idents);
         false -> error({kura_sqlite, {unsupported_blob_condition, Field, Op}})
     end;
-blob_condition(Condition, {Types, Blobs, _FromTypes}, Quals) ->
+blob_condition(Condition, {Types, Blobs, _FromTypes}, Idents) ->
     case [Field || Field <- compared_fields(Condition), is_encrypted(Field, Types)] of
         [Field | _] -> error({kura_sqlite, {encrypted_field_in_where, Field}});
-        [] -> cast_condition(Condition, Blobs, Quals)
+        [] -> cast_condition(Condition, Blobs, Idents)
     end.
 
 %% Only a deterministic field is looked up: on any other field the frames
@@ -787,23 +1043,26 @@ is_encrypted(Field, Types) ->
         #{} -> false
     end.
 
--spec cast_condition(term(), #{atom() => kura_types:kura_type()}, #{atom() => binary()}) ->
-    term().
-cast_condition({Field, in, {subquery, Sub}}, _Blobs, _Quals) ->
+-spec cast_condition(term(), #{atom() => kura_types:kura_type()}, idents()) -> term().
+cast_condition({Columns, in, []}, _Blobs, _Idents) when is_atom(Columns); is_list(Columns) ->
+    {fragment, ~"1 = 0", []};
+cast_condition({Field, not_in, []}, _Blobs, _Idents) when is_atom(Field) ->
+    {fragment, ~"1 = 1", []};
+cast_condition({Field, in, {subquery, Sub}}, _Blobs, _Idents) ->
     {Field, in, {subquery, blob_subquery(Sub)}};
-cast_condition({Field, Op, Value}, Blobs, Quals) when
+cast_condition({Field, Op, Value}, Blobs, Idents) when
     is_atom(Field), ?IS_COMPARISON(Op), is_map_key(Field, Blobs)
 ->
     {fragment,
-        <<(ident(Field, Quals))/binary, " ", (atom_to_binary(Op))/binary, " ", ?CAST/binary>>, [
+        <<(ident(Field, Idents))/binary, " ", (atom_to_binary(Op))/binary, " ", ?CAST/binary>>, [
             Value
         ]};
-cast_condition({Field, In, [_ | _] = Values}, Blobs, Quals) when
+cast_condition({Field, In, [_ | _] = Values}, Blobs, Idents) when
     is_atom(Field), (In =:= in orelse In =:= not_in), is_map_key(Field, Blobs)
 ->
     Casts = comma([?CAST || _ <- Values]),
-    {fragment, <<(ident(Field, Quals))/binary, (in_sql(In))/binary, Casts/binary, ")">>, Values};
-cast_condition({[_ | _] = Fields, in, [_ | _] = Rows} = Condition, Blobs, Quals) ->
+    {fragment, <<(ident(Field, Idents))/binary, (in_sql(In))/binary, Casts/binary, ")">>, Values};
+cast_condition({[_ | _] = Fields, in, [_ | _] = Rows} = Condition, Blobs, Idents) ->
     Arity = length(Fields),
     Atoms = [Field || Field <- Fields, is_atom(Field)],
     Values = [tuple_to_list(Row) || Row <- Rows, is_tuple(Row), tuple_size(Row) =:= Arity],
@@ -811,40 +1070,52 @@ cast_condition({[_ | _] = Fields, in, [_ | _] = Rows} = Condition, Blobs, Quals)
         length(Atoms) =:= Arity andalso length(Values) =:= length(Rows) andalso
             lists:any(fun(Field) -> is_map_key(Field, Blobs) end, Atoms)
     of
-        true -> row_fragment(Atoms, Values, Blobs, Quals);
+        true -> row_fragment(Atoms, Values, Blobs, Idents);
         false -> Condition
     end;
-cast_condition({Field, between, {Low, High}}, Blobs, Quals) when
+cast_condition({Field, between, {Low, High}}, Blobs, Idents) when
     is_atom(Field), is_map_key(Field, Blobs)
 ->
-    {fragment, <<(ident(Field, Quals))/binary, " BETWEEN ", ?CAST/binary, " AND ", ?CAST/binary>>, [
+    {fragment, <<(ident(Field, Idents))/binary, " BETWEEN ", ?CAST/binary, " AND ", ?CAST/binary>>,
+        [
             Low, High
         ]};
-cast_condition({Field, Value}, Blobs, Quals) when
+cast_condition({Field, Value}, Blobs, Idents) when
     is_atom(Field), not ?IS_UNARY_OP(Value), is_map_key(Field, Blobs)
 ->
-    cast_condition({Field, '=', Value}, Blobs, Quals);
-cast_condition({Field, Op, _Value} = Condition, Blobs, _Quals) when
-    is_atom(Field), (Op =:= like orelse Op =:= ilike), is_map_key(Field, Blobs)
+    cast_condition({Field, '=', Value}, Blobs, Idents);
+cast_condition({Field, Op, Pattern}, _Blobs, Idents) when
+    is_atom(Field), (Op =:= like orelse Op =:= ilike)
 ->
-    Condition;
-cast_condition({Field, In, []} = Condition, Blobs, _Quals) when
-    is_atom(Field), (In =:= in orelse In =:= not_in), is_map_key(Field, Blobs)
-->
-    Condition;
-cast_condition({Field, Op, _Value}, Blobs, _Quals) when is_atom(Field), is_map_key(Field, Blobs) ->
+    {fragment, <<(ident(Field, Idents))/binary, " LIKE ? ESCAPE '\\'">>, [Pattern]};
+cast_condition({Field, Op, _Value}, Blobs, _Idents) when is_atom(Field), is_map_key(Field, Blobs) ->
     error({kura_sqlite, {unsupported_blob_condition, Field, Op}});
-cast_condition(Condition, _Blobs, _Quals) ->
+cast_condition({Field, Op, Text}, _Blobs, Idents) when is_atom(Field), ?IS_EXACT_MATCH(Op) ->
+    Pattern = text_pattern(Op, ~"'*'", ?GLOB_TEXT),
+    {fragment, <<(ident(Field, Idents))/binary, " GLOB ", Pattern/binary>>, [Text]};
+cast_condition({Field, Op, Text}, _Blobs, Idents) when is_atom(Field), ?IS_FOLDED_MATCH(Op) ->
+    Pattern = text_pattern(Op, ~"'%'", ?LIKE_TEXT),
+    {fragment, <<(ident(Field, Idents))/binary, " LIKE ", Pattern/binary, " ESCAPE '!'">>, [Text]};
+cast_condition({Field, matches, _Query}, _Blobs, _Idents) when is_atom(Field) ->
+    error(?UNSUPPORTED(full_text_search));
+cast_condition(Condition, _Blobs, _Idents) ->
     Condition.
 
--spec row_fragment(
-    [atom()], [[term()]], #{atom() => kura_types:kura_type()}, #{atom() => binary()}
-) ->
+%% The escaped text with the wildcard wherever the match lets anything stand.
+-spec text_pattern(atom(), binary(), binary()) -> binary().
+text_pattern(Op, Any, Text) when Op =:= contains; Op =:= icontains ->
+    <<Any/binary, " || ", Text/binary, " || ", Any/binary>>;
+text_pattern(Op, Any, Text) when Op =:= starts_with; Op =:= istarts_with ->
+    <<Text/binary, " || ", Any/binary>>;
+text_pattern(Op, Any, Text) when Op =:= ends_with; Op =:= iends_with ->
+    <<Any/binary, " || ", Text/binary>>.
+
+-spec row_fragment([atom()], [[term()]], #{atom() => kura_types:kura_type()}, idents()) ->
     {fragment, binary(), [term()]}.
-row_fragment(Fields, Values, Blobs, Quals) ->
+row_fragment(Fields, Values, Blobs, Idents) ->
     Row = <<"(", (comma([placeholder(Field, Blobs) || Field <- Fields]))/binary, ")">>,
     Rows = comma([Row || _ <- Values]),
-    Columns = comma([ident(Field, Quals) || Field <- Fields]),
+    Columns = comma([ident(Field, Idents) || Field <- Fields]),
     {fragment, <<"(", Columns/binary, ") IN (", Rows/binary, ")">>, lists:append(Values)}.
 
 -spec placeholder(atom(), #{atom() => kura_types:kura_type()}) -> binary().
@@ -864,12 +1135,11 @@ comma([]) -> <<>>;
 comma([Part]) -> Part;
 comma([Part | Rest]) -> <<Part/binary, ", ", (comma(Rest))/binary>>.
 
--spec ident(atom(), #{atom() => binary()}) -> binary().
-ident(Field, Quals) ->
-    Column = quote(atom_to_binary(Field, utf8)),
-    case Quals of
-        #{Field := Qualifier} -> <<Qualifier/binary, ".", Column/binary>>;
-        #{} -> Column
+-spec ident(atom(), idents()) -> binary().
+ident(Field, Idents) ->
+    case Idents of
+        #{Field := Ident} -> Ident;
+        #{} -> quote(atom_to_binary(Field, utf8))
     end.
 
 -spec quote(binary()) -> binary().
@@ -884,23 +1154,57 @@ quote(Name) ->
 -doc """
 Rewrite PG's `$N` placeholders to SQLite's `?N` form.
 
-Both backends accept positional and numbered placeholders. SQLite
-specifically: `?NNN` where NNN is a 1-indexed integer. Position-for-
-position swap; counts and ordering preserved.
+`?N` is SQLite's numbered parameter: it takes the `N`th value whatever its
+place in the statement, as `$N` does in PostgreSQL, so a number that is
+repeated or out of order still names the same value. `kura_driver_sqlite`
+binds the values by that number.
 
-Bytes inside string literals are not rewritten; SQLite uses single
-quotes for literals (`SQLITE_DQS=0` excludes double-quoted strings)
-and the kura emitter follows the same convention.
+Only a placeholder is rewritten. A `$` inside a string literal, a quoted
+identifier (`"..."`, `` `...` `` or `[...]`), a `--` or `/* */` comment or an
+identifier (`a$1`), and one not followed by a digit, is text and is left as
+it is.
 """.
 -spec swap_placeholders(iodata()) -> binary().
 swap_placeholders(SQL) ->
-    Bin = iolist_to_binary(SQL),
-    swap(Bin, <<>>).
+    statement_text(iolist_to_binary(SQL), $\s, <<>>).
 
--spec swap(binary(), binary()) -> binary().
-swap(<<>>, Acc) ->
+%% Previous is the byte before the one being read, which tells a
+%% placeholder from the `$` of an identifier.
+-spec statement_text(binary(), byte(), binary()) -> binary().
+statement_text(<<>>, _Previous, Acc) ->
     Acc;
-swap(<<$$, Rest/binary>>, Acc) ->
-    swap(Rest, <<Acc/binary, $?>>);
-swap(<<C, Rest/binary>>, Acc) ->
-    swap(Rest, <<Acc/binary, C>>).
+statement_text(<<$$, Digit, Rest/binary>>, Previous, Acc) when Digit >= $0, Digit =< $9 ->
+    case identifier_byte(Previous) of
+        true -> statement_text(Rest, Digit, <<Acc/binary, $$, Digit>>);
+        false -> statement_text(Rest, Digit, <<Acc/binary, $?, Digit>>)
+    end;
+statement_text(<<Quote, Rest/binary>>, _Previous, Acc) when
+    Quote =:= $'; Quote =:= $"; Quote =:= $`
+->
+    {Quoted, Tail} = quoted(Rest, Quote, <<Quote>>),
+    statement_text(Tail, Quote, <<Acc/binary, Quoted/binary>>);
+statement_text(<<$[, Rest/binary>>, _Previous, Acc) ->
+    {Skipped, Tail} = through(Rest, ~"]"),
+    statement_text(Tail, $], <<Acc/binary, $[, Skipped/binary>>);
+statement_text(<<"--", Rest/binary>>, _Previous, Acc) ->
+    {Skipped, Tail} = through(Rest, ~"\n"),
+    statement_text(Tail, $\n, <<Acc/binary, "--", Skipped/binary>>);
+statement_text(<<"/*", Rest/binary>>, _Previous, Acc) ->
+    {Skipped, Tail} = through(Rest, ~"*/"),
+    statement_text(Tail, $/, <<Acc/binary, "/*", Skipped/binary>>);
+statement_text(<<Byte, Rest/binary>>, _Previous, Acc) ->
+    statement_text(Rest, Byte, <<Acc/binary, Byte>>).
+
+%% Up to and including End. Text that never reaches it runs to the end, and
+%% SQLite refuses the statement, except for a comment, which may end there.
+-spec through(binary(), binary()) -> {binary(), binary()}.
+through(Text, End) ->
+    case binary:split(Text, End) of
+        [Skipped, Tail] -> {<<Skipped/binary, End/binary>>, Tail};
+        [Unterminated] -> {Unterminated, <<>>}
+    end.
+
+-spec identifier_byte(byte()) -> boolean().
+identifier_byte(Byte) ->
+    (Byte >= $a andalso Byte =< $z) orelse (Byte >= $A andalso Byte =< $Z) orelse
+        (Byte >= $0 andalso Byte =< $9) orelse Byte =:= $_ orelse Byte =:= $$ orelse Byte >= 128.

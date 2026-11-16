@@ -3,6 +3,214 @@
 -include_lib("kura/include/kura.hrl").
 
 %%----------------------------------------------------------------------
+%% placeholder/1
+%%----------------------------------------------------------------------
+
+placeholder_is_a_numbered_question_mark_test() ->
+    ?assertEqual(~"?1", iolist_to_binary(kura_dialect_sqlite:placeholder(1))),
+    ?assertEqual(~"?32766", iolist_to_binary(kura_dialect_sqlite:placeholder(32766))).
+
+kura_asks_the_dialect_for_its_placeholder_test() ->
+    ?assertEqual(~"?7", iolist_to_binary(kura_dialect:placeholder(kura_dialect_sqlite, 7))).
+
+%%----------------------------------------------------------------------
+%% load_stored/2
+%%----------------------------------------------------------------------
+
+load_stored_reads_a_boolean_from_its_integer_test() ->
+    ?assertEqual(true, kura_dialect_sqlite:load_stored(boolean, 1)),
+    ?assertEqual(false, kura_dialect_sqlite:load_stored(boolean, 0)),
+    ?assertEqual(2, kura_dialect_sqlite:load_stored(boolean, 2)),
+    ?assertEqual(~"true", kura_dialect_sqlite:load_stored(boolean, ~"true")),
+    ?assertEqual(1, kura_dialect_sqlite:load_stored(integer, 1)).
+
+load_stored_reads_dates_and_times_from_their_text_test() ->
+    ?assertEqual({1990, 1, 2}, kura_dialect_sqlite:load_stored(date, ~"1990-01-02")),
+    ?assertEqual({12, 5, 6}, kura_dialect_sqlite:load_stored(date, ~"0012-05-06")),
+    ?assertEqual({12, 5, 6}, kura_dialect_sqlite:load_stored(time, ~"12:05:06")),
+    ?assertEqual(
+        {{2024, 1, 2}, {3, 4, 5}},
+        kura_dialect_sqlite:load_stored(utc_datetime, ~"2024-01-02 03:04:05")
+    ),
+    ?assertEqual(
+        {{2024, 1, 2}, {3, 4, 5}},
+        kura_dialect_sqlite:load_stored(naive_datetime, ~"2024-01-02 03:04:05")
+    ).
+
+load_stored_keeps_what_it_cannot_read_test() ->
+    ?assertEqual(~"yesterday", kura_dialect_sqlite:load_stored(date, ~"yesterday")),
+    ?assertEqual(~"12:05:06", kura_dialect_sqlite:load_stored(date, ~"12:05:06")),
+    ?assertEqual(20240102, kura_dialect_sqlite:load_stored(date, 20240102)).
+
+load_stored_leaves_every_other_type_alone_test() ->
+    [
+        ?assertEqual(Value, kura_dialect_sqlite:load_stored(Type, Value))
+     || {Type, Value} <- [
+            {string, ~"1990-01-02"},
+            {text, ~"12:05:06"},
+            {decimal, ~"12345678901234567.89"},
+            {decimal, 1.25},
+            {jsonb, ~"{\"a\":1}"},
+            {{enum, [a, b]}, ~"a"},
+            {uuid, ~"0190a6f8-7b3a-7c3e-8f0a-1b2c3d4e5f60"},
+            {{encrypted, date}, ~"1990-01-02"},
+            {{embed, embeds_one, kura_sqlite_orm_address}, ~"{}"},
+            {float, 1}
+        ]
+    ].
+
+kura_reads_a_row_through_the_dialect_test() ->
+    ?assert(kura_dialect:loads_stored(kura_dialect_sqlite)).
+
+%%----------------------------------------------------------------------
+%% A date of the years 0 to 24
+%%----------------------------------------------------------------------
+
+-define(AUTHOR, kura_sqlite_orm_author).
+-define(EARLY, {12, 5, 6}).
+-define(EARLY_TEXT, ~"0012-05-06").
+
+an_early_date_compared_with_a_date_field_is_its_text_test_() ->
+    Q = kura_query:from(?AUTHOR),
+    Sub = kura_query:where(Q, {born, ?EARLY}),
+    Converted = fun(Condition) ->
+        #kura_query{wheres = [Where]} = kura_dialect_sqlite:convert_values(
+            Q#kura_query{wheres = [Condition]}
+        ),
+        Where
+    end,
+    [
+        ?_assertEqual({born, Op, ?EARLY_TEXT}, Converted({born, Op, ?EARLY}))
+     || Op <- ['=', '!=', '<', '>', '<=', '>=']
+    ] ++
+        [
+            ?_assertEqual({born, ?EARLY_TEXT}, Converted({born, ?EARLY})),
+            ?_assertEqual({born, not_in, [?EARLY_TEXT]}, Converted({born, not_in, [?EARLY]})),
+            ?_assertMatch(
+                {not_exists, {subquery, #kura_query{wheres = [{born, ?EARLY_TEXT}]}}},
+                Converted({not_exists, {subquery, Sub}})
+            )
+        ] ++ early_in_every_position(Converted, Sub).
+
+early_in_every_position(Converted, Sub) ->
+    Q = kura_query:from(?AUTHOR),
+    [
+        ?_assertEqual(
+            {born, in, [?EARLY_TEXT, {2024, 1, 2}, ~"0001-01-01"]},
+            Converted({born, in, [?EARLY, {2024, 1, 2}, ~"0001-01-01"]})
+        ),
+        ?_assertEqual(
+            {born, between, {~"0000-01-01", ?EARLY_TEXT}},
+            Converted({born, between, {{0, 1, 1}, ?EARLY}})
+        ),
+        ?_assertEqual(
+            {'or', [{'not', {born, ?EARLY_TEXT}}, {'and', [{born, '>=', ~"0024-12-31"}]}]},
+            Converted({'or', [{'not', {born, ?EARLY}}, {'and', [{born, '>=', {24, 12, 31}}]}]})
+        ),
+        ?_assertMatch(
+            {id, in, {subquery, #kura_query{wheres = [{born, ?EARLY_TEXT}]}}},
+            Converted({id, in, {subquery, Sub}})
+        ),
+        ?_assertMatch(
+            {exists, {subquery, #kura_query{wheres = [{born, ?EARLY_TEXT}]}}},
+            Converted({exists, {subquery, Sub}})
+        ),
+        ?_assertMatch(
+            #kura_query{
+                ctes = [{~"early", #kura_query{wheres = [{born, ?EARLY_TEXT}]}}],
+                combinations = [{union, #kura_query{wheres = [{born, ?EARLY_TEXT}]}}]
+            },
+            kura_dialect_sqlite:convert_values(
+                kura_query:union(kura_query:with_cte(Q, ~"early", Sub), Sub)
+            )
+        )
+    ].
+
+only_an_early_date_on_a_date_field_is_converted_test_() ->
+    Q = kura_query:from(?AUTHOR),
+    Kept = [
+        {wakes, ?EARLY},
+        {wakes, '<', ?EARLY},
+        {born, {2024, 1, 2}},
+        {born, {25, 1, 1}},
+        {born, {12, 13, 40}},
+        {born, {-1, 5, 6}},
+        {born, ?EARLY_TEXT},
+        {born, is_nil},
+        {name, ?EARLY},
+        {inserted_at, {?EARLY, {1, 2, 3}}},
+        {{author, born}, ?EARLY},
+        {fragment, ~"born = ?", [?EARLY]},
+        {settings, [{born, ?EARLY}]},
+        {born, '=', [?EARLY]},
+        {born, like, ?EARLY}
+    ],
+    [
+        ?_assertEqual(
+            Q#kura_query{wheres = [Condition]},
+            kura_dialect_sqlite:convert_values(Q#kura_query{wheres = [Condition]})
+        )
+     || Condition <- Kept
+    ] ++
+        [
+            ?_assertEqual(
+                #kura_query{from = ~"authors", wheres = [{born, ?EARLY}]},
+                kura_dialect_sqlite:convert_values(
+                    #kura_query{from = ~"authors", wheres = [{born, ?EARLY}]}
+                )
+            ),
+            ?_assertEqual(
+                Q#kura_query{havings = [{born, ?EARLY}]},
+                kura_dialect_sqlite:convert_values(Q#kura_query{havings = [{born, ?EARLY}]})
+            )
+        ].
+
+convert_values_is_idempotent_and_never_raises_test_() ->
+    Q = kura_query:from(?AUTHOR),
+    Once = kura_dialect_sqlite:convert_values(kura_query:where(Q, {born, ?EARLY})),
+    Malformed = [
+        Q#kura_query{wheres = improper([{born, ?EARLY}])},
+        Q#kura_query{wheres = [{born, in, improper([?EARLY])}]},
+        Q#kura_query{wheres = [{'and', improper([{born, ?EARLY}])}]},
+        Q#kura_query{ctes = improper([]), combinations = improper([{union, Q}])}
+    ],
+    [?_assertEqual(Once, kura_dialect_sqlite:convert_values(Once))] ++
+        [?_assertEqual(Query, kura_dialect_sqlite:convert_values(Query)) || Query <- Malformed].
+
+%% `List` ending in an atom, as only a hand-built query holds one. No type
+%% describes it, and eqwalizer refuses to see one written out.
+-spec improper([term()]) -> dynamic().
+improper(List) ->
+    apply(erlang, '++', [List, improper]).
+
+an_early_date_written_to_a_date_field_is_its_text_test_() ->
+    Values = #{born => ?EARLY, wakes => ?EARLY, name => ~"Ada"},
+    Fields = [born, wakes, name],
+    Written = [?EARLY_TEXT, ?EARLY, ~"Ada"],
+    [
+        ?_assertMatch({_, Written}, kura_dialect_sqlite:insert(?AUTHOR, Fields, Values)),
+        ?_assertMatch({_, Written}, kura_dialect_sqlite:insert(?AUTHOR, Fields, Values, #{})),
+        ?_assertMatch(
+            {_, [?EARLY_TEXT, ?EARLY, ~"Ada", ?EARLY_TEXT]},
+            kura_dialect_sqlite:update(?AUTHOR, Fields, Values, [{born, ?EARLY}])
+        ),
+        ?_assertMatch({_, [?EARLY_TEXT]}, kura_dialect_sqlite:delete(?AUTHOR, [{born, ?EARLY}])),
+        ?_assertMatch(
+            {_, [?EARLY_TEXT, ?EARLY, ~"Ada", {2024, 1, 2}, ?EARLY, ~"Bob"]},
+            kura_dialect_sqlite:insert_all(?AUTHOR, Fields, [
+                Values, #{born => {2024, 1, 2}, wakes => ?EARLY, name => ~"Bob"}
+            ])
+        ),
+        ?_assertMatch(
+            {_, [?EARLY_TEXT]},
+            kura_dialect_sqlite:update_all(kura_query:from(?AUTHOR), #{born => ?EARLY})
+        ),
+        ?_assertMatch(
+            {_, [?EARLY]}, kura_dialect_sqlite:insert(authors, [born], #{born => ?EARLY})
+        )
+    ].
+
+%%----------------------------------------------------------------------
 %% swap_placeholders/1
 %%----------------------------------------------------------------------
 
@@ -22,6 +230,45 @@ swap_double_digit_placeholder_test() ->
         <<"SELECT ?12, ?34">>, kura_dialect_sqlite:swap_placeholders(<<"SELECT $12, $34">>)
     ).
 
+swap_keeps_the_number_of_a_repeated_or_out_of_order_placeholder_test() ->
+    ?assertEqual(
+        ~"SELECT ?2, ?1, ?2 WHERE a = ?10",
+        kura_dialect_sqlite:swap_placeholders(~"SELECT $2, $1, $2 WHERE a = $10")
+    ).
+
+swap_leaves_text_that_is_not_a_placeholder_test_() ->
+    Unchanged = [
+        ~"SELECT '$1'",
+        ~"SELECT 'it''s $1'",
+        ~"SELECT \"a$1\"",
+        ~"SELECT \"a\"\"$1\"",
+        ~"SELECT `a$1`",
+        ~"SELECT [a$1]",
+        ~"SELECT 1 -- $1",
+        ~"SELECT 1 /* $1 */",
+        ~"SELECT 1 /* $1",
+        ~"SELECT price$1",
+        ~"SELECT _$1, å$1",
+        ~"SELECT $name, $, $$",
+        ~"SELECT 'unterminated $1",
+        ~"SELECT json_extract(a, '$.b[0]')"
+    ],
+    [?_assertEqual(SQL, kura_dialect_sqlite:swap_placeholders(SQL)) || SQL <- Unchanged].
+
+swap_rewrites_a_placeholder_next_to_skipped_text_test_() ->
+    Cases = [
+        {~"SELECT '$1', $1", ~"SELECT '$1', ?1"},
+        {~"SELECT '$1'$2", ~"SELECT '$1'?2"},
+        {~"SELECT \"a$1\" = $1", ~"SELECT \"a$1\" = ?1"},
+        {~"SELECT [a$1]$2", ~"SELECT [a$1]?2"},
+        {~"SELECT 1 -- $1\n, $2", ~"SELECT 1 -- $1\n, ?2"},
+        {~"SELECT 1 /* $1 */ + $2", ~"SELECT 1 /* $1 */ + ?2"},
+        {~"SELECT 1 /* a */ /* $1 */$2", ~"SELECT 1 /* a */ /* $1 */?2"},
+        {~"SELECT a-$1, ($2), $3||$4", ~"SELECT a-?1, (?2), ?3||?4"},
+        {~"$1", ~"?1"}
+    ],
+    [?_assertEqual(Out, kura_dialect_sqlite:swap_placeholders(In)) || {In, Out} <- Cases].
+
 %%----------------------------------------------------------------------
 %% column_type/1: SQLite type mapping
 %%----------------------------------------------------------------------
@@ -38,8 +285,7 @@ column_type_basics_test_() ->
         ?_assertEqual(~"TEXT", kura_dialect_sqlite:column_type(jsonb)),
         ?_assertEqual(~"TEXT", kura_dialect_sqlite:column_type(utc_datetime)),
         ?_assertMatch(<<"BLOB", _/binary>>, kura_dialect_sqlite:column_type(binary)),
-        ?_assertEqual(~"TEXT", kura_dialect_sqlite:column_type({enum, [a, b]})),
-        ?_assertEqual(~"TEXT", kura_dialect_sqlite:column_type({array, integer}))
+        ?_assertEqual(~"TEXT", kura_dialect_sqlite:column_type({enum, [a, b]}))
     ].
 
 %%----------------------------------------------------------------------
@@ -179,32 +425,32 @@ update_all_wraps_set_values_test() ->
 
 where_on_byte_field_casts_placeholder_test_() ->
     Cases = [
-        {{data, ~"d"}, <<"\"data\" = CAST(?1 AS BLOB)">>, [~"d"]},
-        {{data, '=', ~"d"}, <<"\"data\" = CAST(?1 AS BLOB)">>, [~"d"]},
-        {{data, '!=', ~"d"}, <<"\"data\" != CAST(?1 AS BLOB)">>, [~"d"]},
-        {{data, '>=', ~"d"}, <<"\"data\" >= CAST(?1 AS BLOB)">>, [~"d"]},
-        {{data, in, [~"a", ~"b"]}, <<"\"data\" IN (CAST(?1 AS BLOB), CAST(?2 AS BLOB))">>, [
+        {{data, ~"d"}, ~"(\"data\" = CAST(?1 AS BLOB)\n)", [~"d"]},
+        {{data, '=', ~"d"}, ~"(\"data\" = CAST(?1 AS BLOB)\n)", [~"d"]},
+        {{data, '!=', ~"d"}, ~"(\"data\" != CAST(?1 AS BLOB)\n)", [~"d"]},
+        {{data, '>=', ~"d"}, ~"(\"data\" >= CAST(?1 AS BLOB)\n)", [~"d"]},
+        {{data, in, [~"a", ~"b"]}, ~"(\"data\" IN (CAST(?1 AS BLOB), CAST(?2 AS BLOB))\n)", [
             ~"a", ~"b"
         ]},
-        {{data, not_in, [~"a"]}, <<"\"data\" NOT IN (CAST(?1 AS BLOB))">>, [~"a"]},
+        {{data, not_in, [~"a"]}, ~"(\"data\" NOT IN (CAST(?1 AS BLOB))\n)", [~"a"]},
         {
             {data, between, {~"a", ~"b"}},
-            <<"\"data\" BETWEEN CAST(?1 AS BLOB) AND CAST(?2 AS BLOB)">>,
+            ~"(\"data\" BETWEEN CAST(?1 AS BLOB) AND CAST(?2 AS BLOB)\n)",
             [~"a", ~"b"]
         },
         {
             {[id, data], in, [{1, ~"a"}, {2, ~"b"}]},
-            <<"(\"id\", \"data\") IN ((?1, CAST(?2 AS BLOB)), (?3, CAST(?4 AS BLOB)))">>,
+            ~"((\"id\", \"data\") IN ((?1, CAST(?2 AS BLOB)), (?3, CAST(?4 AS BLOB)))\n)",
             [
                 1, ~"a", 2, ~"b"
             ]
         },
         {
             {'or', [{data, ~"a"}, {name, ~"n"}]},
-            <<"(\"data\" = CAST(?1 AS BLOB) OR \"name\" = ?2)">>,
+            ~"((\"data\" = CAST(?1 AS BLOB)\n) OR \"name\" = ?2)",
             [~"a", ~"n"]
         },
-        {{'not', {data, ~"a"}}, <<"NOT (\"data\" = CAST(?1 AS BLOB))">>, [~"a"]}
+        {{'not', {data, ~"a"}}, ~"NOT ((\"data\" = CAST(?1 AS BLOB)\n))", [~"a"]}
     ],
     [
         ?_assertEqual({Where, Params}, where_sql(Condition))
@@ -216,9 +462,9 @@ where_on_joined_byte_field_casts_placeholder_test_() ->
         kura_query:from(kura_sqlite_owner_schema), inner, ?BLOB_SCHEMA, {owner_id, id}
     ),
     Cases = [
-        {{data, '!=', ~"d"}, <<"\"data\" != CAST(?1 AS BLOB)">>},
-        {{data, not_in, [~"d"]}, <<"\"data\" NOT IN (CAST(?1 AS BLOB))">>},
-        {{'not', {data, ~"d"}}, <<"NOT (\"data\" = CAST(?1 AS BLOB))">>},
+        {{data, '!=', ~"d"}, ~"(\"data\" != CAST(?1 AS BLOB)\n)"},
+        {{data, not_in, [~"d"]}, ~"(\"data\" NOT IN (CAST(?1 AS BLOB))\n)"},
+        {{'not', {data, ~"d"}}, ~"NOT ((\"data\" = CAST(?1 AS BLOB)\n))"},
         {{label, ~"d"}, <<"\"owners\".\"label\" = ?1">>}
     ],
     [
@@ -231,15 +477,15 @@ where_on_from_byte_field_under_join_casts_qualified_column_test_() ->
         kura_query:from(kura_sqlite_owner_bytes_schema), inner, ?BLOB_SCHEMA, {owner_id, id}
     ),
     Cases = [
-        {{key, ~"k"}, <<"\"owners\".\"key\" = CAST(?1 AS BLOB)">>},
-        {{key, in, [~"k"]}, <<"\"owners\".\"key\" IN (CAST(?1 AS BLOB))">>},
+        {{key, ~"k"}, ~"(\"owners\".\"key\" = CAST(?1 AS BLOB)\n)"},
+        {{key, in, [~"k"]}, ~"(\"owners\".\"key\" IN (CAST(?1 AS BLOB))\n)"},
         {
             {key, between, {~"k", ~"k"}},
-            <<"\"owners\".\"key\" BETWEEN CAST(?1 AS BLOB) AND CAST(?2 AS BLOB)">>
+            ~"(\"owners\".\"key\" BETWEEN CAST(?1 AS BLOB) AND CAST(?2 AS BLOB)\n)"
         },
         {
             {[owner_id, key], in, [{1, ~"k"}]},
-            <<"(\"owners\".\"owner_id\", \"owners\".\"key\") IN ((?1, CAST(?2 AS BLOB)))">>
+            ~"((\"owners\".\"owner_id\", \"owners\".\"key\") IN ((?1, CAST(?2 AS BLOB)))\n)"
         }
     ],
     [
@@ -275,14 +521,14 @@ where_in_subquery_casts_inner_query_test() ->
     Q = kura_query:where(kura_query:from(?BLOB_SCHEMA), {id, in, {subquery, Sub}}),
     {SQL, Params} = kura_dialect_sqlite:to_sql(Q),
     ?assertNotEqual(
-        nomatch, binary:match(iolist_to_binary(SQL), ~"WHERE \"data\" = CAST(?1 AS BLOB))")
+        nomatch, binary:match(iolist_to_binary(SQL), ~"WHERE (\"data\" = CAST(?1 AS BLOB)\n))")
     ),
     ?assertEqual([~"d"], Params).
 
 delete_all_casts_where_test() ->
     Q = kura_query:where(kura_query:from(?BLOB_SCHEMA), {data, ~"d"}),
     ?assertEqual(
-        {<<"DELETE FROM \"vault\" WHERE \"data\" = CAST(?1 AS BLOB)">>, [~"d"]},
+        {~"DELETE FROM \"vault\" WHERE (\"data\" = CAST(?1 AS BLOB)\n)", [~"d"]},
         kura_dialect_sqlite:delete_all(Q)
     ).
 
@@ -336,7 +582,7 @@ insert_all_with_opts_wraps_every_row_test() ->
 
 where_and_on_byte_field_casts_test() ->
     ?assertEqual(
-        {<<"(\"data\" = CAST(?1 AS BLOB) AND \"name\" = ?2)">>, [~"a", ~"n"]},
+        {~"((\"data\" = CAST(?1 AS BLOB)\n) AND \"name\" = ?2)", [~"a", ~"n"]},
         where_sql({'and', [{data, ~"a"}, {name, ~"n"}]})
     ).
 
@@ -346,7 +592,7 @@ where_exists_casts_inner_query_test() ->
         kura_query:where(kura_query:from(?BLOB_SCHEMA), {not_exists, {subquery, Sub}})
     ),
     ?assertNotEqual(
-        nomatch, binary:match(iolist_to_binary(SQL), ~"WHERE \"data\" = CAST(?1 AS BLOB))")
+        nomatch, binary:match(iolist_to_binary(SQL), ~"WHERE (\"data\" = CAST(?1 AS BLOB)\n))")
     ),
     ?assertEqual([~"d"], Params).
 
@@ -519,16 +765,23 @@ where_unsupported_operator_on_byte_field_raises_test_() ->
         )
     ].
 
-where_unsupported_operator_on_text_field_is_untouched_test() ->
-    ?assertEqual({<<"\"name\" LIKE ?1">>, [~"n%"]}, where_sql({name, like, ~"n%"})).
+where_like_on_text_field_names_the_escape_test() ->
+    ?assertEqual(
+        {~"(\"name\" LIKE ?1 ESCAPE '\\'\n)", [~"n%"]}, where_sql({name, like, ~"n%"})
+    ).
 
-where_left_alone_on_byte_field_test_() ->
+%% SQLite has no ILIKE, and `IN ()` is not SQL.
+where_uncast_on_byte_field_test_() ->
     [
-        ?_assertEqual({<<"\"data\" LIKE ?1">>, [~"d%"]}, where_sql({data, like, ~"d%"})),
-        ?_assertEqual({<<"\"data\" ILIKE ?1">>, [~"d%"]}, where_sql({data, ilike, ~"d%"})),
+        ?_assertEqual(
+            {~"(\"data\" LIKE ?1 ESCAPE '\\'\n)", [~"d%"]}, where_sql({data, like, ~"d%"})
+        ),
+        ?_assertEqual(
+            {~"(\"data\" LIKE ?1 ESCAPE '\\'\n)", [~"d%"]}, where_sql({data, ilike, ~"d%"})
+        ),
         ?_assertEqual({<<"\"data\" IS NOT NULL">>, []}, where_sql({data, is_not_nil})),
-        ?_assertEqual({<<"\"data\" IN ()">>, []}, where_sql({data, in, []})),
-        ?_assertEqual({<<"\"data\" NOT IN ()">>, []}, where_sql({data, not_in, []}))
+        ?_assertEqual({~"(1 = 0\n)", []}, where_sql({data, in, []})),
+        ?_assertEqual({~"(1 = 1\n)", []}, where_sql({data, not_in, []}))
     ].
 
 %% Ciphertext under a fresh nonce never equals another, so a condition on an
@@ -633,11 +886,11 @@ where_unary_on_encrypted_field_is_untouched_test_() ->
     ].
 
 where_atom_value_on_byte_field_binds_test() ->
-    ?assertEqual({<<"\"data\" = CAST(?1 AS BLOB)">>, [nil]}, where_sql({data, nil})).
+    ?assertEqual({~"(\"data\" = CAST(?1 AS BLOB)\n)", [nil]}, where_sql({data, nil})).
 
 where_fragment_is_untouched_test() ->
     ?assertEqual(
-        {<<"length(data) > ?1">>, [3]}, where_sql({fragment, ~"length(data) > ?", [3]})
+        {~"(length(data) > ?1\n)", [3]}, where_sql({fragment, ~"length(data) > ?", [3]})
     ).
 
 byte_fields_are_cached_per_schema_test() ->
@@ -696,7 +949,6 @@ encrypted_forms_are_blob_columns_test_() ->
     Blob = kura_dialect_sqlite:column_type(binary),
     [
         ?_assertEqual(Blob, kura_dialect_sqlite:column_type({encrypted, string})),
-        ?_assertEqual(~"TEXT", kura_dialect_sqlite:column_type({array, string})),
         ?_assertError(
             {kura_crypto, unsupported_encrypted_type},
             kura_dialect_sqlite:column_type(?LOOKUP_SCHEMA:encrypted(string, not_options))
@@ -714,6 +966,8 @@ encrypted_forms_are_blob_columns_test_() ->
                 {kura_sqlite, {unsupported_type, Type}}, kura_dialect_sqlite:column_type(Type)
             )
          || Type <- [
+                {array, integer},
+                {array, string},
                 {array, {encrypted, string}},
                 {array, {array, {encrypted, string}}},
                 {array, ?DETERMINISTIC}
@@ -927,36 +1181,36 @@ lookup_tests() ->
             Q,
             {token, encrypted_in, [~"f1", ~"f2"]},
             encrypted_in,
-            {<<"\"token\" IN (CAST(?1 AS BLOB), CAST(?2 AS BLOB))">>, [~"f1", ~"f2"]}
+            {~"(\"token\" IN (CAST(?1 AS BLOB), CAST(?2 AS BLOB))\n)", [~"f1", ~"f2"]}
         },
         {
             where,
             Q,
             {token, encrypted_not_in, [~"f1", ~"f2"]},
             encrypted_not_in,
-            {<<"\"token\" NOT IN (CAST(?1 AS BLOB), CAST(?2 AS BLOB))">>, [~"f1", ~"f2"]}
+            {~"(\"token\" NOT IN (CAST(?1 AS BLOB), CAST(?2 AS BLOB))\n)", [~"f1", ~"f2"]}
         },
-        {where, Q, {token, encrypted_in, []}, encrypted_in, {<<"\"token\" IN ()">>, []}},
+        {where, Q, {token, encrypted_in, []}, encrypted_in, {~"(1 = 0\n)", []}},
         {
             where,
             Q,
             {'and', [{name, ~"n"}, {'or', [{'not', {token, encrypted_in, [~"f1"]}}]}]},
             encrypted_in,
-            {<<"(\"name\" = ?1 AND (NOT (\"token\" IN (CAST(?2 AS BLOB)))))">>, [~"n", ~"f1"]}
+            {~"(\"name\" = ?1 AND (NOT ((\"token\" IN (CAST(?2 AS BLOB))\n))))", [~"n", ~"f1"]}
         },
         {
             where,
             Joined,
             {token, encrypted_not_in, [~"f1"]},
             encrypted_not_in,
-            {<<"\"token\" NOT IN (CAST(?1 AS BLOB))">>, [~"f1"]}
+            {~"(\"token\" NOT IN (CAST(?1 AS BLOB))\n)", [~"f1"]}
         },
         {
             having,
             Having,
             {token, encrypted_in, [~"f1"]},
             encrypted_in,
-            {<<"\"token\" IN (CAST(?1 AS BLOB))">>, [~"f1"]}
+            {~"(\"token\" IN (CAST(?1 AS BLOB))\n)", [~"f1"]}
         }
     ],
     [
@@ -969,7 +1223,7 @@ lookup_tests() ->
                 hd(plain_secret_joins()),
                 {secret, encrypted_in, [~"f1"]},
                 {secret, encrypted_in},
-                {<<"\"lookups\".\"secret\" IN (CAST(?1 AS BLOB))">>, [~"f1"]}
+                {~"(\"lookups\".\"secret\" IN (CAST(?1 AS BLOB))\n)", [~"f1"]}
             ),
             ?_assertError(
                 {kura_sqlite, {unsupported_blob_condition, secret, encrypted_in}},
@@ -1205,3 +1459,267 @@ distance_query_through_the_compiler_raises_test_() ->
                 end)
             ]
         end}.
+
+%%----------------------------------------------------------------------
+%% Text matches
+%%----------------------------------------------------------------------
+
+text_match_test_() ->
+    Glob =
+        ~"replace(replace(replace(?1, '[', '[[]'), '*', '[*]'), char(63), '[' || char(63) || ']')",
+    Like = ~"replace(replace(replace(?1, '!', '!!'), '%', '!%'), '_', '!_')",
+    Cases = [
+        {contains, <<"(\"name\" GLOB '*' || ", Glob/binary, " || '*'\n)">>},
+        {starts_with, <<"(\"name\" GLOB ", Glob/binary, " || '*'\n)">>},
+        {ends_with, <<"(\"name\" GLOB '*' || ", Glob/binary, "\n)">>},
+        {icontains, <<"(\"name\" LIKE '%' || ", Like/binary, " || '%' ESCAPE '!'\n)">>},
+        {istarts_with, <<"(\"name\" LIKE ", Like/binary, " || '%' ESCAPE '!'\n)">>},
+        {iends_with, <<"(\"name\" LIKE '%' || ", Like/binary, " ESCAPE '!'\n)">>},
+        {like, ~"(\"name\" LIKE ?1 ESCAPE '\\'\n)"},
+        {ilike, ~"(\"name\" LIKE ?1 ESCAPE '\\'\n)"}
+    ],
+    [?_assertEqual({Where, [~"n"]}, where_sql({name, Op, ~"n"})) || {Op, Where} <- Cases].
+
+text_match_under_and_or_not_and_having_test_() ->
+    Q = kura_query:from(?BLOB_SCHEMA),
+    [
+        ?_assertMatch(
+            {<<"((\"name\" LIKE ?1 ESCAPE '\\'\n) OR NOT ((\"name\" GLOB ", _/binary>>, [~"a", ~"b"]},
+            where_sql({'or', [{name, ilike, ~"a"}, {'not', {name, starts_with, ~"b"}}]})
+        ),
+        ?_assertMatch(
+            {match, _},
+            re:run(
+                element(
+                    1,
+                    kura_dialect_sqlite:to_sql(
+                        kura_query:having(kura_query:group_by(Q, [name]), {name, ilike, ~"a"})
+                    )
+                ),
+                ~"HAVING \\(\"name\" LIKE \\?1 ESCAPE"
+            )
+        )
+    ].
+
+%%----------------------------------------------------------------------
+%% A column named differently from its field
+%%----------------------------------------------------------------------
+
+renamed_column_in_rewritten_conditions_test_() ->
+    Secret = kura_query:from(kura_sqlite_orm_secret),
+    Author = kura_query:from(kura_sqlite_orm_author),
+    Joined = kura_query:join(Author, inner, kura_sqlite_orm_post, {id, author_id}),
+    Cases = [
+        {Secret, {raw, ~"r"}, ~"(\"raw_bytes\" = CAST(?1 AS BLOB)\n)"},
+        {Secret, {raw, in, [~"r"]}, ~"(\"raw_bytes\" IN (CAST(?1 AS BLOB))\n)"},
+        {
+            Secret,
+            {[id, raw], in, [{1, ~"r"}]},
+            ~"((\"id\", \"raw_bytes\") IN ((?1, CAST(?2 AS BLOB)))\n)"
+        },
+        {Author, {email, like, ~"r"}, ~"(\"email_address\" LIKE ?1 ESCAPE '\\'\n)"},
+        {Joined, {email, ilike, ~"r"}, ~"(\"authors\".\"email_address\" LIKE ?1 ESCAPE '\\'\n)"},
+        {Joined, {name, like, ~"r"}, ~"(\"authors\".\"name\" LIKE ?1 ESCAPE '\\'\n)"},
+        {Joined, {title, like, ~"r"}, ~"(\"title\" LIKE ?1 ESCAPE '\\'\n)"}
+    ],
+    [
+        ?_assertMatch({Where, _}, where_sql(Query, Condition))
+     || {Query, Condition, Where} <- Cases
+    ] ++
+        [
+            ?_assertMatch(
+                {<<"(\"email_address\" GLOB ", _/binary>>, [~"r"]},
+                where_sql(Author, {email, contains, ~"r"})
+            ),
+            ?_assertEqual(
+                {~"DELETE FROM \"secrets\" WHERE (\"raw_bytes\" = CAST(?1 AS BLOB)\n)", [~"r"]},
+                kura_dialect_sqlite:delete_all(kura_query:where(Secret, {raw, ~"r"}))
+            ),
+            ?_assertEqual(
+                [raw, token, ssn], kura_dialect_sqlite:blob_columns(kura_sqlite_orm_secret)
+            )
+        ].
+
+%%----------------------------------------------------------------------
+%% What SQLite cannot run
+%%----------------------------------------------------------------------
+
+-define(REFUSED(Capability), {kura, {unsupported_capability, Capability, kura_pool_sqlite}}).
+
+unsupported_query_raises_test_() ->
+    Q = kura_query:from(?BLOB_SCHEMA),
+    Locked = Q#kura_query{lock = for_update},
+    Refused = [
+        {row_locks, Locked},
+        {row_locks, Q#kura_query{lock = {for_share, nowait}}},
+        {row_locks, Q#kura_query{lock = {fragment, ~"FOR UPDATE OF vault"}}},
+        {row_locks, Q#kura_query{lock = ~"FOR UPDATE"}},
+        {select_for_update_skip_locked, Q#kura_query{lock = {for_update, skip_locked}}},
+        {distinct_on, kura_query:distinct(Q, [name])},
+        {full_text_search, kura_query:where(Q, {name, matches, ~"n"})},
+        {full_text_search, kura_query:where(Q, {'not', {name, matches, ~"n"}})},
+        {row_locks, kura_query:where(Q, {id, in, {subquery, Locked}})},
+        {row_locks, kura_query:where(Q, {exists, {subquery, Locked}})},
+        {row_locks, kura_query:with_cte(Q, ~"locked", Locked)},
+        {row_locks, kura_query:union(Q, Locked)}
+    ],
+    [
+        ?_assertError(?REFUSED(Capability), kura_dialect_sqlite:to_sql(Query))
+     || {Capability, Query} <- Refused
+    ] ++
+        [
+            ?_assertError(?REFUSED(row_locks), kura_dialect_sqlite:to_sql_from(Locked, 1)),
+            ?_assertError(?REFUSED(row_locks), kura_dialect_sqlite:delete_all(Locked)),
+            ?_assertError(
+                ?REFUSED(row_locks), kura_dialect_sqlite:update_all(Locked, #{name => ~"n"})
+            ),
+            ?_assertMatch({_, []}, kura_dialect_sqlite:to_sql(kura_query:distinct(Q)))
+        ].
+
+%% Every form kura_query:lock_clause/1 reads is refused as the lock it stands
+%% for. A fragment is not read, so it is a row lock whatever its text says.
+every_lock_form_is_refused_as_what_it_stands_for_test_() ->
+    Q = kura_query:from(?BLOB_SCHEMA),
+    Skipping = [
+        {for_update, skip_locked},
+        {for_update, #{wait => skip_locked}},
+        {for_share, #{tables => [vault], wait => skip_locked}},
+        [for_share, {for_update, skip_locked}],
+        [{for_update, #{tables => [vault]}}, {for_share, #{wait => skip_locked}}],
+        ~"for update skip locked",
+        ~"FOR SHARE OF vault SKIP LOCKED"
+    ],
+    Waiting = [
+        for_key_share,
+        {for_update, nowait},
+        {for_update, #{tables => [vault]}},
+        {for_update, #{tables => [vault], wait => nowait}},
+        [for_update, {for_share, nowait}],
+        ~"FOR NO KEY UPDATE",
+        {fragment, ~"FOR UPDATE SKIP LOCKED"}
+    ],
+    [
+        ?_assertError(
+            ?REFUSED(select_for_update_skip_locked),
+            kura_dialect_sqlite:to_sql(Q#kura_query{lock = Lock})
+        )
+     || Lock <- Skipping
+    ] ++
+        [
+            ?_assertError(
+                ?REFUSED(row_locks), kura_dialect_sqlite:to_sql(Q#kura_query{lock = Lock})
+            )
+         || Lock <- Waiting
+        ].
+
+%% Text kura cannot read as a lock is refused by kura under strict_locks.
+a_lock_kura_cannot_read_is_kuras_to_refuse_test_() ->
+    {setup, fun() -> application:set_env(kura, strict_locks, true) end,
+        fun(_) -> application:unset_env(kura, strict_locks) end, fun(_) ->
+            Q = kura_query:from(?BLOB_SCHEMA),
+            ?_assertError(
+                {kura, {invalid_lock, ~"FOR EVER"}},
+                kura_dialect_sqlite:to_sql(Q#kura_query{lock = ~"FOR EVER"})
+            )
+        end}.
+
+%% kura checks a query for a repo whose pool module is kura_pool_sqlite,
+%% whatever its dialect would compile: the PostgreSQL dialect has a lock
+%% clause and DISTINCT ON.
+kura_refuses_for_a_repo_on_the_sqlite_pool_test_() ->
+    Repo = kura_sqlite_checked_repo,
+    {setup,
+        fun() ->
+            compiler_repo(Repo, #{dialect => kura_dialect_pg, pool_module => kura_pool_sqlite})
+        end,
+        fun compiler_repo_gone/1, fun(_) -> refused_through_the_compiler(Repo) end}.
+
+%% A repo that names no pool module is not checked by kura, so there the
+%% dialect's own refusal is the only one.
+dialect_refuses_for_a_repo_kura_does_not_check_test_() ->
+    Repo = kura_sqlite_unchecked_repo,
+    {setup, fun() -> compiler_repo(Repo, #{dialect => kura_dialect_sqlite}) end,
+        fun compiler_repo_gone/1, fun(_) ->
+            [
+                ?_assertMatch(
+                    {_, []}, kura_query_compiler:to_sql(Repo, kura_query:from(?BLOB_SCHEMA))
+                )
+                | refused_through_the_compiler(Repo)
+            ]
+        end}.
+
+refused_through_the_compiler(Repo) ->
+    Q = kura_query:from(?BLOB_SCHEMA),
+    Locked = kura_query:lock(Q, for_update),
+    Distinct = kura_query:distinct(Q, [name]),
+    [
+        ?_assertError(?REFUSED(row_locks), kura_query_compiler:to_sql(Repo, Locked)),
+        ?_assertError(?REFUSED(row_locks), kura_query_compiler:to_sql_cached(Repo, Locked)),
+        ?_assertError(?REFUSED(row_locks), kura_query_compiler:to_sql_from(Repo, Locked, 1)),
+        ?_assertError(
+            ?REFUSED(row_locks),
+            kura_query_compiler:delete_all(Repo, kura_query:where(Locked, {id, 1}))
+        ),
+        ?_assertError(
+            ?REFUSED(row_locks),
+            kura_query_compiler:update_all(
+                Repo, kura_query:where(Locked, {id, 1}), #{name => ~"n"}
+            )
+        ),
+        ?_assertError(
+            ?REFUSED(select_for_update_skip_locked),
+            kura_query_compiler:to_sql(Repo, kura_query:lock(Q, {for_update, skip_locked}))
+        ),
+        ?_assertError(?REFUSED(distinct_on), kura_query_compiler:to_sql(Repo, Distinct)),
+        ?_assertError(?REFUSED(distinct_on), kura_query_compiler:to_sql_cached(Repo, Distinct)),
+        ?_assertError(
+            ?REFUSED(row_locks),
+            kura_query_compiler:to_sql(Repo, kura_query:where(Q, {id, in, {subquery, Locked}}))
+        ),
+        ?_assertError(
+            ?REFUSED(distinct_on),
+            kura_query_compiler:to_sql(Repo, kura_query:with_cte(Q, ~"firsts", Distinct))
+        ),
+        ?_assertError(
+            ?REFUSED(row_locks), kura_query_compiler:to_sql(Repo, kura_query:union(Q, Locked))
+        )
+    ].
+
+compiler_repo(Repo, Config) ->
+    application:set_env(kura, repos, #{Repo => Config}),
+    kura_query_cache:init(),
+    kura_query_cache:flush().
+
+compiler_repo_gone(_) ->
+    kura_query_cache:flush(),
+    application:unset_env(kura, repos).
+
+%%----------------------------------------------------------------------
+%% Bound values in one statement
+%%----------------------------------------------------------------------
+
+insert_all_parameter_limit_test_() ->
+    Rows = fun(Count) -> [#{id => N, name => ~"n"} || N <- lists:seq(1, Count)] end,
+    Over = {kura, {too_many_parameters, 32768, 32766}},
+    [
+        ?_assertEqual(
+            32766,
+            length(element(2, kura_dialect_sqlite:insert_all(vault, [id, name], Rows(16383))))
+        ),
+        ?_assertEqual(
+            32766,
+            length(
+                element(
+                    2,
+                    kura_dialect_sqlite:insert_all(vault, [id, name], Rows(16383), #{
+                        returning => true
+                    })
+                )
+            )
+        ),
+        ?_assertError(Over, kura_dialect_sqlite:insert_all(vault, [id, name], Rows(16384))),
+        ?_assertError(
+            Over,
+            kura_dialect_sqlite:insert_all(vault, [id, name], Rows(16384), #{returning => true})
+        )
+    ].

@@ -70,6 +70,38 @@ capabilities_excludes_pg_only_features_test() ->
     ?assert(lists:member(returning, Caps)),
     ?assert(lists:member(transactions, Caps)).
 
+capabilities_are_what_the_bundled_sqlite_runs_test() ->
+    ?assertEqual(
+        [
+            json,
+            partial_indexes,
+            prepared_statements,
+            returning,
+            savepoints,
+            transactions,
+            window_functions
+        ],
+        lists:sort(kura_pool_sqlite:capabilities())
+    ).
+
+the_model_is_one_kura_knows_test() ->
+    ?assertEqual(ok, kura_capabilities:validate(kura_pool_sqlite)).
+
+%% The model number lives in kura_pool_sqlite alone. Whatever it is, of the
+%% capabilities kura checks a query or a stream for, SQLite has window
+%% functions only.
+checked_capabilities_sqlite_lacks_are_left_out_test() ->
+    ?assert(is_integer(kura_pool_sqlite:capability_model())),
+    ?assertEqual(kura_pool_sqlite:capability_model(), kura_backend_sqlite:capability_model()),
+    Lacking = [
+        full_text_search, vector, select_for_update_skip_locked, row_locks, distinct_on, cursors
+    ],
+    ?assertEqual(
+        {error, {missing_capabilities, Lacking}},
+        kura_capabilities:require(kura_pool_sqlite, Lacking)
+    ),
+    ?assertEqual(ok, kura_capabilities:require(kura_pool_sqlite, [window_functions])).
+
 require_advisory_locks_returns_missing_test() ->
     %% A consumer that needs PG-only features should refuse to boot
     %% on a SQLite backend.
@@ -610,7 +642,10 @@ reference_to_a_missing_row_is_refused_test() ->
     with_file_pool(pool_for_restrict, fun(Name) ->
         #{} = sql(Name, ~"CREATE TABLE parent (id INTEGER PRIMARY KEY)"),
         #{} = sql(Name, ~"CREATE TABLE child (parent_id INTEGER REFERENCES parent (id))"),
-        ?assertEqual({error, 787}, sql(Name, ~"INSERT INTO child VALUES (99)"))
+        ?assertMatch(
+            {error, {pgsql_error, #{code := ~"23503", sqlite_code := 787}}},
+            sql(Name, ~"INSERT INTO child VALUES (99)")
+        )
     end).
 
 replaced_connection_enforces_foreign_keys_test() ->

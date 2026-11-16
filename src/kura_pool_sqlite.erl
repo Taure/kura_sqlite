@@ -173,7 +173,8 @@ connections nobody holds.
     checkout/2,
     checkin/2,
     give_away/3,
-    capabilities/0
+    capabilities/0,
+    capability_model/0
 ]).
 
 -export([start_link/4, dirty/2]).
@@ -303,9 +304,15 @@ give_away(_Token, _NotPid, _GiftData) ->
 %%----------------------------------------------------------------------
 
 -doc """
-SQLite 3.45 capability set as shipped by esqlite. Excludes PG-only
-features (advisory_locks, listen_notify, arrays). RETURNING is
-included since 3.35.
+What the SQLite esqlite builds (3.50) supports of kura's standard
+capabilities. kura refuses a query that needs one not listed here.
+
+Left out, since SQLite has no such thing: `jsonb` (`json` stands for the
+text JSON functions), `arrays`, `advisory_locks`, `listen_notify`,
+`select_for_update_skip_locked`, `row_locks`, `distinct_on`, `cursors`,
+`concurrent_indexes`, `vector`. Also left out is `full_text_search`: SQLite
+has FTS5, but `{Field, matches, Query}` compiles to PostgreSQL's
+`to_tsvector`.
 """.
 -spec capabilities() -> kura_capabilities:capability_set().
 capabilities() ->
@@ -313,10 +320,21 @@ capabilities() ->
         returning,
         json,
         partial_indexes,
+        window_functions,
         transactions,
         savepoints,
         prepared_statements
     ].
+
+-doc """
+The revision of kura's capability checks that `capabilities/0` was written
+against. Model 1 checks a query for `full_text_search`, `window_functions`,
+`vector`, `select_for_update_skip_locked`, `row_locks` and `distinct_on`,
+and `kura_stream` for `cursors`. SQLite has window functions only, so kura
+refuses the rest.
+""".
+-spec capability_model() -> pos_integer().
+capability_model() -> 1.
 
 %%----------------------------------------------------------------------
 %% gen_server

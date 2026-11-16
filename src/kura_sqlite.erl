@@ -8,8 +8,8 @@ Checks for a database used through `kura_sqlite`.
 -export_type([blob_column_finding/0]).
 
 -type blob_column_finding() ::
-    {text_in_blob_column, Table :: binary(), Column :: atom()}
-    | {check_failed, Table :: binary(), Column :: atom(), Reason :: term()}.
+    {text_in_blob_column, Table :: binary(), Field :: atom()}
+    | {check_failed, Table :: binary(), Field :: atom(), Reason :: term()}.
 
 -doc """
 Look for TEXT values in the byte columns (`binary`, every encrypted type,
@@ -31,23 +31,24 @@ check_blob_columns(Repo, Schemas) ->
         [
             Finding
          || Schema <- Schemas,
-            Column <- kura_dialect_sqlite:blob_columns(Schema),
-            Finding <- column_findings(Repo, Schema:table(), Column)
+            Columns <- [kura_schema:column_map(Schema)],
+            Field <- kura_dialect_sqlite:blob_columns(Schema),
+            Finding <- column_findings(Repo, Schema:table(), Field, maps:get(Field, Columns))
         ]
     of
         [] -> ok;
         Findings -> {error, Findings}
     end.
 
--spec column_findings(module(), binary(), atom()) -> [blob_column_finding()].
-column_findings(Repo, Table, Column) ->
+-spec column_findings(module(), binary(), atom(), binary()) -> [blob_column_finding()].
+column_findings(Repo, Table, Field, Column) ->
     SQL =
-        <<"SELECT 1 FROM ", (quoted(Table))/binary, " WHERE typeof(",
-            (quoted(atom_to_binary(Column, utf8)))/binary, ") = 'text' LIMIT 1">>,
+        <<"SELECT 1 FROM ", (quoted(Table))/binary, " WHERE typeof(", (quoted(Column))/binary,
+            ") = 'text' LIMIT 1">>,
     case kura_db:query(Repo, SQL, []) of
         #{rows := []} -> [];
-        #{rows := [_]} -> [{text_in_blob_column, Table, Column}];
-        {error, Reason} -> [{check_failed, Table, Column, Reason}]
+        #{rows := [_]} -> [{text_in_blob_column, Table, Field}];
+        {error, Reason} -> [{check_failed, Table, Field, Reason}]
     end.
 
 -spec quoted(binary()) -> binary().

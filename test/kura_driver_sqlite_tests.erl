@@ -1155,14 +1155,33 @@ unrecognised_blob_column_is_refused_test() ->
         end)
     ).
 
-%% A {H, M, S} time has the shape of a date, so a three-integer tuple that
-%% could be one is refused rather than bound as a date.
-params_that_may_be_a_time_or_are_out_of_range_are_refused_test_() ->
+%% A {H, M, S} time has the shape of a date. A three-integer tuple whose
+%% first element is 24 or less is never a date here, and binds as the time
+%% it is.
+times_bind_as_their_clock_test_() ->
+    Cases = [
+        {{12, 5, 6}, ~"12:05:06"},
+        {{7, 30, 0}, ~"07:30:00"},
+        {{0, 0, 0}, ~"00:00:00"},
+        {{23, 59, 59}, ~"23:59:59"},
+        {{23, 59, 60}, ~"23:59:60"},
+        {{24, 0, 0}, ~"24:00:00"}
+    ],
+    [
+        ?_assertMatch(#{rows := [#{t1 := ~"text", v1 := Text}]}, bound([Param, 1]))
+     || {Param, Text} <- Cases
+    ].
+
+params_that_are_no_date_or_time_are_refused_test_() ->
     [
         ?_assertEqual({error, {unsupported_param, 1}}, bound([Param, 1]))
      || Param <- [
-            {12, 5, 6},
             {24, 1, 1},
+            {24, 0, 1},
+            {12, 60, 0},
+            {12, 0, 61},
+            {-1, 0, 0},
+            {12, 5, 6.0},
             {2024, 13, 1},
             {2024, 1, 0},
             {10000, 1, 1},
@@ -1428,3 +1447,199 @@ nesting_quotes_and_comments_inside_a_cte_body_are_skipped_test() ->
     after
         nested_teardown({Pool, Path})
     end.
+
+%%----------------------------------------------------------------------
+%% Constraint errors
+%%----------------------------------------------------------------------
+
+constraint_errors_name_what_failed_test_() ->
+    Cases = [
+        {~"INSERT INTO people (id, email, org, slug) VALUES (1, 'a', 9, 'x')", #{
+            code => ~"23505", table => ~"people", constraint => ~"people_pkey", sqlite_code => 1555
+        }},
+        {~"INSERT INTO people (email, org, slug) VALUES ('a', 9, 'x')", #{
+            code => ~"23505",
+            table => ~"people",
+            constraint => ~"people_email_key",
+            sqlite_code => 2067
+        }},
+        {~"INSERT INTO people (email, org, slug) VALUES ('b', 1, 's')", #{
+            code => ~"23505",
+            table => ~"people",
+            constraint => ~"people_by_org_slug",
+            sqlite_code => 2067
+        }},
+        {~"INSERT INTO people (email, org, slug, nick) VALUES ('b', 2, 's', 'n')", #{
+            code => ~"23505",
+            table => ~"people",
+            constraint => ~"people_nick_key",
+            sqlite_code => 2067
+        }},
+        {~"INSERT INTO people (email, org, slug, tag) VALUES ('b', 2, 's', 'T')", #{
+            code => ~"23505", constraint => ~"people_lower_tag", sqlite_code => 2067
+        }},
+        {~"INSERT INTO people (email, org, slug) VALUES ('b', NULL, 's')", #{
+            code => ~"23502", table => ~"people", column => ~"org", sqlite_code => 1299
+        }},
+        {~"INSERT INTO people (email, org, slug, age) VALUES ('b', 2, 's', -1)", #{
+            code => ~"23514", constraint => ~"people_age_check", sqlite_code => 275
+        }},
+        {~"INSERT INTO people (email, org, slug, boss) VALUES ('b', 2, 's', 99)", #{
+            code => ~"23503", sqlite_code => 787
+        }},
+        {~"INSERT INTO \"work log\" (\"first name\") VALUES ('a')", #{
+            code => ~"23505",
+            table => ~"work log",
+            constraint => ~"work log_first name_key",
+            sqlite_code => 2067
+        }},
+        {~"INSERT INTO rowless VALUES ('k')", #{
+            code => ~"23505",
+            table => ~"rowless",
+            constraint => ~"rowless_pkey",
+            sqlite_code => 1555
+        }}
+    ],
+    {setup, fun constrained/0, fun nested_teardown/1, fun({Pool, _Path}) ->
+        [
+            ?_test(begin
+                {error, {pgsql_error, Fields}} = sql(Pool, SQL),
+                ?assertEqual(Expected, maps:remove(message, Fields)),
+                ?assertMatch(#{message := <<_, _/binary>>}, Fields)
+            end)
+         || {SQL, Expected} <- Cases
+        ]
+    end}.
+
+%% Two partial indexes on one column: SQLite does not say which refused.
+constrained() ->
+    {Pool, Path} = nested_setup(file, 1),
+    [
+        #{} = sql(Pool, SQL)
+     || SQL <- [
+            ~"""
+            CREATE TABLE people (
+                id INTEGER PRIMARY KEY,
+                email TEXT UNIQUE,
+                org INTEGER NOT NULL,
+                slug TEXT,
+                nick TEXT,
+                tag TEXT,
+                age INTEGER CONSTRAINT people_age_check CHECK (age >= 0),
+                boss INTEGER REFERENCES people (id)
+            )
+            """,
+            ~"CREATE UNIQUE INDEX people_by_org_slug ON people (org, slug)",
+            ~"CREATE INDEX people_slug_org ON people (slug, org)",
+            ~"CREATE UNIQUE INDEX people_nick_short ON people (nick) WHERE length(nick) < 3",
+            ~"CREATE UNIQUE INDEX people_nick_long ON people (nick) WHERE length(nick) < 9",
+            ~"CREATE UNIQUE INDEX people_lower_tag ON people (lower(tag))",
+            ~"CREATE TABLE \"work log\" (\"first name\" TEXT UNIQUE)",
+            ~"CREATE TABLE rowless (k TEXT PRIMARY KEY) WITHOUT ROWID",
+            ~"INSERT INTO people (id, email, org, slug, nick, tag) VALUES (1, 'a', 1, 's', 'n', 't')",
+            ~"INSERT INTO \"work log\" VALUES ('a')",
+            ~"INSERT INTO rowless VALUES ('k')"
+        ]
+    ],
+    {Pool, Path}.
+
+%% A rowid given twice is the key of a table that declares none.
+a_repeated_rowid_is_the_key_test() ->
+    with_parent(fun(Pool) ->
+        #{} = sql(Pool, ~"CREATE TABLE loose (word TEXT)"),
+        #{} = sql(Pool, ~"INSERT INTO loose (rowid, word) VALUES (1, 'a')"),
+        {error, {pgsql_error, Fields}} = sql(
+            Pool, ~"INSERT INTO loose (rowid, word) VALUES (1, 'b')"
+        ),
+        ?assertEqual(
+            #{
+                code => ~"23505",
+                table => ~"loose",
+                constraint => ~"loose_pkey",
+                sqlite_code => 2579
+            },
+            maps:remove(message, Fields)
+        )
+    end).
+
+%% SQLite does not quote the names in its message, so one that holds `, `
+%% or a dot, or is empty, cannot be told from the punctuation around it.
+a_message_that_cannot_be_split_names_no_table_test() ->
+    with_parent(fun(Pool) ->
+        [
+            #{} = sql(Pool, SQL)
+         || SQL <- [
+                ~"CREATE TABLE \"x, y\" (c TEXT UNIQUE)",
+                ~"CREATE TABLE blank (\"\" TEXT UNIQUE)",
+                ~"CREATE TABLE \"a.b\" (c TEXT UNIQUE, d TEXT NOT NULL)",
+                ~"CREATE TABLE dotted (\"e.f\" TEXT UNIQUE)",
+                ~"INSERT INTO \"x, y\" VALUES ('a')",
+                ~"INSERT INTO blank VALUES ('a')",
+                ~"INSERT INTO \"a.b\" VALUES ('a', 'd')",
+                ~"INSERT INTO dotted VALUES ('a')"
+            ]
+        ],
+        [
+            begin
+                {error, {pgsql_error, Fields}} = sql(Pool, SQL),
+                ?assertEqual(
+                    #{code => ~"23505", sqlite_code => 2067}, maps:remove(message, Fields)
+                )
+            end
+         || SQL <- [
+                ~"INSERT INTO \"x, y\" VALUES ('a')",
+                ~"INSERT INTO blank VALUES ('a')",
+                ~"INSERT INTO \"a.b\" VALUES ('a', 'd')",
+                ~"INSERT INTO dotted VALUES ('a')"
+            ]
+        ],
+        {error, {pgsql_error, NotNull}} = sql(Pool, ~"INSERT INTO \"a.b\" VALUES ('z', NULL)"),
+        ?assertEqual(#{code => ~"23502", sqlite_code => 1299}, maps:remove(message, NotNull))
+    end).
+
+%% The message names the table and the column and holds no value of the row.
+constraint_error_message_holds_no_row_value_test() ->
+    with_parent(fun(Pool) ->
+        #{} = sql(Pool, ~"CREATE TABLE secrets (word TEXT UNIQUE)"),
+        Insert = fun() ->
+            kura_driver_sqlite:query(
+                kura_pool_sqlite, Pool, ~"INSERT INTO secrets VALUES (?1)", [~"hunter2"], #{}
+            )
+        end,
+        #{} = Insert(),
+        {error, {pgsql_error, #{message := Message}}} = Insert(),
+        ?assertEqual(~"UNIQUE constraint failed: secrets.word", Message)
+    end).
+
+%% A failure that is no constraint's, and a constraint failure SQLite words
+%% in a way the driver does not read, keep the result code.
+other_failures_keep_the_result_code_test() ->
+    with_parent(fun(Pool) ->
+        #{} = sql(
+            Pool,
+            ~"""
+            CREATE TRIGGER no_twos BEFORE INSERT ON parent WHEN NEW.id = 2
+            BEGIN SELECT RAISE(ABORT, 'no twos'); END
+            """
+        ),
+        ?assertEqual({error, 1811}, sql(Pool, ~"INSERT INTO parent VALUES (2)")),
+        ?assertEqual({error, 1}, sql(Pool, ~"SELECT nothing FROM parent"))
+    end).
+
+%% The statement's own transaction is still usable after the lookup.
+constraint_error_leaves_the_transaction_open_test() ->
+    with_parent(fun(Pool) ->
+        #{} = sql(Pool, ~"CREATE UNIQUE INDEX parent_id_again ON parent (id)"),
+        Result = kura_driver_sqlite:transaction(
+            kura_pool_sqlite,
+            Pool,
+            fun() ->
+                Refused = sql(Pool, ~"INSERT INTO parent VALUES (1)"),
+                #{} = sql(Pool, ~"INSERT INTO parent VALUES (3)"),
+                Refused
+            end,
+            #{}
+        ),
+        ?assertMatch({error, {pgsql_error, #{constraint := ~"parent_pkey"}}}, Result),
+        ?assertMatch(#{rows := [#{id := 1}, #{id := 3}]}, sql(Pool, ~"SELECT id FROM parent"))
+    end).

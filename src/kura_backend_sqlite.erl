@@ -25,7 +25,8 @@ Consumers that need to query capabilities directly can call
     pool_module/0,
     driver_module/0,
     dialect/0,
-    capabilities/0
+    capabilities/0,
+    capability_model/0
 ]).
 
 -spec pool_module() -> module().
@@ -37,6 +38,13 @@ driver_module() -> kura_driver_sqlite.
 -spec dialect() -> module().
 dialect() -> kura_dialect_sqlite.
 
--doc "Forwards to `kura_pool_sqlite:capabilities/0` so consumers can query the backend's feature set without knowing the impl module names.".
+-doc """
+Forwards to `kura_pool_sqlite:capabilities/0` so consumers can query the
+backend's feature set without knowing the impl module names.
+""".
 -spec capabilities() -> kura_capabilities:capability_set().
 capabilities() -> kura_pool_sqlite:capabilities().
+
+-doc "Forwards to `kura_pool_sqlite:capability_model/0`.".
+-spec capability_model() -> pos_integer().
+capability_model() -> kura_pool_sqlite:capability_model().

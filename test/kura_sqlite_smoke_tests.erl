@@ -95,6 +95,9 @@ boolean_roundtrip() ->
     %% the read side. Verify the encoded default and the cast.
     ?assertEqual(~"1", kura_dialect_sqlite:format_default(true)),
     ?assertEqual(~"0", kura_dialect_sqlite:format_default(false)),
+    ?assertEqual(~"'it''s'", kura_dialect_sqlite:format_default(~"it's")),
+    ?assertEqual(~"'{\"k\":\"it''s\"}'", kura_dialect_sqlite:format_default(#{k => ~"it's"})),
+    ?assertEqual(~"'[\"it''s\"]'", kura_dialect_sqlite:format_default([~"it's"])),
     ?assertEqual({ok, true}, kura_types:cast(boolean, 1)),
     ?assertEqual({ok, false}, kura_types:cast(boolean, 0)).
 
