@@ -9,8 +9,8 @@ SQLite backend for [kura](https://github.com/Taure/kura). Provides
 
 ```erlang
 {deps, [
-    {kura, "~> 2.4"},
-    {kura_sqlite, "~> 0.2"}
+    {kura, "~> 2.31"},
+    {kura_sqlite, "~> 1.4"}
 ]}.
 ```
 
