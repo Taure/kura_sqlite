@@ -88,9 +88,10 @@ refuses a query that needs one with
   amount in an `integer` field of its smallest unit.
 - **JSON** values store as TEXT. JSONB operators (`->`, `->>`, `@>`)
   are not available; use Erlang map operations after decoding.
-- **Arrays** are unsupported. A migration declaring an `{array, Inner}`
-  column, and a write of a list to an array field, raise
-  `{kura_sqlite, {unsupported_type, {array, Inner}}}`.
+- **Arrays** are unsupported. A write of a list to an array field raises
+  `{kura_sqlite, {unsupported_type, {array, Inner}}}`; store the list in a
+  `json` field. A migration declaring an `{array, Inner}` column still
+  creates it as TEXT, so a schema shared with Postgres migrates.
 - **`like` and `ilike`** both compile to `LIKE ? ESCAPE '\'`. SQLite's
   `LIKE` ignores the case of ASCII letters, so `like` matches what `ilike`
   does, and neither folds a letter outside ASCII (`å` does not match `Å`).

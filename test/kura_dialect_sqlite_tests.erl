@@ -955,7 +955,9 @@ encrypted_forms_are_blob_columns_test_() ->
         ),
         ?_assertError(
             {kura_sqlite, {unsupported_type, vector}}, kura_dialect_sqlite:column_type(vector)
-        )
+        ),
+        ?_assertEqual(~"TEXT", kura_dialect_sqlite:column_type({array, integer})),
+        ?_assertEqual(~"TEXT", kura_dialect_sqlite:column_type({array, {array, string}}))
     ] ++
         [
             options_column(Type)
@@ -966,8 +968,6 @@ encrypted_forms_are_blob_columns_test_() ->
                 {kura_sqlite, {unsupported_type, Type}}, kura_dialect_sqlite:column_type(Type)
             )
          || Type <- [
-                {array, integer},
-                {array, string},
                 {array, {encrypted, string}},
                 {array, {array, {encrypted, string}}},
                 {array, ?DETERMINISTIC}
